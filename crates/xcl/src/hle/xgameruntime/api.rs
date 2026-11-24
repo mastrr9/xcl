@@ -536,11 +536,12 @@ fn classes() -> Vec<Class> {
             Class { name: "XGameEvent", clsid: XGAMEEVENT, impls: vec![("XGameEventWrite", ok as usize)], forward: &[] },
             Class { name: "XNetworking", clsid: XNETWORKING, impls: xnetworking(), forward: &[] },
             Class { name: "XError", clsid: XERROR, impls: xerror(), forward: &[] },
-            // dialogs and text entry without a user handle go to the PC runtime
+            // the dialogs with a requesting user are XCL's (closed at once); dialogs and text entry
+            // without a user handle go to the PC runtime
             Class {
                 name: "XGameUi",
                 clsid: XGAMEUI,
-                impls: Vec::new(),
+                impls: xgameui(),
                 forward: &[
                     "XGameUiShowMessageDialogAsync",
                     "XGameUiShowMessageDialogResult",
@@ -978,6 +979,198 @@ unsafe extern "system" fn sign_out_async(_user: usize, b: *mut XAsyncBlock) -> H
 
 unsafe extern "system" fn prompt_space_async(_bytes: u64, b: *mut XAsyncBlock) -> HRESULT {
     completed(b)
+}
+
+// ---------------------------------------------------------------------------------------
+// XGameUi dialogs for the local user: there is no Xbox shell to draw them, so each one
+// completes as if the player opened it and backed out (the documented user-cancel results).
+// ---------------------------------------------------------------------------------------
+
+/// HRESULT_FROM_WIN32(ERROR_CANCELLED): XGameUiWebAuthenticationResultData.responseStatus when
+/// the user closes the web view
+const E_CANCELLED: HRESULT = 0x8007_04C7_u32 as i32;
+
+fn note_dialog(name: &str) {
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.iter().any(|s| s == name) {
+        seen.push(name.to_string());
+        crate::xlog_info!("XGameUi: {name} – no Xbox shell here, closed at once");
+    }
+}
+
+/// XGameUiShowAchievementsAsync / ShowPlayerProfileCardAsync / ShowSendGameInviteAsync /
+/// ShowMultiplayerActivityGameInviteAsync / ShowStateShareAsync(async, requestingUser, …):
+/// shown and closed, S_OK (their Result functions return the async status).
+unsafe fn closed_dialog(name: &str, b: *mut XAsyncBlock, user: *mut c_void) -> HRESULT {
+    if b.is_null() || !super::valid_user(user) {
+        return E_INVALIDARG;
+    }
+    note_dialog(name);
+    completed(b)
+}
+
+unsafe extern "system" fn achievements_async(b: *mut XAsyncBlock, user: *mut c_void) -> HRESULT {
+    closed_dialog("achievements", b, user)
+}
+
+unsafe extern "system" fn profile_card_async(b: *mut XAsyncBlock, user: *mut c_void) -> HRESULT {
+    closed_dialog("player profile card", b, user)
+}
+
+unsafe extern "system" fn send_invite_async(b: *mut XAsyncBlock, user: *mut c_void) -> HRESULT {
+    closed_dialog("send game invite", b, user)
+}
+
+unsafe extern "system" fn activity_invite_async(b: *mut XAsyncBlock, user: *mut c_void) -> HRESULT {
+    closed_dialog("multiplayer activity invite", b, user)
+}
+
+unsafe extern "system" fn state_share_async(b: *mut XAsyncBlock, user: *mut c_void) -> HRESULT {
+    closed_dialog("state share", b, user)
+}
+
+static PICKER_ID: u8 = 0;
+
+/// The players a player picker that is closed without changes returns: the title's preselection,
+/// kept to the players it offered and to `max`. Fewer than `min` cannot be confirmed: E_ABORT.
+fn picker_selection(offered: &[u64], preselected: &[u64], min: u32, max: u32) -> Result<Vec<u64>, HRESULT> {
+    let mut picked: Vec<u64> = Vec::new();
+    for &p in preselected {
+        if offered.contains(&p) && !picked.contains(&p) && picked.len() < max as usize {
+            picked.push(p);
+        }
+    }
+    if picked.len() < min as usize {
+        return Err(crate::util::E_ABORT);
+    }
+    Ok(picked)
+}
+
+/// XGameUiShowPlayerPickerAsync(async, requestingUser, promptText, selectFromPlayersCount,
+/// selectFromPlayers, preSelectedPlayersCount, preSelectedPlayers, minSelectionCount,
+/// maxSelectionCount)
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn player_picker_async(
+    b: *mut XAsyncBlock,
+    user: *mut c_void,
+    _prompt: *const u8,
+    offered_count: u32,
+    offered: *const u64,
+    preselected_count: u32,
+    preselected: *const u64,
+    min: u32,
+    max: u32,
+) -> HRESULT {
+    if b.is_null() || !super::valid_user(user) || min > max {
+        return E_INVALIDARG;
+    }
+    let list = |n: u32, p: *const u64| -> Option<Vec<u64>> {
+        match (n, p.is_null()) {
+            (0, _) => Some(Vec::new()),
+            (_, true) => None,
+            (n, false) => Some(std::slice::from_raw_parts(p, n as usize).to_vec()),
+        }
+    };
+    let (Some(offered), Some(preselected)) = (list(offered_count, offered), list(preselected_count, preselected)) else {
+        return E_INVALIDARG;
+    };
+    note_dialog("player picker");
+    begin_with(b, &PICKER_ID as *const u8 as usize, move || {
+        picker_selection(&offered, &preselected, min, max).map(|v| v.iter().flat_map(|p| p.to_le_bytes()).collect())
+    })
+}
+
+unsafe extern "system" fn player_picker_result_count(b: *mut XAsyncBlock, count: *mut u32) -> HRESULT {
+    if count.is_null() {
+        return E_INVALIDARG;
+    }
+    let mut size = 0usize;
+    let hr = XAsyncGetResultSize(b, &mut size);
+    if hr >= 0 {
+        *count = (size / 8) as u32;
+    }
+    hr
+}
+
+unsafe extern "system" fn player_picker_result(b: *mut XAsyncBlock, count: u32, players: *mut u64, used: *mut u32) -> HRESULT {
+    let mut bytes = 0usize;
+    let hr = XAsyncGetResult(b, &PICKER_ID as *const u8 as *const c_void, count as usize * 8, players as *mut c_void, &mut bytes);
+    if hr >= 0 && !used.is_null() {
+        *used = (bytes / 8) as u32;
+    }
+    hr
+}
+
+static WEB_AUTH_ID: u8 = 0;
+
+/// XGameUiWebAuthenticationResultData
+#[repr(C)]
+pub struct WebAuthenticationResultData {
+    pub response_status: HRESULT,
+    pub response_completion_uri_size: usize,
+    pub response_completion_uri: *const u8,
+}
+
+/// The result of a web view the user closed: responseStatus E_CANCELLED and, as the GDK reference
+/// has it for a cancelled request, an empty response (0 bytes; the pointer is to a lone NUL in
+/// the buffer, relative until XAsyncGetResult places it).
+fn cancelled_web_authentication() -> PayloadBuf {
+    let header = std::mem::size_of::<WebAuthenticationResultData>();
+    let mut bytes = Vec::with_capacity(header + 1);
+    bytes.extend_from_slice(&E_CANCELLED.to_le_bytes());
+    bytes.extend_from_slice(&[0u8; 4]);
+    bytes.extend_from_slice(&0usize.to_le_bytes());
+    bytes.extend_from_slice(&header.to_le_bytes());
+    bytes.push(0);
+    PayloadBuf { bytes, fixups: vec![16] }
+}
+
+/// XGameUiShowWebAuthenticationAsync(async, requestingUser, requestUri, completionUri) and
+/// …WithOptionsAsync(…, options): no web view, so the user closed it.
+unsafe extern "system" fn web_authentication_async(b: *mut XAsyncBlock, user: *mut c_void, request: *const u8, completion: *const u8) -> HRESULT {
+    if b.is_null() || !super::valid_user(user) || request.is_null() || completion.is_null() {
+        return E_INVALIDARG;
+    }
+    note_dialog("web authentication");
+    begin_with_fixups(b, &WEB_AUTH_ID as *const u8 as usize, || Ok(cancelled_web_authentication()))
+}
+
+unsafe extern "system" fn web_authentication_result(
+    b: *mut XAsyncBlock,
+    size: usize,
+    buf: *mut c_void,
+    out: *mut *mut WebAuthenticationResultData,
+    used: *mut usize,
+) -> HRESULT {
+    let hr = XAsyncGetResult(b, &WEB_AUTH_ID as *const u8 as *const c_void, size, buf, used);
+    if hr >= 0 && !out.is_null() {
+        *out = buf as *mut WebAuthenticationResultData;
+    }
+    hr
+}
+
+/// The XGameUi functions XCL answers itself (the dialogs with a requesting user).
+fn xgameui() -> Vec<(&'static str, usize)> {
+    vec![
+        ("XGameUiShowAchievementsAsync", achievements_async as usize),
+        ("XGameUiShowAchievementsResult", empty_result as usize),
+        ("XGameUiShowPlayerProfileCardAsync", profile_card_async as usize),
+        ("XGameUiShowPlayerProfileCardResult", empty_result as usize),
+        ("XGameUiShowSendGameInviteAsync", send_invite_async as usize),
+        ("XGameUiShowSendGameInviteResult", empty_result as usize),
+        ("XGameUiShowMultiplayerActivityGameInviteAsync", activity_invite_async as usize),
+        ("XGameUiShowMultiplayerActivityGameInviteResult", empty_result as usize),
+        ("XGameUiShowStateShareAsync", state_share_async as usize),
+        ("XGameUiShowStateShareResult", empty_result as usize),
+        ("XGameUiShowPlayerPickerAsync", player_picker_async as usize),
+        ("XGameUiShowPlayerPickerResultCount", player_picker_result_count as usize),
+        ("XGameUiShowPlayerPickerResult", player_picker_result as usize),
+        ("XGameUiShowWebAuthenticationAsync", web_authentication_async as usize),
+        ("XGameUiShowWebAuthenticationWithOptionsAsync", web_authentication_async as usize),
+        ("XGameUiShowWebAuthenticationResultSize", XAsyncGetResultSize as usize),
+        ("XGameUiShowWebAuthenticationResult", web_authentication_result as usize),
+    ]
 }
 
 unsafe extern "system" fn sign_out_deferral(out: *mut usize) -> HRESULT {
@@ -1624,10 +1817,18 @@ mod tests {
             assert!(crate::util::from_cstr_ptr((*tptr).token).unwrap().starts_with("XBL3.0 "));
             assert!(!crate::util::from_cstr_ptr((*tptr).signature).unwrap().is_empty());
 
+            // the achievements dialog for the local user is XCL's: closed at once, S_OK
+            let ach: unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, *mut c_void, u32) -> HRESULT = slot(ui, slot_in_table("XGameUiShowAchievementsAsync").2);
+            let ach_r: unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock) -> HRESULT = slot(ui, slot_in_table("XGameUiShowAchievementsResult").2);
+            let mut ab: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(ach(ui, &mut ab, user, 0x1234_5678), S_OK);
+            assert_eq!(get_status(xa, &mut ab, true), S_OK);
+            assert_eq!(ach_r(ui, &mut ab), S_OK);
+
             // an unimplemented slot answers E_NOTIMPL and is reported
-            let ach: unsafe extern "system" fn(*mut c_void) -> HRESULT = slot(ui, slot_in_table("XGameUiShowAchievementsAsync").2);
-            assert_eq!(ach(ui), E_NOTIMPL);
-            assert!(stats().unimplemented.contains_key("XGameUiShowAchievementsAsync"), "{:?}", stats().unimplemented);
+            let manage: unsafe extern "system" fn(*mut c_void) -> HRESULT = slot(ui, slot_in_table("XGameUiShowManageSpaceAsync").2);
+            assert_eq!(manage(ui), E_NOTIMPL);
+            assert!(stats().unimplemented.contains_key("XGameUiShowManageSpaceAsync"), "{:?}", stats().unimplemented);
 
             // XGameSave: provider (async), container, write a blob, read it back (async)
             let (_, s) = query(XGAMESAVE, g(0x1bfff3af_f14a_40a3_8e35_9ada906593f9));
@@ -2083,5 +2284,65 @@ mod tests {
         assert!(parse_mute_tts(Some("1")));
         assert!(parse_mute_tts(Some("true")));
         assert!(parse_mute_tts(Some("yes")));
+    }
+
+    #[test]
+    fn user_dialogs_close_at_once() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let user = super::super::user_ptr();
+            // the picker keeps the title's preselection among the players it offered, up to max
+            assert_eq!(picker_selection(&[1, 2, 3], &[3, 9, 1, 3], 0, 1), Ok(vec![3]));
+            assert_eq!(picker_selection(&[1, 2, 3], &[3, 9, 1], 1, 4), Ok(vec![3, 1]));
+            assert_eq!(picker_selection(&[1, 2, 3], &[], 0, 4), Ok(vec![]));
+            assert_eq!(picker_selection(&[1, 2], &[9], 1, 2), Err(crate::util::E_ABORT));
+
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(achievements_async(&mut b, std::ptr::null_mut()), E_INVALIDARG);
+            assert_eq!(achievements_async(std::ptr::null_mut(), user), E_INVALIDARG);
+            for f in [achievements_async, profile_card_async, send_invite_async, activity_invite_async, state_share_async] {
+                let mut b: XAsyncBlock = std::mem::zeroed();
+                assert_eq!(f(&mut b, user), S_OK);
+                assert_eq!(XAsyncGetStatus(&mut b, true), S_OK);
+                assert_eq!(empty_result(&mut b), S_OK);
+            }
+
+            let offered = [11u64, 22, 33];
+            let pre = [33u64, 44];
+            assert_eq!(player_picker_async(&mut b, user, b"Pick\0".as_ptr(), 3, std::ptr::null(), 0, std::ptr::null(), 0, 1), E_INVALIDARG);
+            assert_eq!(player_picker_async(&mut b, user, b"Pick\0".as_ptr(), 3, offered.as_ptr(), 2, pre.as_ptr(), 2, 1), E_INVALIDARG);
+            assert_eq!(player_picker_async(&mut b, user, b"Pick\0".as_ptr(), 3, offered.as_ptr(), 2, pre.as_ptr(), 0, 2), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b, true), S_OK);
+            let mut n = 0u32;
+            assert_eq!(player_picker_result_count(&mut b, &mut n), S_OK);
+            assert_eq!(n, 1);
+            let mut players = [0u64; 4];
+            let mut used = 0u32;
+            assert_eq!(player_picker_result(&mut b, 4, players.as_mut_ptr(), &mut used), S_OK);
+            assert_eq!((used, players[0]), (1, 33));
+            // a selection the preselection cannot meet: the player backed out
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(player_picker_async(&mut b, user, std::ptr::null(), 3, offered.as_ptr(), 0, std::ptr::null(), 1, 1), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b, true), crate::util::E_ABORT);
+
+            // web authentication: the web view was closed, responseStatus E_CANCELLED
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(web_authentication_async(&mut b, user, std::ptr::null(), b"x\0".as_ptr()), E_INVALIDARG);
+            assert_eq!(web_authentication_async(&mut b, user, b"https://example.invalid/a\0".as_ptr(), b"https://example.invalid/b\0".as_ptr()), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b, true), S_OK);
+            let mut size = 0usize;
+            assert_eq!(XAsyncGetResultSize(&mut b, &mut size), S_OK);
+            assert_eq!(size, std::mem::size_of::<WebAuthenticationResultData>() + 1);
+            let mut buf = vec![0u8; size];
+            let mut data: *mut WebAuthenticationResultData = std::ptr::null_mut();
+            let mut bytes = 0usize;
+            assert_eq!(web_authentication_result(&mut b, size, buf.as_mut_ptr() as *mut c_void, &mut data, &mut bytes), S_OK);
+            assert_eq!((data as *const u8, bytes), (buf.as_ptr(), size));
+            let d = std::ptr::read_unaligned(data);
+            assert_eq!(d.response_status, E_CANCELLED);
+            assert_eq!(d.response_completion_uri_size, 0);
+            assert_eq!(crate::util::from_cstr_ptr(d.response_completion_uri).as_deref(), Some(""));
+            assert_eq!(std::mem::size_of::<WebAuthenticationResultData>(), 24);
+        }
     }
 }
