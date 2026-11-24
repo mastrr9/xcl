@@ -1475,12 +1475,59 @@ unsafe extern "system" fn XPackageGetPackageKind(_id: usize, out: *mut u32) -> H
     S_OK
 }
 
+/// SipHash-1-3 with zero keys: what std's `DefaultHasher::new()` computes with the Rust versions
+/// XCL has been built with, written out because std does not promise to keep that algorithm.
+fn sip13(data: &[u8]) -> u64 {
+    fn round(v: &mut [u64; 4]) {
+        v[0] = v[0].wrapping_add(v[1]);
+        v[1] = v[1].rotate_left(13) ^ v[0];
+        v[0] = v[0].rotate_left(32);
+        v[2] = v[2].wrapping_add(v[3]);
+        v[3] = v[3].rotate_left(16) ^ v[2];
+        v[0] = v[0].wrapping_add(v[3]);
+        v[3] = v[3].rotate_left(21) ^ v[0];
+        v[2] = v[2].wrapping_add(v[1]);
+        v[1] = v[1].rotate_left(17) ^ v[2];
+        v[2] = v[2].rotate_left(32);
+    }
+    let mut v = [0x736f_6d65_7073_6575u64, 0x646f_7261_6e64_6f6d, 0x6c79_6765_6e65_7261, 0x7465_6462_7974_6573];
+    let mut chunks = data.chunks_exact(8);
+    for c in &mut chunks {
+        let m = u64::from_le_bytes(c.try_into().unwrap());
+        v[3] ^= m;
+        round(&mut v);
+        v[0] ^= m;
+    }
+    let mut last = (data.len() as u64 & 0xff) << 56;
+    for (i, &b) in chunks.remainder().iter().enumerate() {
+        last |= (b as u64) << (8 * i);
+    }
+    v[3] ^= last;
+    round(&mut v);
+    v[0] ^= last;
+    v[2] ^= 0xff;
+    for _ in 0..3 {
+        round(&mut v);
+    }
+    v[0] ^ v[1] ^ v[2] ^ v[3]
+}
+
+/// The app-specific device id of a console and title: 16 hex digits. The bytes hashed are the
+/// ones `Hash for (&str, &str)` feeds std's hasher (each string, then 0xFF), so the ids titles
+/// were given before stay the same, and no toolchain update can change them.
+fn app_specific_device_id(console_id: &str, title_id: &str) -> String {
+    let mut data = Vec::with_capacity(console_id.len() + title_id.len() + 2);
+    for s in [console_id, title_id] {
+        data.extend_from_slice(s.as_bytes());
+        data.push(0xFF);
+    }
+    format!("{:016X}", sip13(&data))
+}
+
 /// A stable id per console and title.
 unsafe extern "system" fn XSystemGetAppSpecificDeviceId(size: usize, buf: *mut u8, used: *mut usize) -> HRESULT {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    (crate::state::config().console_id.as_str(), crate::state::config().title_id.as_str()).hash(&mut h);
-    crate::util::write_cstr_out(&format!("{:016X}", h.finish()), buf, size, used)
+    let c = crate::state::config();
+    crate::util::write_cstr_out(&app_specific_device_id(&c.console_id, &c.title_id), buf, size, used)
 }
 
 /// XUserFindUserByLocalId / XUserFindUserById (slots 10 / 12): the local user by either id.
@@ -2176,6 +2223,16 @@ mod tests {
             assert_eq!(ERR_SEEN.load(Ordering::SeqCst), crate::util::E_FAIL as u32);
             set_cb(err, 0, std::ptr::null_mut());
         }
+    }
+
+    #[test]
+    fn app_specific_device_id_does_not_depend_on_the_toolchain() {
+        // pinned: the value std's DefaultHasher gave for this pair when the id was introduced
+        assert_eq!(app_specific_device_id("00000000.00000000.00000000.00000000.00", "4D2A1B3C"), "179CF6D52B420CBE");
+        assert_ne!(app_specific_device_id("00000000.00000000.00000000.00000000.00", "4D2A1B3D"), "179CF6D52B420CBE");
+        // the two strings are kept apart (0xFF after each)
+        assert_ne!(app_specific_device_id("ab", "c"), app_specific_device_id("a", "bc"));
+        assert_eq!(app_specific_device_id("", "").len(), 16);
     }
 
     #[test]
