@@ -2091,7 +2091,7 @@ fn gpu_ps_image_sample_offset_implicit_lod_between_mips() {
         return;
     }
     use windows::Win32::Graphics::Direct3D12::*;
-    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_SAMPLE_DESC};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_SAMPLE_DESC};
     let scale = 2f32.powf(0.25) / 8.0;
     let ps = prog(&[
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 129)], None), // offset x +1, y 0
@@ -2132,14 +2132,29 @@ fn gpu_ps_image_sample_offset_implicit_lod_between_mips() {
     let mut sgprs = vec![0u32; 32];
     sgprs[16..24].copy_from_slice(&tsharp(0, 77, 9));
     sgprs[24..28].copy_from_slice(&s_sharp);
-    let px = draw_console_views(None, Some(&ps), &[[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]], &sgprs, &[tex], &[crate::gpu::desc::sampler_d3d12(&s_sharp, false)]);
-    for y in 0..16 {
-        for x in 0..16 {
-            let u = (x as f32 + 0.5) * scale;
-            let texel = |size: f32| ((u * size).floor() + 1.0).clamp(0.0, size - 1.0);
-            let want = 0.75 * texel(8.0) + 0.25 * (100.0 + texel(4.0));
-            let got = px[y * 16 + x][0];
-            assert!((got - want).abs() < 0.02, "pixel ({x},{y}) = {got}, expected {want}");
+    let tris = [[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]];
+    let samplers = [crate::gpu::desc::sampler_d3d12(&s_sharp, false)];
+    let hlsl = draw_console_views(None, Some(&ps), &tris, &sgprs, std::slice::from_ref(&tex), &samplers);
+    // the same pixel shader through the direct DXIL translator (HLSL pass-through VS)
+    let vs = translate(&draw_passthrough_vs(), &runner::options(Mode::Vertex(draw_vsi()))).unwrap();
+    let vsb = super::dxc::compile(&vs.hlsl, "main", "vs_6_6", &[]).unwrap();
+    let ko = crate::gpu::dxil::kernel::KernelOptions { wave64: runner::options(Mode::Pixel(draw_psi())).wave64, split: false, mem_windows: 1, sampler_base: 0 };
+    let dps = crate::gpu::dxil::kernel::translate_pixel(&ps, ko, &draw_psi()).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil;
+    let verts: Vec<f32> = tris.iter().flat_map(|p| [p[0] / 8.0 - 1.0, 1.0 - p[1] / 8.0, 0.0, 0.0, 0.0, 0.0]).collect();
+    let layout = [
+        runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 },
+        runner::VertexElement { semantic: "COLOR", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 8 },
+    ];
+    let direct = runner::draw_views(&vsb, &dps, &layout, &verts, 24, &sgprs, &[], std::slice::from_ref(&tex), &samplers, 16, [-1.0; 4]).unwrap();
+    for (backend, px) in [("HLSL", &hlsl), ("direct", &direct)] {
+        for y in 0..16 {
+            for x in 0..16 {
+                let u = (x as f32 + 0.5) * scale;
+                let texel = |size: f32| ((u * size).floor() + 1.0).clamp(0.0, size - 1.0);
+                let want = 0.75 * texel(8.0) + 0.25 * (100.0 + texel(4.0));
+                let got = px[y * 16 + x][0];
+                assert!((got - want).abs() < 0.02, "{backend}: pixel ({x},{y}) = {got}, expected {want}");
+            }
         }
     }
 }

@@ -270,6 +270,30 @@ impl Lw {
         self.uitof(c)
     }
 
+    /// An MIMG texel offset (`o`: three 6-bit signed fields) in the texture coordinates of
+    /// mip `level` – offset / that level's size (array layers do not move) – and the
+    /// level's `getDimensions`.
+    fn texel_offset(&mut self, tex: Texture, dim: u64, o: Value, level: Value) -> ([Value; 3], Value) {
+        let dims = self.s.get_dimensions(tex.handle, Some(level));
+        let one = self.c(1);
+        let (w, hh, dd) = match dim {
+            0 => (self.s.m.extract(dims, 0), one, one),
+            1 => (self.s.m.extract(dims, 0), self.s.m.extract(dims, 1), one),
+            2 => (self.s.m.extract(dims, 0), self.s.m.extract(dims, 1), self.s.m.extract(dims, 2)),
+            4 => (self.s.m.extract(dims, 0), one, one),
+            _ => (self.s.m.extract(dims, 0), self.s.m.extract(dims, 1), one),
+        };
+        let mut ofs = [one; 3];
+        for (k, (sh, size)) in [(26u32, w), (18, hh), (10, dd)].into_iter().enumerate() {
+            let x = self.shlc(o, sh);
+            let x = self.ashrc(x, 26);
+            let xf = self.sitof(x);
+            let sf = self.uitof(size);
+            ofs[k] = self.fdiv(xf, sf);
+        }
+        (ofs, dims)
+    }
+
     pub fn mimg(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         if f("TFE") != 0 || f("LWE") != 0 {
@@ -488,6 +512,8 @@ impl Lw {
                 None
             };
             let mut coords: Vec<Value> = (0..body as usize).map(|k| compf(self, i_body + k)).collect();
+            let coords_unmoved = coords.clone();
+            let mut ofs_dims = None;
             let lod = i_extra.map(|i| compf(self, i));
             let cl = i_clamp.map(|i| compf(self, i));
             let s3 = self.sreg(ssamp + 3);
@@ -524,23 +550,8 @@ impl Lw {
                     }
                     _ => self.c(0),
                 };
-                let dims = self.s.get_dimensions(tex.handle, Some(level));
-                let one = self.c(1);
-                let (w, hh, dd) = match dim {
-                    0 => (self.s.m.extract(dims, 0), one, one),
-                    1 => (self.s.m.extract(dims, 0), self.s.m.extract(dims, 1), one),
-                    2 => (self.s.m.extract(dims, 0), self.s.m.extract(dims, 1), self.s.m.extract(dims, 2)),
-                    4 => (self.s.m.extract(dims, 0), one, one),
-                    _ => (self.s.m.extract(dims, 0), self.s.m.extract(dims, 1), one),
-                };
-                let mut ofs = Vec::new();
-                for (sh, size) in [(26u32, w), (18, hh), (10, dd)] {
-                    let x = self.shlc(o, sh);
-                    let x = self.ashrc(x, 26);
-                    let xf = self.sitof(x);
-                    let sf = self.uitof(size);
-                    ofs.push(self.fdiv(xf, sf));
-                }
+                let (ofs, dims) = self.texel_offset(tex, dim, o, level);
+                ofs_dims = Some(dims);
                 for (k, c) in coords.iter_mut().enumerate() {
                     if (dim == 4 && k == 1) || (dim == 5 && k == 2) {
                         continue;
@@ -609,6 +620,91 @@ impl Lw {
                     (None, None, None, Some(b)) => {
                         let l = floor(self, *b);
                         self.s.sample_level(tex, smp, &coord, &[], l)
+                    }
+                    // implicit LOD with an offset and a linear mip filter: the console moves each of
+                    // the two blended mips by the offset in its own texels – sampled per mip and
+                    // blended here (PS, not lz). Anisotropic or point-mip samplers keep the one-mip
+                    // form of the last arm.
+                    _ if ovgpr.is_some() && ps && !has_lz => {
+                        let o = ovgpr.expect("offset");
+                        // the view's levels; a clamp past the last mip samples the last mip
+                        let n = self.s.m.extract(ofs_dims.expect("offset dims"), 3);
+                        let one = self.c(1);
+                        let n = self.umax(n, one);
+                        let last = self.sub(n, one);
+                        let l = self.s.calculate_lod(tex, smp, &spatial, true);
+                        let l = floor(self, l);
+                        let lastf = self.uitof(last);
+                        let l = self.fmin(l, lastf);
+                        let l0 = self.un(op::ROUND_NI, l);
+                        let l0u = self.ftoui(l0);
+                        let l1u = self.addc(l0u, 1);
+                        let l1u = self.umin(l1u, last);
+                        let l1 = self.uitof(l1u);
+                        let per_mip = |lw: &mut Lw, level: Value, lf: Value| {
+                            let (ofs, _) = lw.texel_offset(tex, dim, o, level);
+                            let mut c = coords_unmoved.clone();
+                            for (k, x) in c.iter_mut().enumerate() {
+                                if !((dim == 4 && k == 1) || (dim == 5 && k == 2)) {
+                                    *x = lw.fadd(*x, ofs[k]);
+                                }
+                            }
+                            match dim {
+                                4 => c[1] = lw.un(op::ROUND_NE, c[1]),
+                                5 => c[2] = lw.un(op::ROUND_NE, c[2]),
+                                _ => {}
+                            }
+                            lw.s.sample_level(tex, smp, &c, &[], lf)
+                        };
+                        let m0 = per_mip(self, l0u, l0);
+                        let m1 = per_mip(self, l1u, l1);
+                        let s1 = self.s.sample(tex, smp, &coord, &[], cl);
+                        // S# word 2: XY_MAG_FILTER [21:20], XY_MIN_FILTER [23:22], MIP_FILTER [27:26];
+                        // word 0: MAX_ANISO_RATIO [11:9] – anisotropic only with an aniso min / mag
+                        // filter, as `desc::sampler_d3d12` decides. A level-0 SampleLevel filters with
+                        // the mag filter, so mip 0 of a minified sample needs min = mag.
+                        let (w0, w2) = match self.static_samplers.get(&d.pc).copied() {
+                            Some(w) => (self.c(w[0]), self.c(w[2])),
+                            None => (self.sreg(ssamp), self.sreg(ssamp + 2)),
+                        };
+                        let field = |lw: &mut Lw, w: Value, sh: u32, m: u32| {
+                            let x = lw.lshrc(w, sh);
+                            lw.andc(x, m)
+                        };
+                        let mag = field(self, w2, 20, 3);
+                        let min = field(self, w2, 22, 3);
+                        let mip = field(self, w2, 26, 3);
+                        let ratio = field(self, w0, 9, 7);
+                        let linear = self.cmpc(Pred::Eq, mip, 2);
+                        let mag_a = self.cmpc(Pred::UGe, mag, 2);
+                        let min_a = self.cmpc(Pred::UGe, min, 2);
+                        let a = self.lor(mag_a, min_a);
+                        let r = self.nz(ratio);
+                        let aniso = self.land(a, r);
+                        let k1 = self.fc(1.0);
+                        let up = self.fcmp(Pred::FOGe, l0, k1);
+                        // a filter's linear bit: point 0, linear 1, aniso point 2, aniso linear 3
+                        let lin_of = |lw: &mut Lw, f: Value| {
+                            let x = lw.lshrc(f, 1);
+                            let x = lw.or(f, x);
+                            lw.andc(x, 1)
+                        };
+                        let mag_l = lin_of(self, mag);
+                        let min_l = lin_of(self, min);
+                        let same = self.cmp(Pred::Eq, mag_l, min_l);
+                        let exact = self.lor(up, same);
+                        let iso = self.lnot(aniso);
+                        let pm = self.land(linear, iso);
+                        let pm = self.land(pm, exact);
+                        let frac = self.fsub(l, l0);
+                        let mut r = s1;
+                        for (i, v) in r.iter_mut().enumerate() {
+                            let dlt = self.fsub(m1[i], m0[i]);
+                            let x = self.fmul(frac, dlt);
+                            let x = self.fadd(m0[i], x);
+                            *v = self.sel(pm, x, s1[i]);
+                        }
+                        r
                     }
                     _ if has_lz || !ps => {
                         let z = self.fc(0.0);
