@@ -37,7 +37,7 @@ pub struct KernelOptions {
 /// Version of the direct translator's output, part of the on-disk translation cache's
 /// identity (`recomp::pso`): bump it on any change that alters the emitted containers
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
-pub const TRANSLATOR_VERSION: u32 = 7;
+pub const TRANSLATOR_VERSION: u32 = 8;
 
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
@@ -568,8 +568,8 @@ pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3])
     let lanes: u32 = if lw.wave64 { 64 } else { 32 };
     let total: u32 = cs.threads.iter().product();
     if cs.tg_size {
-        // (threads / lanes) | (gi / lanes) << 6
-        let w = lw.c(total / lanes);
+        // waves in the group (a last partial one counts) | (gi / lanes) << 6
+        let w = lw.c(total.div_ceil(lanes));
         let l = lw.c(lanes);
         let i = lw.bin(super::module::BinOp::UDiv, tid, l);
         let i = lw.shlc(i, 6);
@@ -767,4 +767,32 @@ fn geom_init(lw: &mut Lw, g: &GsInterface, _tid: Value, io: super::shader::RawUa
     let none = lw.c(u32::MAX);
     lw.wr(base, none);
     lw.geom = Some(super::lower_geom::GeomCtx { g: g.clone(), emitted, strip, ntri, base, tri, maxt, rec });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TG_SIZE = the group's wave count (a last, partial wave counts) | the thread's wave
+    /// index << 6. With a constant thread index `compute_init` folds it to a constant, so
+    /// no GPU or DXC is needed: native and split wave64, and wave32.
+    #[test]
+    fn tg_size_counts_a_partial_last_wave() {
+        for (wave64, split) in [(false, false), (true, false), (true, true)] {
+            let lanes = if wave64 { 64 } else { 32 };
+            for threads in [[1, 1, 1], [40, 1, 1], [48, 1, 1], [64, 1, 1], [96, 1, 1], [128, 1, 1], [8, 12, 1]] {
+                let total: u32 = threads.iter().product();
+                let cs = CsInterface { threads, user_sgprs: 2, tgid: [false; 3], tg_size: true, tid_components: 1 };
+                let o = KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+                let mut lw = Lw::new(&[], &BTreeSet::new(), o, &Entry::Compute(cs.clone()));
+                for thread in 0..total {
+                    let tid = lw.c(thread);
+                    compute_init(&mut lw, &cs, tid, [tid; 3]);
+                    let v = lw.init.compute.as_ref().unwrap().sgpr[&2];
+                    let want = total.div_ceil(lanes) | (thread / lanes) << 6;
+                    assert_eq!(lw.s.m.const_u64(v), Some(want as u64), "{threads:?}, wave{lanes}, split {split}: thread {thread}");
+                }
+            }
+        }
+    }
 }
