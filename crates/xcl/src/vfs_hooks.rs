@@ -104,7 +104,32 @@ fn apply_open_decision(
             unsafe { SetLastError(error) };
             INVALID_HANDLE_VALUE
         }
+        // The open alone; `open_as_decided` hides the game file once it succeeded.
+        Decision::RemoveOnClose(inner, _) => apply_open_decision(*inner, disposition, passthrough, redirected),
     }
+}
+
+/// The hooks' open: `apply_open_decision`, then what the decision leaves for after a successful
+/// open – a delete-on-close handle to a game file hides that file, as DeleteFileW would.
+fn open_as_decided(
+    v: &vfs::Vfs,
+    decision: Decision,
+    disposition: u32,
+    passthrough: impl FnOnce() -> HANDLE,
+    redirected: impl FnOnce(*const u16, u32) -> HANDLE,
+) -> HANDLE {
+    let removal = match &decision {
+        Decision::RemoveOnClose(_, rel) => Some(rel.clone()),
+        _ => None,
+    };
+    let handle = apply_open_decision(decision, disposition, passthrough, redirected);
+    if let Some(rel) = removal.filter(|_| handle != INVALID_HANDLE_VALUE) {
+        // keep the open's own last error (ERROR_ALREADY_EXISTS for OPEN_ALWAYS / CREATE_ALWAYS)
+        let error = unsafe { GetLastError() };
+        v.commit_overlay_removal(&rel);
+        unsafe { SetLastError(error) };
+    }
+    handle
 }
 
 unsafe extern "system" fn hk_create_file_w(n: *const u16, acc: u32, sh: u32, sa: *const c_void, disp: u32, fl: u32, t: HANDLE) -> HANDLE {
@@ -112,7 +137,8 @@ unsafe extern "system" fn hk_create_file_w(n: *const u16, acc: u32, sh: u32, sa:
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(n, acc, sh, sa, disp, fl, t) };
     let Some(path) = from_wide_ptr(n) else { return orig(n, acc, sh, sa, disp, fl, t) };
     log_open("CreateFileW", &path, fl);
-    apply_open_decision(
+    open_as_decided(
+        v,
         v.open_decision(&path, acc, disp, fl),
         disp,
         || orig(n, acc, sh, sa, disp, fl, t),
@@ -125,7 +151,8 @@ unsafe extern "system" fn hk_create_file_a(n: *const u8, acc: u32, sh: u32, sa: 
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(n, acc, sh, sa, disp, fl, t) };
     let Some(path) = from_ansi_ptr(n) else { return orig(n, acc, sh, sa, disp, fl, t) };
     log_open("CreateFileA", &path, fl);
-    apply_open_decision(
+    open_as_decided(
+        v,
         v.open_decision(&path, acc, disp, fl),
         disp,
         || orig(n, acc, sh, sa, disp, fl, t),
@@ -140,7 +167,8 @@ unsafe extern "system" fn hk_create_file_2(n: *const u16, acc: u32, sh: u32, dis
     // CREATEFILE2_EXTENDED_PARAMETERS { dwSize, dwFileAttributes, dwFileFlags, ... }
     let flags = if params.is_null() { 0 } else { *((params as *const u8).add(8) as *const u32) };
     log_open("CreateFile2", &path, flags);
-    apply_open_decision(
+    open_as_decided(
+        v,
         v.open_decision(&path, acc, disp, flags),
         disp,
         || orig(n, acc, sh, disp, params),
@@ -546,6 +574,75 @@ unsafe extern "system" fn hk_delete_file_w(n: *const u16) -> i32 {
         Target::Translated(p) => orig(wide(&p).as_ptr()),
         Target::Game { rel } => bool_result(v.delete_file(&rel)),
     }
+}
+
+type FnSetFileInfoByHandle = unsafe extern "system" fn(HANDLE, i32, *const c_void, u32) -> i32;
+static O_SET_FILE_INFO_BY_HANDLE: AtomicUsize = AtomicUsize::new(0);
+
+const FILE_DISPOSITION_INFO_CLASS: i32 = 4; // FileDispositionInfo
+const FILE_DISPOSITION_INFO_EX_CLASS: i32 = 21; // FileDispositionInfoEx
+const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x1;
+
+/// Whether SetFileInformationByHandle(`class`, `info`, `size`) marks the file for deletion:
+/// FILE_DISPOSITION_INFO { BOOLEAN DeleteFile } or FILE_DISPOSITION_INFO_EX { DWORD Flags }.
+unsafe fn disposition_deletes(class: i32, info: *const c_void, size: u32) -> bool {
+    if info.is_null() {
+        return false;
+    }
+    match class {
+        FILE_DISPOSITION_INFO_CLASS if size >= 1 => *(info as *const u8) != 0,
+        FILE_DISPOSITION_INFO_EX_CLASS if size >= 4 => (info as *const u32).read_unaligned() & FILE_DISPOSITION_FLAG_DELETE != 0,
+        _ => false,
+    }
+}
+
+/// The real path of an open file, "\\?\" form.
+unsafe fn final_path(h: HANDLE) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS};
+    let mut buf = vec![0u16; 512];
+    for _ in 0..2 {
+        let n = GetFinalPathNameByHandleW(h, buf.as_mut_ptr(), buf.len() as u32, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS) as usize;
+        if n == 0 {
+            return None;
+        }
+        if n < buf.len() {
+            return Some(String::from_utf16_lossy(&buf[..n]));
+        }
+        buf.resize(n + 1, 0);
+    }
+    None
+}
+
+/// Deleting by handle (FileDispositionInfo / FileDispositionInfoEx, which MSVC's
+/// std::filesystem::remove uses with FILE_DISPOSITION_FLAG_POSIX_SEMANTICS): a handle that may
+/// delete a game file is one to its overlay copy (an open with DELETE access is a write), so
+/// once the overlay file is marked the game file under it is hidden too, as DeleteFileW does.
+/// Clearing the mark changes nothing: the overlay file, while it stays, covers the whiteout.
+/// Directories are left as they are (whether the merged directory is empty is not checked here).
+unsafe fn set_file_info_vfs(v: &vfs::Vfs, h: HANDLE, class: i32, info: *const c_void, size: u32, orig: impl FnOnce() -> i32) -> i32 {
+    if !disposition_deletes(class, info, size) {
+        return orig();
+    }
+    // before the call: a POSIX delete takes the name away at once
+    let rel = final_path(h)
+        .and_then(|p| v.overlay_rel(&p))
+        .filter(|rel| !std::path::Path::new(&v.overlay_path(rel)).is_dir());
+    let ok = orig();
+    if let Some(rel) = rel.filter(|_| ok != 0) {
+        let error = GetLastError();
+        v.commit_overlay_removal(&rel);
+        SetLastError(error);
+    }
+    ok
+}
+
+unsafe extern "system" fn hk_set_file_info_by_handle(h: HANDLE, class: i32, info: *const c_void, size: u32) -> i32 {
+    let orig = orig!(O_SET_FILE_INFO_BY_HANDLE as FnSetFileInfoByHandle);
+    if !disposition_deletes(class, info, size) {
+        return orig(h, class, info, size);
+    }
+    let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(h, class, info, size) };
+    set_file_info_vfs(v, h, class, info, size, || orig(h, class, info, size))
 }
 
 /// Source for a copy/move: (real path to read, game rel if it lives in the game folder).
@@ -1197,6 +1294,7 @@ pub fn install() -> Result<(), String> {
         ("CreateDirectoryW", hk_create_dir_w as usize, &O_CREATE_DIR_W),
         ("RemoveDirectoryW", hk_remove_dir_w as usize, &O_REMOVE_DIR_W),
         ("DeleteFileW", hk_delete_file_w as usize, &O_DELETE_FILE_W),
+        ("SetFileInformationByHandle", hk_set_file_info_by_handle as usize, &O_SET_FILE_INFO_BY_HANDLE),
         ("ReadFile", hk_read_file as usize, &O_READ_FILE),
         ("MoveFileExW", hk_move_file_ex_w as usize, &O_MOVE_FILE_EX_W),
         ("MoveFileWithProgressW", hk_move_file_with_progress_w as usize, &O_MOVE_FILE_PROGRESS_W),
@@ -1381,6 +1479,80 @@ mod tests {
 
         f.vfs.delete_file(r"data\gone.txt").unwrap();
         assert_eq!(overwrite(r"G:\data\gone.txt"), 0, "creating a whited-out file");
+    }
+
+    /// Deleting a game file by handle hides it as DeleteFileW does and leaves the game folder
+    /// alone: an open with FILE_FLAG_DELETE_ON_CLOSE, and FileDispositionInfo(Ex) the way MSVC's
+    /// std::filesystem::remove does it (DELETE access, then a POSIX delete, else the plain one).
+    #[test]
+    fn deleting_a_game_file_by_handle_hides_it() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileDispositionInfo, FileDispositionInfoEx, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_FLAG_DELETE,
+            FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_DELETE_ON_CLOSE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, OPEN_EXISTING,
+        };
+        let f = HookFixture::new("delete_by_handle");
+        let v = &f.vfs;
+        let open_real = |p: *const u16, access: u32, flags: u32| unsafe {
+            CreateFileW(p, access, 7, std::ptr::null(), OPEN_EXISTING, flags, std::ptr::null_mut())
+        };
+        let open = |path: &str, access: u32, flags: u32| {
+            let decision = v.open_decision(path, access, OPEN_EXISTING, flags);
+            let h = open_as_decided(v, decision, OPEN_EXISTING, || panic!("game paths go through the VFS"), |p, _| {
+                open_real(p, access, flags)
+            });
+            assert_ne!(h, INVALID_HANDLE_VALUE, "open {path}: error {}", unsafe { GetLastError() });
+            h
+        };
+        let delete = |h: HANDLE, posix: bool| {
+            let ex = FILE_DISPOSITION_INFO_EX { Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS };
+            let plain = FILE_DISPOSITION_INFO { DeleteFile: true };
+            let (class, info, size) = if posix {
+                (FileDispositionInfoEx, &ex as *const _ as *const c_void, std::mem::size_of_val(&ex) as u32)
+            } else {
+                (FileDispositionInfo, &plain as *const _ as *const c_void, std::mem::size_of_val(&plain) as u32)
+            };
+            unsafe { set_file_info_vfs(v, h, class, info, size, || SetFileInformationByHandle(h, class, info, size)) }
+        };
+        let close = |h: HANDLE| assert_ne!(unsafe { CloseHandle(h) }, 0);
+        let original = |name: &str| std::fs::read(f.game().join("data").join(name)).unwrap();
+
+        // a directory is left as it was: the game files in it stay
+        let h = open(r"G:\data", DELETE, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        assert_ne!(delete(h, false), 0);
+        close(h);
+        assert!(v.is_dir("data"));
+        assert_eq!(f.read_vfs(r"G:\data\hello.txt").as_deref(), Some(&b"original"[..]));
+
+        // delete-on-close: the file stays until its handle closes
+        let h = open(r"G:\data\hello.txt", FILE_GENERIC_READ | DELETE, FILE_FLAG_DELETE_ON_CLOSE);
+        assert_eq!(f.read_vfs(r"G:\data\hello.txt").as_deref(), Some(&b"original"[..]));
+        close(h);
+        assert!(!v.exists(r"data\hello.txt"));
+        assert_eq!(f.read_vfs(r"G:\data\hello.txt"), None);
+        assert_eq!(original("hello.txt"), b"original");
+
+        // std::filesystem::remove
+        let h = open(r"G:\data\gone.txt", DELETE, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        if delete(h, true) != 0 {
+            assert!(!v.exists(r"data\gone.txt"), "a POSIX delete takes the name at once");
+        } else {
+            assert!(v.whiteouts().iter().all(|w| w != r"data\gone.txt"), "a failed call hides nothing");
+            assert_ne!(delete(h, false), 0, "error {}", unsafe { GetLastError() });
+        }
+        close(h);
+        assert!(!v.exists(r"data\gone.txt"));
+        assert_eq!(original("gone.txt"), b"bye");
+
+        // a file outside the game folder is Windows' own business
+        let scratch = f.temp().join("scratch.bin");
+        std::fs::write(&scratch, b"x").unwrap();
+        let h = open_real(wide(&scratch.to_string_lossy()).as_ptr(), DELETE, 0);
+        assert_ne!(h, INVALID_HANDLE_VALUE);
+        assert_ne!(delete(h, false), 0);
+        close(h);
+        assert!(!scratch.exists());
+        assert_eq!(v.whiteouts(), vec![r"data\gone.txt".to_string(), r"data\hello.txt".to_string()]);
     }
 
     fn real_move(s: *const u16, d: *const u16, f: u32) -> i32 {

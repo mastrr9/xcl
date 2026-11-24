@@ -31,6 +31,11 @@ pub enum Decision {
     UseWithDisposition(String, u32),
     /// CREATE_ALWAYS creates an overlay file over an existing original.
     CreateOverOriginal(String),
+    /// Open as the inner decision says, with FILE_FLAG_DELETE_ON_CLOSE: closing the handle
+    /// deletes the overlay file, so once the open succeeds the game file `rel` covers is hidden
+    /// too (`Vfs::commit_overlay_removal`), as DeleteFileW would. Until the handle closes the
+    /// overlay file keeps the name visible, as Windows does for a file whose delete is pending.
+    RemoveOnClose(Box<Decision>, String),
     /// Fail with this Win32 error code.
     Fail(u32),
 }
@@ -51,6 +56,7 @@ const OPEN_ALWAYS: u32 = 4;
 const TRUNCATE_EXISTING: u32 = 5;
 
 const GENERIC_WRITE: u32 = 0x4000_0000;
+const DELETE: u32 = 0x0001_0000;
 const WRITE_ACCESS: u32 = GENERIC_WRITE
     | 0x1000_0000 // GENERIC_ALL
     | 0x0000_0002 // FILE_WRITE_DATA / ADD_FILE
@@ -534,6 +540,18 @@ impl Vfs {
     }
 
     pub fn open_decision_for(&self, target: Target, access: u32, disposition: u32, flags: u32) -> Decision {
+        if let (Target::Game { rel }, true) = (&target, flags & FILE_FLAG_DELETE_ON_CLOSE != 0) {
+            // A file opened delete-on-close goes when its handle closes, the game file with it.
+            // The open itself is the write CreateFileW makes of it (it adds DELETE access). A
+            // directory goes only if it is empty then, which the overlay cannot tell: left as is.
+            let rel = rel.clone();
+            let decision = self.open_decision_for(target, access | DELETE, disposition, flags & !FILE_FLAG_DELETE_ON_CLOSE);
+            return match decision {
+                Decision::Pass | Decision::Fail(_) => decision,
+                _ if Path::new(&self.overlay_path(&rel)).is_dir() => decision,
+                _ => Decision::RemoveOnClose(Box::new(decision), rel),
+            };
+        }
         match target {
             Target::Pass => Decision::Pass,
             Target::Translated(p) => {
@@ -598,6 +616,21 @@ impl Vfs {
 
     pub fn open_decision(&self, path: &str, access: u32, disposition: u32, flags: u32) -> Decision {
         self.open_decision_for(self.classify(path), access, disposition, flags)
+    }
+
+    /// The game path `rel` of a file in the overlay, from the real path of a handle to it
+    /// (GetFinalPathNameByHandleW: "\\?\" form, 8.3 names and links resolved). None for a path
+    /// outside the overlay, for the overlay folder itself and for XCL's whiteout list.
+    pub fn overlay_rel(&self, real: &str) -> Option<String> {
+        let path = strip_verbatim(&norm(real));
+        let canonical = std::fs::canonicalize(&self.overlay).ok().map(|p| p.to_string_lossy().into_owned());
+        let roots = canonical.into_iter().chain(full_path(&self.overlay)).chain([self.overlay.clone()]);
+        roots.map(|root| trim_sep(&strip_verbatim(&norm(&root)))).find_map(|root| {
+            let head = path.get(..root.len())?;
+            let rest = path[root.len()..].strip_prefix('\\')?.trim_end_matches('\\');
+            (head.eq_ignore_ascii_case(&root) && !rest.is_empty() && !rest.eq_ignore_ascii_case(".xcl_whiteouts"))
+                .then(|| rest.to_string())
+        })
     }
 
     pub fn delete_file(&self, rel: &str) -> Result<(), u32> {
@@ -1008,6 +1041,39 @@ mod tests {
         std::fs::write(&ov_file, b"hi").unwrap();
         assert_eq!(v.remove_dir("data\\ov_only.txt"), Err(ERROR_DIRECTORY));
         assert!(v.visible_in_overlay("data\\ov_only.txt"));
+    }
+
+    /// CreateFileW(..., DELETE, ..., FILE_FLAG_DELETE_ON_CLOSE) on a game file opens its overlay
+    /// copy and has the hooks hide the game file once the open succeeded (closing the handle
+    /// deletes only the copy).
+    #[test]
+    fn delete_on_close_opens_remove_the_game_file() {
+        let f = Fixture::new("delete_on_close");
+        let v = &f.vfs;
+        let ov = v.overlay_path("data\\hello.txt");
+        let d = v.open_decision("G:\\data\\hello.txt", 0x8000_0000 | DELETE, OPEN_EXISTING, FILE_FLAG_DELETE_ON_CLOSE);
+        assert_eq!(d, Decision::RemoveOnClose(Box::new(Decision::Use(ov.clone())), "data\\hello.txt".into()));
+        assert_eq!(std::fs::read(&ov).unwrap(), b"original", "the handle still reads the file");
+        assert!(!v.is_whiteout("data\\hello.txt"), "nothing is hidden before the open succeeded");
+        // a scratch file created over a game file
+        let d = v.open_decision("G:\\data\\gone.txt", GENERIC_WRITE | DELETE, CREATE_ALWAYS, FILE_FLAG_DELETE_ON_CLOSE);
+        let inner = Decision::CreateOverOriginal(v.overlay_path("data\\gone.txt"));
+        assert_eq!(d, Decision::RemoveOnClose(Box::new(inner), "data\\gone.txt".into()));
+        // failures stay failures; a directory opens as before
+        let d = v.open_decision("G:\\data\\none.txt", DELETE, OPEN_EXISTING, FILE_FLAG_DELETE_ON_CLOSE);
+        assert_eq!(d, Decision::Fail(ERROR_FILE_NOT_FOUND));
+        let d = v.open_decision("G:\\data", DELETE, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_DELETE_ON_CLOSE);
+        assert_eq!(d, Decision::Use(v.overlay_path("data")));
+
+        // from the real path of a handle back to the game path
+        let real = std::fs::canonicalize(&ov).unwrap().to_string_lossy().into_owned();
+        assert!(real.starts_with("\\\\?\\"), "{real}");
+        assert_eq!(v.overlay_rel(&real).as_deref(), Some("data\\hello.txt"));
+        assert_eq!(v.overlay_rel(&ov.to_ascii_uppercase()).as_deref(), Some("DATA\\HELLO.TXT"));
+        assert_eq!(v.overlay_rel(&v.overlay_path("")), None);
+        assert_eq!(v.overlay_rel(&v.overlay_path(".xcl_whiteouts")), None);
+        assert_eq!(v.overlay_rel(&v.original_path("data\\hello.txt")), None);
+        assert_eq!(v.overlay_rel(&format!("{}x\\data\\hello.txt", v.overlay_path(""))), None);
     }
 
     #[test]
