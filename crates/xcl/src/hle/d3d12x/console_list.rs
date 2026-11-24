@@ -760,11 +760,15 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let mut bound_heaps: Vec<ID3D12DescriptorHeap> = Vec::new();
     let mut has_sampler_heap = false;
     let chunks: Vec<Vec<u32>> = st.chunks.iter().map(|(c, used)| c[..*used].chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect()).collect();
+    let mut run = BarrierRun::default();
     'chunks: for words in &chunks {
         let mut at = 0usize;
         while at < words.len() {
             let w0 = words[at];
             let get = |k: usize| words.get(at + k).copied().unwrap_or(0);
+            if w0 != TRANSITIONS_MARKER && w0 != BARRIER_MARKER {
+                run.record(&list);
+            }
             if w0 == PIPE_MARKER {
                 pso = Some((get(2) as usize | (get(3) as usize) << 32) as *const ConsolePso);
                 at += 7;
@@ -807,7 +811,10 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                             b.chunks_exact(4).filter(|c| c[0] as u32 == 0).map(|c| (c[1] as usize, c[2] as u32, D3D12_RESOURCE_STATES(c[3] as u32 as i32))).collect();
                         super::title_textures::note_transitions(st.pc, &t);
                     }
-                    list.ResourceBarrier(std::slice::from_raw_parts(b.as_ptr() as *const D3D12_RESOURCE_BARRIER, n));
+                    if run.meets(&b) {
+                        run.record(&list);
+                    }
+                    run.add(&b);
                 }
                 out.barriers += n as u32;
                 at += 2 + 8 * n;
@@ -866,11 +873,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 }
                 at += 35;
             } else if w0 == BARRIER_MARKER {
-                list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                    Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }) },
-                }]);
+                run.uav_all();
                 out.barriers += 1;
                 at += 1;
             } else if w0 == DISPATCH || w0 & !4 == 0x4002_E800 {
@@ -957,6 +960,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
             }
         }
     }
+    run.record(&list);
     drop(guard);
     if std::env::var_os("XCL_CONSOLE_LISTS_LOG").is_some() {
         crate::xlog_info!(
@@ -976,6 +980,63 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     Ok(out)
 }
 
+/// Barrier records in a row (nothing recorded between them), as one ResourceBarrier: one drain
+/// for the run, where a call per record drained for each. Each barrier is 4 words (D3D12_RESOURCE_BARRIER:
+/// type | flags, then the union); the run holds one UAV barrier for all resources at most, and
+/// a record naming a resource the run already moves starts a new run (one call may not move a
+/// resource twice), so the barriers keep their order where it matters.
+#[derive(Default)]
+struct BarrierRun {
+    barriers: Vec<u64>,
+    uav_all: bool,
+}
+
+impl BarrierRun {
+    /// The resources a barrier names (type 0 transition, 2 UAV: one at +8; 1 aliasing: two).
+    fn resources(b: &[u64]) -> impl Iterator<Item = u64> + '_ {
+        b.chunks_exact(4).flat_map(|c| [c[1], if c[0] as u32 == 1 { c[2] } else { 0 }]).filter(|&r| r != 0)
+    }
+
+    /// Whether `record` names a resource a barrier of the run names.
+    fn meets(&self, record: &[u64]) -> bool {
+        let named: Vec<u64> = Self::resources(&self.barriers).collect();
+        Self::resources(record).any(|r| named.contains(&r))
+    }
+
+    fn add(&mut self, record: &[u64]) {
+        for c in record.chunks_exact(4) {
+            // a UAV barrier for all resources the run has already
+            if c[0] as u32 == 2 && c[1] == 0 {
+                if self.uav_all {
+                    continue;
+                }
+                self.uav_all = true;
+            }
+            self.barriers.extend_from_slice(c);
+        }
+    }
+
+    /// A UAV barrier for all resources.
+    fn uav_all(&mut self) {
+        self.add(&[2, 0, 0, 0]);
+    }
+
+    /// The run's barriers, the run left empty.
+    fn take(&mut self) -> Vec<u64> {
+        self.uav_all = false;
+        std::mem::take(&mut self.barriers)
+    }
+
+    /// The run as one ResourceBarrier on `list` (none for an empty run).
+    unsafe fn record(&mut self, list: &ID3D12GraphicsCommandList) {
+        let b = self.take();
+        if !b.is_empty() {
+            // the resource pointers are borrowed (ManuallyDrop fields, nothing released)
+            list.ResourceBarrier(std::slice::from_raw_parts(b.as_ptr() as *const D3D12_RESOURCE_BARRIER, b.len() / 4));
+        }
+    }
+}
+
 fn bytemuck_u32(v: &[u32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
 }
@@ -983,6 +1044,42 @@ fn bytemuck_u32(v: &[u32]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Barrier records with nothing between them go in one ResourceBarrier: transitions of
+    /// different resources and UAV barriers for all resources join one run, which keeps one
+    /// such UAV barrier; a record naming a resource the run already moves starts a new run.
+    #[test]
+    fn barrier_records_in_a_row_are_one_call() {
+        // transition: type 0 | flags, resource, subresource | before << 32, after
+        let t = |res: u64, before: u64, after: u64| [0u64, res, before << 32, after];
+        let mut run = BarrierRun::default();
+        // UAV barrier, two transitions of A and B, UAV barrier, a transition of C: one call
+        run.uav_all();
+        let ab: Vec<u64> = [t(0xA0, 0x8, 0xC0), t(0xB0, 0x4, 0x8)].concat();
+        assert!(!run.meets(&ab));
+        run.add(&ab);
+        run.uav_all();
+        let c = t(0xC0, 0x80, 0x400);
+        assert!(!run.meets(&c));
+        run.add(&c);
+        let want: Vec<u64> = [[2, 0, 0, 0], t(0xA0, 0x8, 0xC0), t(0xB0, 0x4, 0x8), c].concat();
+        assert_eq!(run.take(), want, "one UAV barrier for all resources, the transitions in order");
+        assert!(run.take().is_empty(), "taken: the run is empty");
+        // A again, a UAV barrier of B, aliasing onto D: each meets the run that names it
+        run.add(&t(0xA0, 0xC0, 0x8));
+        assert!(run.meets(&t(0xA0, 0x8, 0xC0)), "A twice in one call");
+        assert!(!run.meets(&t(0xD0, 0x8, 0xC0)));
+        run.add(&[2, 0xB0, 0, 0]);
+        assert!(run.meets(&t(0xB0, 0x8, 0x4)), "a UAV barrier of B names B");
+        run.add(&[1, 0, 0xD0, 0]);
+        assert!(run.meets(&t(0xD0, 0x8, 0xC0)), "aliasing onto D names D");
+        assert!(!run.meets(&[2, 0, 0, 0]), "a UAV barrier for all resources names none");
+        // a UAV barrier for all resources after a new start is kept again
+        assert_eq!(run.take().len(), 12);
+        run.uav_all();
+        run.uav_all();
+        assert_eq!(run.take(), vec![2, 0, 0, 0]);
+    }
 
     #[test]
     fn layout_packs_parameters_in_order() {
