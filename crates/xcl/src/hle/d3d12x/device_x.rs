@@ -1251,7 +1251,7 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
             a[0] = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32;
         }
     }
-    let needs_root = list.iter().any(|a| (5..=8).contains(&a[0]));
+    let needs_root = list.iter().any(|a| changes_root(a[0]));
     pc[8..16].copy_from_slice(&(if list.is_empty() { 0 } else { list.as_ptr() as u64 }).to_le_bytes());
     let hr = real::dev_create_command_signature(this, pc.as_ptr() as usize, if needs_root { root } else { 0 }, riid, ppv);
     if hr >= 0 && !ppv.is_null() && needs_root {
@@ -1263,9 +1263,27 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     hr
 }
 
+/// Whether an indirect argument of type `ty` sets a root argument (the command signature then
+/// needs the root signature): root constants, root CBV / SRV / UAV and the incrementing
+/// constant, which writes a root constant too.
+fn changes_root(ty: u32) -> bool {
+    [D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW, D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW, D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW, D3D12_INDIRECT_ARGUMENT_TYPE_INCREMENTING_CONSTANT]
+        .iter()
+        .any(|t| t.0 as u32 == ty)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incrementing_constants_change_root_arguments() {
+        assert!(changes_root(D3D12_INDIRECT_ARGUMENT_TYPE_INCREMENTING_CONSTANT.0 as u32), "it writes a root constant");
+        assert!((5..=8).all(changes_root));
+        for t in [D3D12_INDIRECT_ARGUMENT_TYPE_DRAW, D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW, D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH] {
+            assert!(!changes_root(t.0 as u32), "{t:?}");
+        }
+    }
 
     #[test]
     fn console_types_and_descs_become_pc_ones() {
