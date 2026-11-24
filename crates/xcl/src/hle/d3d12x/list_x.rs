@@ -112,6 +112,17 @@ unsafe fn as_copy_dest(list: *mut c_void, res: usize, op: impl FnOnce()) {
     transition(list, res, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
 }
 
+/// `op`, a write that orders itself after the work before it or needs no order with it (a
+/// WriteBufferImmediate, a query resolve), with the window buffer `res` as its copy destination,
+/// back to COMMON after it. A buffer in COMMON is promoted to COPY_DEST by its first use as one
+/// (D3D12's implicit state promotion, which takes no barrier), so only the transition back is
+/// recorded. A copy or a fill keeps `as_copy_dest`: its barrier before orders the earlier
+/// shader writes it reads or overwrites, which a CopyBufferRegion does not wait for itself.
+unsafe fn as_promoted_copy_dest(list: *mut c_void, res: usize, op: impl FnOnce()) {
+    op();
+    transition(list, res, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+}
+
 unsafe fn copy_buffer_region(list: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
     pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(list, PC_COPY_BUFFER_REGION)(list, dst, dst_off, src, src_off, n);
 }
@@ -2276,10 +2287,22 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
     };
     note_write(list as usize, va, n);
-    let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words.iter().enumerate().map(|(i, &w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * i as u64, Value: w }).collect();
-    let modes = vec![mode; words.len()];
+    write_window(list, d, at, words, mode);
+}
+
+/// The WriteBufferImmediate of `words` (one or two) at the GPU address `at` in the window buffer
+/// `d`, and one barrier after it (`as_promoted_copy_dest`). WriteBufferImmediate needs its
+/// destination in COPY_DEST; the buffer is in COMMON and promoted to it. A MARKER_OUT write
+/// waits for the work before it by itself; a MARKER_IN one is written when it is reached, as
+/// the console's top-of-pipe write. (A barrier before it as well made each label two barrier
+/// batches.)
+unsafe fn write_window(list: *mut c_void, d: usize, at: u64, words: &[u32], mode: D3D12_WRITEBUFFERIMMEDIATE_MODE) {
+    debug_assert!(words.len() <= 2, "a label is one or two words");
+    let words = &words[..words.len().min(2)];
+    let params: [D3D12_WRITEBUFFERIMMEDIATE_PARAMETER; 2] = std::array::from_fn(|i| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * i as u64, Value: words.get(i).copied().unwrap_or(0) });
+    let modes = [mode; 2];
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
-    as_copy_dest(list, d, || pc::<F>(list, PC_WRITE_BUFFER_IMMEDIATE)(list, params.len() as u32, params.as_ptr(), modes.as_ptr()));
+    as_promoted_copy_dest(list, d, || pc::<F>(list, PC_WRITE_BUFFER_IMMEDIATE)(list, words.len() as u32, params.as_ptr(), modes.as_ptr()));
 }
 
 /// timestamp queries (one heap per device, used round-robin) and a lazily created READBACK
@@ -2369,8 +2392,7 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
     type Resolve = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
     if let Some((d, off)) = uma_dst {
         note_write(list as usize, va, 8);
-        pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
-        as_copy_dest(list, d, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, d, off));
+        timestamp_into_window(list, heap, i, d, off);
     } else if let Some((rb, base)) = readback {
         // Queue the CPU copy only if the list is tracked; otherwise avoid emitting an unused resolve.
         let mut g = LISTS.lock().unwrap();
@@ -2384,6 +2406,16 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
         pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
         pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, rb_raw, off);
     }
+}
+
+/// The timestamp query `i` of `heap`, resolved into the window buffer `d` at `off`, and one
+/// barrier after the resolve (`as_promoted_copy_dest`: ResolveQueryData needs its destination
+/// in COPY_DEST, the buffer is promoted to it from COMMON; the resolve is ordered after the
+/// query by the runtime).
+unsafe fn timestamp_into_window(list: *mut c_void, heap: usize, i: u32, d: usize, off: u64) {
+    type Resolve = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
+    pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
+    as_promoted_copy_dest(list, d, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, d, off));
 }
 
 /// command list #69 Write32BitValueBottomOfPipeX(address, value, flush, flags)
@@ -5198,6 +5230,217 @@ mod tests {
         on_release(list_key);
         assert!(!has_list_state(list_key));
         assert_eq!(fake_res.refs.load(Ordering::Relaxed), 0);
+    }
+
+    /// Labels (WriteBufferImmediate) and timestamp resolves into a window buffer take one
+    /// barrier each, after the write; copies and fills keep theirs before and after. Replayed
+    /// with D3D12's buffer state rules (a buffer in COMMON is promoted to COPY_DEST by its first
+    /// use as one; an explicit transition starts from the state the buffer is in), every command
+    /// finds the buffer in a state it may use, and the draw after them finds it back in COMMON.
+    #[test]
+    fn window_labels_take_one_barrier_each() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum Ev {
+            Barrier(usize, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES),
+            /// (destination, value) and mode of each word
+            Write(Vec<(u64, u32)>, Vec<D3D12_WRITEBUFFERIMMEDIATE_MODE>),
+            EndQuery(usize, u32),
+            Resolve(usize, u32, usize, u64),
+            Copy(usize, u64, usize, u64, u64),
+        }
+
+        #[repr(C)]
+        struct FakeLabelList {
+            vt: *const usize,
+            events: Mutex<Vec<Ev>>,
+        }
+
+        unsafe fn push(this: *mut c_void, e: Ev) {
+            (*(this as *const FakeLabelList)).events.lock().unwrap().push(e);
+        }
+        unsafe extern "system" fn fake_resource_barrier(this: *mut c_void, count: u32, barriers: *const D3D12_RESOURCE_BARRIER) {
+            for i in 0..count as usize {
+                let b = &*barriers.add(i);
+                assert_eq!(b.Type, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION);
+                let tr = &*b.Anonymous.Transition;
+                let res = (std::ptr::addr_of!(tr.pResource) as *const usize).read_unaligned();
+                push(this, Ev::Barrier(res, tr.StateBefore, tr.StateAfter));
+            }
+        }
+        unsafe extern "system" fn fake_write(this: *mut c_void, n: u32, params: *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, modes: *const D3D12_WRITEBUFFERIMMEDIATE_MODE) {
+            let p = std::slice::from_raw_parts(params, n as usize).iter().map(|p| (p.Dest, p.Value)).collect();
+            push(this, Ev::Write(p, std::slice::from_raw_parts(modes, n as usize).to_vec()));
+        }
+        unsafe extern "system" fn fake_end_query(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, i: u32) {
+            assert_eq!(ty, D3D12_QUERY_TYPE_TIMESTAMP);
+            push(this, Ev::EndQuery(heap, i));
+        }
+        unsafe extern "system" fn fake_resolve(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, i: u32, n: u32, dst: usize, off: u64) {
+            assert_eq!((ty, n), (D3D12_QUERY_TYPE_TIMESTAMP, 1));
+            push(this, Ev::Resolve(heap, i, dst, off));
+        }
+        unsafe extern "system" fn fake_copy(this: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
+            push(this, Ev::Copy(dst, dst_off, src, src_off, n));
+        }
+
+        let mut orig_vt = [0usize; PC_WRITE_BUFFER_IMMEDIATE + 1];
+        orig_vt[PC_RESOURCE_BARRIER] = fake_resource_barrier as usize;
+        orig_vt[PC_WRITE_BUFFER_IMMEDIATE] = fake_write as usize;
+        orig_vt[PC_END_QUERY] = fake_end_query as usize;
+        orig_vt[PC_RESOLVE_QUERY_DATA] = fake_resolve as usize;
+        orig_vt[PC_COPY_BUFFER_REGION] = fake_copy as usize;
+        let mut ext_vt = [0usize; PC_WRITE_BUFFER_IMMEDIATE + 2];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        // SAFETY: slot 0 of the extended table is at `.add(1)`, the PC table's address before it.
+        let fake = Box::new(FakeLabelList { vt: unsafe { ext_vt.as_ptr().add(1) }, events: Mutex::new(Vec::new()) });
+        let list = &*fake as *const FakeLabelList as *mut c_void;
+        let (win, other, heap) = (0xA000_0000usize, 0xB000_0000usize, 0xC000usize);
+        let (out, inn) = (D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN);
+        let (common, dest) = (D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+
+        unsafe {
+            write_window(list, win, 0x1_0000, &[7], out); // Write32BitValueBottomOfPipeX
+            write_window(list, win, 0x2_0000, &[1, 2], out); // Write64BitValueBottomOfPipeX
+            write_window(list, win, 0x3_0000, &[9], inn); // Write32BitValueTopOfPipeX
+            timestamp_into_window(list, heap, 5, win, 0x40); // a timestamp
+            as_copy_dest(list, win, || copy_buffer_region(list, win, 0x80, other, 0, 8)); // a fill / copy
+        }
+        let events = std::mem::take(&mut *fake.events.lock().unwrap());
+        assert_eq!(
+            events,
+            [
+                Ev::Write(vec![(0x1_0000, 7)], vec![out]),
+                Ev::Barrier(win, dest, common),
+                Ev::Write(vec![(0x2_0000, 1), (0x2_0004, 2)], vec![out, out]),
+                Ev::Barrier(win, dest, common),
+                Ev::Write(vec![(0x3_0000, 9)], vec![inn]),
+                Ev::Barrier(win, dest, common),
+                Ev::EndQuery(heap, 5),
+                Ev::Resolve(heap, 5, win, 0x40),
+                Ev::Barrier(win, dest, common),
+                Ev::Barrier(win, common, dest),
+                Ev::Copy(win, 0x80, other, 0, 8),
+                Ev::Barrier(win, dest, common),
+            ]
+        );
+        // three labels and a timestamp: 4 barriers (8 with one before each as well)
+        assert_eq!(events.iter().take(9).filter(|e| matches!(e, Ev::Barrier(..))).count(), 4);
+
+        // the window's state through the list, as D3D12 tracks it for a buffer
+        let mut state = common;
+        for e in &events {
+            match *e {
+                Ev::Barrier(r, before, after) => {
+                    assert_eq!(r, win);
+                    assert_eq!(before, state, "a transition from a state the buffer is not in: {e:?}");
+                    state = after;
+                }
+                Ev::Write(..) | Ev::Resolve(..) | Ev::Copy(..) => {
+                    // a copy destination: COPY_DEST, or COMMON, which is promoted to it
+                    if state == common {
+                        state = dest;
+                    }
+                    assert_eq!(state, dest, "{e:?} with the window in {state:?}");
+                }
+                Ev::EndQuery(..) => {}
+            }
+        }
+        assert_eq!(state, common, "a draw after the labels must find the window in COMMON");
+    }
+
+    /// The labels' path on a real list: two WriteBufferImmediate labels into a buffer in COMMON
+    /// with no barrier before them, then a copy out of the buffer (promoted from COMMON again,
+    /// so the buffer must be back in it), sees both values.
+    #[test]
+    fn window_labels_land_before_a_later_read() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            let desc = |w: u64, flags| D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: w,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: flags,
+                ..Default::default()
+            };
+            let mut buf: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &desc(0x1_0000, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buf,
+            )
+            .unwrap();
+            let buf = buf.unwrap();
+            let mut rb: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &desc(256, D3D12_RESOURCE_FLAG_NONE),
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut rb,
+            )
+            .unwrap();
+            let rb = rb.unwrap();
+
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            if list.cast::<ID3D12GraphicsCommandList2>().is_err() {
+                crate::gpu::recomp::runner::skip_test("no WriteBufferImmediate");
+                return;
+            }
+            // `pc` reads the PC table through slot -1 of an extended one
+            let list_ptr = list.as_raw();
+            let orig_vt = *(list_ptr as *const *const usize);
+            let mut ext_vt = [0usize; PC_WRITE_BUFFER_IMMEDIATE + 2];
+            ext_vt[0] = orig_vt as usize;
+            std::ptr::copy_nonoverlapping(orig_vt, ext_vt.as_mut_ptr().add(1), PC_WRITE_BUFFER_IMMEDIATE + 1);
+            *(list_ptr as *mut *const usize) = ext_vt.as_ptr().add(1);
+
+            let (d, va) = (buf.as_raw() as usize, buf.GetGPUVirtualAddress());
+            write_window(list_ptr, d, va + 0x100, &[0x677], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT);
+            write_window(list_ptr, d, va + 0x108, &[0x1122_3344, 0x5566_7788], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN);
+
+            *(list_ptr as *mut *const usize) = orig_vt;
+            list.CopyBufferRegion(&rb, 0, &buf, 0x100, 16);
+            list.Close().unwrap();
+            q.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            q.Signal(&fence, 1).unwrap();
+            crate::gpu::fence::wait(&fence, 1, &dev, None, 2000).unwrap();
+
+            let mut p = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut p)).unwrap();
+            let got = std::slice::from_raw_parts(p as *const u32, 4).to_vec();
+            rb.Unmap(0, None);
+            assert_eq!(got, [0x677, 0, 0x1122_3344, 0x5566_7788]);
+        }
     }
 
     /// Write64BitValueBottomOfPipeX / Write64BitValueTopOfPipeX with timestamp flags targeting
