@@ -72,6 +72,21 @@ impl Lw {
         s
     }
 
+    /// abs / neg of source `i` applied to the sign bit of a value kept as bits (`sign` is
+    /// 0x8000_0000, or 0x8000 for an f16 in the low half): abs clears it, then neg flips it.
+    /// For ops that move or select the value, so a NaN or denormal is otherwise unchanged.
+    pub fn sign_bit_mods(&mut self, m: &Mods, i: usize, u: Value, sign: u32) -> Value {
+        let mut s = u;
+        if m.abs[i] {
+            s = self.andc(s, !sign);
+        }
+        if m.neg[i] {
+            let k = self.c(sign);
+            s = self.xor(s, k);
+        }
+        s
+    }
+
     /// Float result with output modifiers, as dword bits.
     pub fn fres(&mut self, m: &Mods, e: Value) -> Value {
         let mut s = match m.omod {
@@ -455,6 +470,7 @@ impl Lw {
             }
             "v_cvt_f32_f16" => {
                 let h = if m.opsel & 1 == 1 { self.lshrc(a, 16) } else { self.andc(a, 0xFFFF) };
+                let h = self.sign_bit_mods(&m, 0, h, 0x8000);
                 fr!(self.s.f16_to_f32(h))
             }
             "v_cvt_f16_f32" => {
@@ -488,6 +504,8 @@ impl Lw {
             "v_pack_b32_f16" => {
                 let lo = if m.opsel & 1 == 1 { self.lshrc(a, 16) } else { self.andc(a, 0xFFFF) };
                 let hi = if m.opsel & 2 == 2 { self.lshrc(b, 16) } else { self.andc(b, 0xFFFF) };
+                let lo = self.sign_bit_mods(&m, 0, lo, 0x8000);
+                let hi = self.sign_bit_mods(&m, 1, hi, 0x8000);
                 let hi = self.shlc(hi, 16);
                 self.or(lo, hi)
             }
@@ -955,6 +973,8 @@ impl Lw {
             "v_cndmask_b32" => {
                 let Some(Src::Pair(l, h)) = u.get(2).copied() else { return err(d, "mask") };
                 let bit = self.lane_of(l, h);
+                let a = self.sign_bit_mods(&m, 0, a, 0x8000_0000);
+                let b = self.sign_bit_mods(&m, 1, b, 0x8000_0000);
                 self.sel(bit, b, a)
             }
             "v_permlane16_b32" | "v_permlanex16_b32" => {
