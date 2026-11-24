@@ -304,6 +304,42 @@ fn v_swaprel_b32_uses_the_m0_relative_switch() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
     }
 }
+/// Hints and debug-only branches: s_incperflevel, s_decperflevel, s_wakeup, v_pipeflush and
+/// v_clrexcp have no effect here, and the s_cbranch_cdbg* branches (taken only under an
+/// attached debugger) fall through. Each used to leave its whole program untranslated.
+fn hints_and_debug_branches_program() -> Vec<u8> {
+    let mut code = Vec::new();
+    for (n, e) in [("S_INCPERFLEVEL", "ENC_SOPP"), ("S_DECPERFLEVEL", "ENC_SOPP"), ("S_WAKEUP", "ENC_SOPP"), ("V_PIPEFLUSH", "ENC_VOP1"), ("V_CLREXCP", "ENC_VOP1")] {
+        code.extend(encode(n, e, &[], None).unwrap());
+    }
+    // each branch skips one v_mov (SIMM16 1: one dword), which must run
+    for (i, n) in ["S_CBRANCH_CDBGSYS", "S_CBRANCH_CDBGUSER", "S_CBRANCH_CDBGSYS_OR_USER", "S_CBRANCH_CDBGSYS_AND_USER"].into_iter().enumerate() {
+        code.extend(encode(n, "ENC_SOPP", &[("SIMM16", 1)], None).unwrap());
+        code.extend(encode("V_MOV_B32", "ENC_VOP1", &[("VDST", 1 + i as u64), ("SRC0", 129 + i as u64)], None).unwrap());
+    }
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    code
+}
+
+#[test]
+fn hints_and_debug_branches_translate() {
+    let t = translate(&hints_and_debug_branches_program(), &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+}
+
+#[test]
+fn gpu_hints_and_debug_branches_fall_through() {
+    if !gpu_ready() {
+        return;
+    }
+    let r = runner::run_code(&hints_and_debug_branches_program(), &KernelState::default(), &[]).unwrap();
+    for (l, v) in r.vgpr.iter().enumerate().take(32) {
+        assert_eq!(v[1..5], [1, 2, 3, 4], "lane {l}: every v_mov after a debug branch ran");
+    }
+}
 
 #[test]
 fn gpu_v_swaprel_b32() {
