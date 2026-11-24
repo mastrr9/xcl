@@ -370,15 +370,59 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
         cmdline.push(' ');
         cmdline.push_str(&quote(a));
     }
-    let code = match spawn_host(&cmdline, &root, &boot_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("xcl: failed to start the game process: {e}");
-            return 2;
+    let relaunch = relaunch_path(&boot);
+    let _ = std::fs::remove_file(&relaunch);
+    let mut relaunches = 0;
+    let code = loop {
+        let code = match spawn_host(&cmdline, &root, &boot_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("xcl: failed to start the game process: {e}");
+                return 2;
+            }
+        };
+        // XLaunchNewGame: the title ended itself to start again with new arguments
+        let Some(new_args) = take_relaunch(&relaunch) else { break code };
+        if relaunches == MAX_RELAUNCHES {
+            eprintln!("xcl: the game asked to start again {MAX_RELAUNCHES} times in a row – not starting it again");
+            break code;
         }
+        relaunches += 1;
+        println!("  the game starts again (XLaunchNewGame), arguments: {}", if new_args.is_empty() { "none" } else { &new_args });
+        summarize(&boot, code, &environment);
+        let _ = std::fs::rename(logs.join("xcl.log"), logs.join("xcl.prev.log"));
+        let _ = std::fs::rename(boot.report_path(), logs.join("report.prev.json"));
+        cmdline = relaunch_command_line(&exe, &new_args);
     };
     summarize(&boot, code, &environment);
     code as i32
+}
+
+/// How many times in a row a title may start itself again (XLaunchNewGame) before XCL stops.
+const MAX_RELAUNCHES: u32 = 8;
+
+/// Where the game process leaves the arguments XLaunchNewGame asked for; the launcher starts the
+/// title again with them once that process has ended.
+pub fn relaunch_path(boot: &Boot) -> PathBuf {
+    boot.cache_dir().join("relaunch.txt")
+}
+
+/// The arguments a relaunch was asked for (and the request removed), if one was.
+fn take_relaunch(path: &Path) -> Option<String> {
+    let args = std::fs::read_to_string(path).ok()?;
+    let _ = std::fs::remove_file(path);
+    Some(args.trim().to_owned())
+}
+
+/// The title's command line for a relaunch: its executable, then the argument string the title
+/// passed to XLaunchNewGame as it is (a title reads its whole command line and quotes its own).
+fn relaunch_command_line(exe: &Path, args: &str) -> String {
+    let mut cmdline = quote(&exe.to_string_lossy());
+    if !args.is_empty() {
+        cmdline.push(' ');
+        cmdline.push_str(args);
+    }
+    cmdline
 }
 
 /// Formats a friendly error message listing the missing console Zen 2 CPU features.
@@ -662,6 +706,27 @@ mod tests {
         let d = TempDir::new("pe");
         std::fs::write(d.0.join("junk.exe"), b"not a PE").unwrap();
         assert_eq!(crate::inspect::console_imports(&d.0.join("junk.exe")), None);
+    }
+
+    #[test]
+    fn a_relaunch_request_is_taken_once_with_its_arguments() {
+        let dir = std::env::temp_dir().join(format!("xcl-relaunch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("relaunch.txt");
+        assert_eq!(take_relaunch(&p), None);
+        std::fs::write(&p, " -lang=fr \"save slot\"\r\n").unwrap();
+        assert_eq!(take_relaunch(&p).as_deref(), Some("-lang=fr \"save slot\""));
+        assert_eq!(take_relaunch(&p), None, "a request is taken once");
+        std::fs::write(&p, "").unwrap();
+        assert_eq!(take_relaunch(&p).as_deref(), Some(""), "a relaunch without arguments is still one");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_relaunch_command_line_is_the_exe_then_the_titles_arguments() {
+        let exe = Path::new(r"C:\Games\My Game\game.exe");
+        assert_eq!(relaunch_command_line(exe, ""), quote(r"C:\Games\My Game\game.exe"));
+        assert_eq!(relaunch_command_line(exe, "-a \"b c\""), format!("{} -a \"b c\"", quote(r"C:\Games\My Game\game.exe")));
     }
 
     #[test]
