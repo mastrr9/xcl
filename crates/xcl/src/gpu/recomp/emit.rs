@@ -3749,6 +3749,7 @@ impl Em {
                     "v_rsq_f64" => format!("rcp_d(sqrt_d(quiet_d({})))", f64v(0)),
                     "v_trunc_f64" => format!("trunc_d(quiet_d({}))", f64v(0)),
                     "v_ldexp_f64" => format!("ldexp_d(quiet_d({}), (int){})", f64v(0), lo_hi[1].0),
+                    "v_trig_preop_f64" => format!("trig_preop_d({}, {})", f64v(0), lo_hi[1].0),
                     "v_cvt_f32_f64" => {
                         self.line(&format!("uint {t} = {};", Self::fres(&m, &format!("(float){}", f64v(0)))));
                         self.write32(&dst, &t);
@@ -6808,6 +6809,35 @@ double round_ne_d(double x) {
     uint64_t whole = mag & ~mask;
     if (fraction > half || (fraction == half && ((whole >> shift) & 1ull) != 0ull)) whole += 1ull << shift;
     return asdouble((uint)whole, sign | (uint)(whole >> 32));
+}
+// The first 1201 bits of the fraction of 2/π (b_1200 first, at bit 31 of word 0), zeros after.
+static const uint XCL_TWO_OVER_PI[38] = {
+    0xA2F9836Eu, 0x4E441529u, 0xFC2757D1u, 0xF534DDC0u, 0xDB629599u, 0x3C439041u, 0xFE5163ABu, 0xDEBBC561u,
+    0xB7246E3Au, 0x424DD2E0u, 0x06492EEAu, 0x09D1921Cu, 0xFE1DEB1Cu, 0xB129A73Eu, 0xE88235F5u, 0x2EBB4484u,
+    0xE99C7026u, 0xB45F7E41u, 0x3991D639u, 0x835339F4u, 0x9C845F8Bu, 0xBDF9283Bu, 0x1FF897FFu, 0xDE05980Fu,
+    0xEF2F118Bu, 0x5A0A6D1Fu, 0x6D367ECFu, 0x27CB09B7u, 0x4F463F66u, 0x9E5FEA2Du, 0x7527BAC7u, 0xEBE5F17Bu,
+    0x3D0739F7u, 0x8A5292EAu, 0x6BFB5FB1u, 0x1F8D5D08u, 0x56033046u, 0xFC7B0000u
+};
+uint two_over_pi_word(int i) { return i < 38 ? XCL_TWO_OVER_PI[i] : 0u; }
+// v_trig_preop_f64(x, seg): the 53 bits of 2/π from bit `shift` on (seg · 53, plus the biased
+// exponent of x past 1077), truncated, as a double scaled by 2^(-53 - shift), and by 2^128 more
+// for an exponent of 1968 and up. A result below 2^-1022 is rounded toward zero, as the ISA says.
+double trig_preop_d(double x, uint seg) {
+    uint xl, xh; asuint(x, xl, xh);
+    int e = (int)((xh >> 20) & 0x7FFu);
+    int shift = (int)(seg & 31u) * 53 + max(e - 1077, 0);
+    int w = shift >> 5, o = shift & 31;
+    uint64_t top = ((uint64_t)two_over_pi_word(w) << 32) | (uint64_t)two_over_pi_word(w + 1);
+    if (o != 0) top = (top << (uint)o) | (uint64_t)(two_over_pi_word(w + 2) >> (uint)(32 - o));
+    uint64_t r = top >> 11;
+    int scale = -53 - shift + (e >= 1968 ? 128 : 0);
+    if (r == 0ull) return 0.0;
+    uint rh = (uint)(r >> 32), rl = (uint)r;
+    int msb = rh != 0u ? 32 + (int)firstbithigh(rh) : (int)firstbithigh(rl);
+    if (msb + scale >= -1022) return ldexp_d((double)r, scale);
+    int sh = -1074 - scale;
+    uint64_t m = sh >= 64 ? 0ull : r >> (uint)sh;
+    return asdouble((uint)m, (uint)(m >> 32));
 }
 uint dot4_u8(uint a, uint b, uint c) { uint r = c; [unroll] for (uint i = 0u; i < 32u; i += 8u) r += ((a >> i) & 0xFFu) * ((b >> i) & 0xFFu); return r; }
 uint dot4_i8(uint a, uint b, uint c) { int r = (int)c; [unroll] for (uint i = 0u; i < 32u; i += 8u) r += (((int)(a << (24u - i))) >> 24) * (((int)(b << (24u - i))) >> 24); return (uint)r; }

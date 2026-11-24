@@ -1175,6 +1175,101 @@ fn pair(v: &[u32], i: usize) -> f64 {
     f64::from_bits(v[i] as u64 | (v[i + 1] as u64) << 32)
 }
 
+/// The fraction of 2/π, 1201 bits from the top, zeros after (as XCL_TWO_OVER_PI in the prelude).
+const TWO_OVER_PI: [u32; 38] = [
+    0xA2F9_836E, 0x4E44_1529, 0xFC27_57D1, 0xF534_DDC0, 0xDB62_9599, 0x3C43_9041,
+    0xFE51_63AB, 0xDEBB_C561, 0xB724_6E3A, 0x424D_D2E0, 0x0649_2EEA, 0x09D1_921C,
+    0xFE1D_EB1C, 0xB129_A73E, 0xE882_35F5, 0x2EBB_4484, 0xE99C_7026, 0xB45F_7E41,
+    0x3991_D639, 0x8353_39F4, 0x9C84_5F8B, 0xBDF9_283B, 0x1FF8_97FF, 0xDE05_980F,
+    0xEF2F_118B, 0x5A0A_6D1F, 0x6D36_7ECF, 0x27CB_09B7, 0x4F46_3F66, 0x9E5F_EA2D,
+    0x7527_BAC7, 0xEBE5_F17B, 0x3D07_39F7, 0x8A52_92EA, 0x6BFB_5FB1, 0x1F8D_5D08,
+    0x5603_3046, 0xFC7B_0000,
+];
+
+/// v_trig_preop_f64 as the ISA has it: the 53 bits of 2/π from bit `shift` on (seg · 53, plus the
+/// biased exponent of x past 1077), taken one by one, times 2^(-53 - shift) (2^128 more for an
+/// exponent of 1968 and up), rounded toward zero below 2^-1022.
+fn trig_preop_ref(x: f64, seg: u32) -> f64 {
+    let e = ((x.to_bits() >> 52) & 0x7FF) as i32;
+    let shift = (seg & 31) as i32 * 53 + (e - 1077).max(0);
+    let bit = |p: i32| if p <= 1200 { (TWO_OVER_PI[(p / 32) as usize] >> (31 - p % 32)) as u64 & 1 } else { 0 };
+    let r = (shift..shift + 53).fold(0u64, |r, p| r << 1 | bit(p));
+    let scale = -53 - shift + if e >= 1968 { 128 } else { 0 };
+    if r == 0 {
+        return 0.0;
+    }
+    if 63 - r.leading_zeros() as i32 + scale >= -1022 {
+        // exact: r < 2^53, each step a power of two that keeps the value normal
+        let (mut v, mut n) = (r as f64, scale);
+        while n < -1000 {
+            v *= p2f(-1000);
+            n += 1000;
+        }
+        return v * p2f(n);
+    }
+    let sh = -1074 - scale;
+    f64::from_bits(if sh >= 64 { 0 } else { r >> sh })
+}
+
+#[test]
+fn trig_preop_table_is_two_over_pi() {
+    // the first two segments of 1.0 add up to 2/π rounded
+    assert_eq!(trig_preop_ref(1.0, 0).to_bits(), 0x3FE4_5F30_6DC9_C882);
+    assert_eq!(trig_preop_ref(1.0, 0) + trig_preop_ref(1.0, 1), std::f64::consts::FRAC_2_PI);
+    let code = prog(&[("V_TRIG_PREOP_F64", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 2)], None)]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(t.hlsl.contains("trig_preop_d("), "{}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+}
+
+/// v_trig_preop_f64 bit for bit against the ISA's rule: exponents at and around 1077 and 1968,
+/// denormal results, segments 0 to 31, and random x.
+#[test]
+fn gpu_v_trig_preop_f64() {
+    for wave64 in gpu_waves() {
+        trig_preop_f64(wave64);
+    }
+}
+
+fn trig_preop_f64(wave64: bool) {
+    let code = prog(&[("V_TRIG_PREOP_F64", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 2)], None)]);
+    let mut cases: Vec<(f64, u32)> = Vec::new();
+    let xs = [1.0, -1.0, 0.0, 5e-324, 2f64.powi(53), 2f64.powi(54), 2f64.powi(55), 2f64.powi(100), 1e300, f64::MAX, p2f(944), p2f(945), -p2f(946), f64::INFINITY, f64::NAN];
+    for &x in &xs {
+        for seg in [0, 1, 2, 3, 7, 20, 22, 23, 31] {
+            cases.push((x, seg));
+        }
+    }
+    let mut rng = Rng(0x0BAD_5EED_1234_5678);
+    while cases.len() < 6 * 64 {
+        cases.push((f64::from_bits(rng.next()), rng.below(32) as u32));
+    }
+    let mut bad = Vec::new();
+    let mut lanes = 0;
+    for chunk in cases.chunks(if wave64 { 64 } else { 32 }) {
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let (x, seg) = chunk[l % chunk.len()];
+            (r[0], r[1], r[2]) = (x.to_bits() as u32, (x.to_bits() >> 32) as u32, seg);
+        }
+        let (r, ran) = run_wave(&code, &st, wave64);
+        lanes = ran;
+        for (l, v) in r.vgpr.iter().take(ran).enumerate() {
+            let (x, seg) = chunk[l % chunk.len()];
+            let (got, want) = (pair(v, 4), trig_preop_ref(x, seg));
+            if got.to_bits() != want.to_bits() {
+                bad.push(format!("v_trig_preop_f64({x:e} = {:#018x}, {seg}) = {got:e}, want {want:e}", x.to_bits()));
+            }
+        }
+    }
+    bad.sort();
+    bad.dedup();
+    assert!(bad.is_empty(), "wave{lanes}:\n{}", bad.join("\n"));
+}
+
 /// v_floor, v_ceil, v_trunc and v_fract_f64 and the f64 to i32 and u32 conversions against
 /// the CPU's IEEE results, bit for bit, including the sign of zero, |x| ≥ 2^63, ±inf and NaN.
 #[test]
