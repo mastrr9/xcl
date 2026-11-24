@@ -8,8 +8,8 @@
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, RwLock};
 
 struct Pending {
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
@@ -23,7 +23,7 @@ struct Pending {
     compute: bool,
     /// of its shaders (`used`); 0 = none
     key: u64,
-    /// it was used (`used::note` is told once)
+    /// it was used (`used::note` is told once, for a `key`)
     used: std::sync::atomic::AtomicBool,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
@@ -104,14 +104,16 @@ impl Pending {
     }
 
     fn note_use(&self) {
-        if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
+        // (a load first: a pipeline used before is not written to at every bind)
+        if !self.used.load(Ordering::Relaxed) && !self.used.swap(true, Ordering::Relaxed) && self.key != 0 {
             used::note(self.key);
         }
     }
 }
 
-/// stand-in handed to the title → its real pipeline
-static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
+/// stand-in handed to the title → its real pipeline. Read at every bind and several times a
+/// draw (`lookup`), written when the title makes or releases a pipeline.
+static PENDING: RwLock<Option<HashMap<usize, Arc<Pending>>>> = RwLock::new(None);
 
 /// The build is done (`real`: its pipeline, 0 = failed).
 fn complete(p: &Pending, real: usize) {
@@ -210,7 +212,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         late: Default::default(),
         demand: Default::default(),
     });
-    PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
+    PENDING.write().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
@@ -460,19 +462,83 @@ mod used_tests {
     }
 }
 
+#[cfg(test)]
 fn entry(pso: usize) -> Option<Arc<Pending>> {
-    PENDING.lock().unwrap().as_ref()?.get(&pso).cloned()
+    PENDING.read().unwrap().as_ref()?.get(&pso).cloned()
+}
+
+enum Lookup {
+    /// not a stand-in
+    None,
+    /// a stand-in whose real pipeline is built and was used before
+    Built(usize),
+    /// any other stand-in
+    Entry(Arc<Pending>),
+}
+
+/// Stand-ins released so far (`released`): what a thread's `BUILT_HERE` was filled at.
+static RELEASES: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// stand-in → its built pipeline, as this thread found them (`RELEASES` then; up to
+    /// `BUILT_HERE_MAX`). A stand-in's real pipeline changes only when it is released.
+    static BUILT_HERE: std::cell::RefCell<(u64, HashMap<usize, usize>)> = std::cell::RefCell::new((0, HashMap::new()));
+}
+const BUILT_HERE_MAX: usize = 4096;
+
+/// `pso` in `PENDING`. A translated draw looks its pipeline up three times
+/// (`bind::graphics_bound`, `bind::bind_abi`, `real::pso_root_signature`), and a bind once.
+/// One built and used before, what nearly all of them find, is answered from the thread's own
+/// `BUILT_HERE` – no lock, no copy of its entry and none of its own locks (`job`, `done`, which
+/// two of the three took) – and else under the map's shared lock: the threads that record lists
+/// do not take turns at the map.
+fn lookup(pso: usize) -> Lookup {
+    let releases = RELEASES.load(Ordering::Acquire);
+    let here = BUILT_HERE.try_with(|c| {
+        let c = c.borrow();
+        if c.0 == releases { c.1.get(&pso).copied() } else { None }
+    });
+    if let Ok(Some(r)) = here {
+        return Lookup::Built(r);
+    }
+    let found = {
+        let g = PENDING.read().unwrap();
+        let Some(p) = g.as_ref().and_then(|m| m.get(&pso)) else { return Lookup::None };
+        match p.real.load(Ordering::Acquire) {
+            r if r != 0 && p.used.load(Ordering::Relaxed) => Lookup::Built(r),
+            _ => Lookup::Entry(p.clone()),
+        }
+    };
+    if let Lookup::Built(r) = found {
+        // (a release since `releases` was read: the next lookup finds the count moved on)
+        let _ = BUILT_HERE.try_with(|c| {
+            let mut c = c.borrow_mut();
+            if c.0 != releases || c.1.len() >= BUILT_HERE_MAX {
+                c.1.clear();
+                c.0 = releases;
+            }
+            c.1.insert(pso, r);
+        });
+    }
+    found
 }
 
 /// The pipeline to use for `pso` now: the real one once built, else `pso` itself.
 pub fn resolve(pso: usize) -> usize {
-    let Some(p) = entry(pso) else { return pso };
+    match lookup(pso) {
+        Lookup::None => pso,
+        Lookup::Built(r) => r,
+        Lookup::Entry(p) => resolve_entry(pso, &p),
+    }
+}
+
+fn resolve_entry(pso: usize, p: &Arc<Pending>) -> usize {
     p.note_use();
     match p.real.load(Ordering::Acquire) {
         0 => {
             // a lazy one is wanted now: to the workers
             if !p.sent.swap(true, Ordering::AcqRel) {
-                let _ = queue().lock().unwrap().send(p);
+                let _ = queue().lock().unwrap().send(p.clone());
             }
             pso
         }
@@ -488,14 +554,24 @@ pub fn resolve_wait(pso: usize) -> usize {
 
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
-    let Some(p) = entry(pso) else { return pso };
+    match lookup(pso) {
+        Lookup::None => pso,
+        Lookup::Built(r) => r,
+        Lookup::Entry(p) => wait_entry(pso, &p, budget),
+    }
+}
+
+fn wait_entry(pso: usize, p: &Arc<Pending>, budget: Option<std::time::Duration>) -> usize {
     p.note_use();
+    if let r @ 1.. = p.real.load(Ordering::Acquire) {
+        return r;
+    }
     if let Some(budget) = budget {
-        return resolve_within(&p, pso, budget);
+        return resolve_within(p, pso, budget);
     }
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
-        complete(&p, job());
+        complete(p, job());
     }
     p.want();
     let mut done = p.done.lock().unwrap();
@@ -551,10 +627,101 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
 
 /// For binding: compute pipelines are waited for, graphics ones are not.
 pub fn resolve_for_bind(pso: usize) -> usize {
-    match entry(pso) {
-        Some(p) if p.compute => resolve_wait(pso),
-        Some(_) => resolve(pso),
-        None => pso,
+    match lookup(pso) {
+        Lookup::None => pso,
+        Lookup::Built(r) => r,
+        Lookup::Entry(p) if p.compute => wait_entry(pso, &p, wait_budget()),
+        Lookup::Entry(p) => resolve_entry(pso, &p),
+    }
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::*;
+
+    /// A pipeline that is built is looked up without its own locks: a bind or a draw does not
+    /// wait on a thread that holds them (a worker taking its job, `counts`).
+    #[test]
+    fn a_built_pipeline_is_resolved_without_its_own_locks() {
+        let (gfx, cs) = (0x7E57_7101usize, 0x7E57_7102usize);
+        submit(gfx, false, Box::new(|| 0x6601));
+        submit(cs, true, Box::new(|| 0x6602));
+        assert_eq!(resolve_wait(gfx), 0x6601);
+        assert_eq!(resolve_wait(cs), 0x6602);
+        let (pg, pc) = (entry(gfx).unwrap(), entry(cs).unwrap());
+        let held = (pg.job.lock().unwrap(), pg.done.lock().unwrap(), pc.job.lock().unwrap(), pc.done.lock().unwrap());
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send((resolve_wait(gfx), resolve_for_bind(cs), resolve_wait(cs), resolve(gfx), resolve_for_bind(gfx), is_pending(gfx), is_pending(cs)));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5)).ok();
+        drop(held);
+        assert_eq!(got, Some((0x6601, 0x6602, 0x6602, 0x6601, 0x6601, false, false)));
+        released(gfx);
+        released(cs);
+    }
+
+    /// A pipeline built ahead of its use (no key: nothing written for the next run) is still
+    /// noted as used at its first lookup, and found built after it.
+    #[test]
+    fn a_pipeline_built_before_its_first_use_is_noted_at_it() {
+        let pso = 0x7E57_7103usize;
+        submit_lazy(pso, false, Box::new(|| 0x6603), 0);
+        let p = entry(pso).unwrap();
+        let job = p.job.lock().unwrap().take().unwrap();
+        complete(&p, job());
+        assert!(!p.used.load(Ordering::Relaxed));
+        assert!(matches!(lookup(pso), Lookup::Entry(_)), "built, not used yet");
+        assert_eq!(resolve(pso), 0x6603);
+        assert!(p.used.load(Ordering::Relaxed));
+        assert!(matches!(lookup(pso), Lookup::Built(0x6603)));
+        assert!(!is_pending(pso));
+        released(pso);
+        assert!(matches!(lookup(pso), Lookup::None));
+    }
+
+    /// A bind's bounded wait (`XCL_PSO_WAIT_MS`) is kept: a pipeline not built within the budget
+    /// is not kept by the thread as built, its binds get the stand-in until a worker has built it,
+    /// and only then is it answered from the thread's `BUILT_HERE`.
+    #[test]
+    fn a_late_pipeline_is_answered_from_the_threads_cache_only_once_built() {
+        let pso = 0x7E57_7106usize;
+        submit(pso, true, Box::new(|| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            0x6606
+        }));
+        let budget = Some(std::time::Duration::from_millis(20));
+        assert_eq!(resolve_wait_for(pso, budget), pso, "not built within the budget: the stand-in");
+        assert!(entry(pso).unwrap().late.load(Ordering::Acquire));
+        assert!(matches!(lookup(pso), Lookup::Entry(_)), "late, not built");
+        assert_eq!(BUILT_HERE.with(|c| c.borrow().1.get(&pso).copied()), None, "a stand-in is not kept as built");
+        let start = std::time::Instant::now();
+        while is_pending(pso) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(resolve_wait_for(pso, budget), 0x6606, "built by a worker");
+        assert_eq!(BUILT_HERE.with(|c| c.borrow().1.get(&pso).copied()), Some(0x6606), "kept by this thread once built");
+        released(pso);
+    }
+
+    /// A thread answers a built pipeline from its own `BUILT_HERE`, and not after the stand-in
+    /// is released: its address may come back for another pipeline.
+    #[test]
+    fn a_released_stand_in_is_not_answered_from_the_threads_cache() {
+        let pso = 0x7E57_7104usize;
+        submit(pso, false, Box::new(|| 0x6604));
+        assert_eq!(resolve_wait(pso), 0x6604);
+        assert_eq!(resolve(pso), 0x6604);
+        assert_eq!(BUILT_HERE.with(|c| c.borrow().1.get(&pso).copied()), Some(0x6604), "kept by this thread");
+        released(pso);
+        assert_eq!(resolve(pso), pso, "released: no stand-in any more");
+        assert!(!is_pending(pso));
+        // the address comes back for another pipeline, still being built
+        submit_lazy(pso, false, Box::new(|| 0x6605), 0);
+        assert!(is_pending(pso));
+        assert_eq!(resolve_wait(pso), 0x6605);
+        assert_eq!(resolve(pso), 0x6605);
+        released(pso);
     }
 }
 
@@ -562,7 +729,9 @@ pub fn resolve_for_bind(pso: usize) -> usize {
 /// another object) and return its real pipeline to release (0: none, or still being built –
 /// the worker's result is then released when it arrives).
 pub fn released(pso: usize) -> usize {
-    let Some(p) = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
+    let Some(p) = PENDING.write().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
+    // every thread's `BUILT_HERE` is out of date (the address may come back for another object)
+    RELEASES.fetch_add(1, Ordering::AcqRel);
     let done = p.done.lock().unwrap();
     if *done {
         p.real.swap(0, Ordering::AcqRel)
@@ -575,11 +744,15 @@ pub fn released(pso: usize) -> usize {
 
 /// `pso` is a stand-in whose real pipeline is still being built.
 pub fn is_pending(pso: usize) -> bool {
-    entry(pso).is_some_and(|p| !*p.done.lock().unwrap())
+    match lookup(pso) {
+        Lookup::None | Lookup::Built(_) => false,
+        // (a pipeline that is built is done: no need of its lock)
+        Lookup::Entry(p) => p.real.load(Ordering::Acquire) == 0 && !*p.done.lock().unwrap(),
+    }
 }
 
 /// (built in the background, failed, still building)
 pub fn counts() -> (usize, usize, usize) {
-    let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
+    let pending = PENDING.read().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
 }
