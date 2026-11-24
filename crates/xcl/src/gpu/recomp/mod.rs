@@ -79,6 +79,7 @@ pub const MEM_HEAP_BASE: u32 = 0;
 /// `Options::heap_windows`. `translate` takes it out of `mem_windows`.
 pub const HEAP_WINDOWS: u32 = 0x100;
 pub mod upper_lanes;
+pub mod diff_graphics;
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -1702,6 +1702,7 @@ fn gpu_graphics_vs_ps_draw() {
         runner::VertexElement { semantic: "COLOR", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 8 },
     ];
     let clear = [0.0, 0.0, 1.0, 1.0];
+    super::diff_graphics::check(&vs, &ps, (&vs_code, &vo), (&ps_code, &po), 16, |vs, ps| runner::draw(vs, ps, &layout, &verts, 24, &[], &[], 16, clear)).unwrap();
     let px = runner::draw(&vs, &ps, &layout, &verts, 24, &[], &[], 16, clear).unwrap();
     for y in 0..16 {
         for x in 0..16 {
@@ -1872,6 +1873,7 @@ fn gpu_rect_list_corners() {
         attrs: None,
     };
     let outputs = vsi.outputs.clone();
+    let (vo, po) = (Options { mode: Mode::Vertex(vsi.clone()), wave64: true, ..Default::default() }, Options { mode: Mode::Pixel(psi.clone()), wave64: true, ..Default::default() });
     let vt = translate(&vs_code, &Options { mode: Mode::Vertex(vsi), wave64: true, ..Default::default() }).unwrap();
     let pt = translate(&ps_code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
     assert!(vt.complete() && pt.complete(), "{:?} {:?}", vt.unsupported, pt.unsupported);
@@ -1889,6 +1891,9 @@ fn gpu_rect_list_corners() {
     let ndc = |x: usize, y: usize| ((x as f32 + 0.5) / 8.0 - 1.0, 1.0 - (y as f32 + 0.5) / 8.0);
     let run = |v: &[f32], with_gs: bool| runner::draw_gs(&vs, with_gs.then_some(gs.as_slice()), &ps, &layout, v, 32, &[], &[], n as u32, clear).unwrap();
     let (x1, x2, y1, y2) = (-0.5f32, 0.5, -0.5, 0.5);
+    // `XCL_DXIL_DIFF=1`: the first corner order through the GS with the direct DXIL VS / PS, compared
+    let v0 = verts(&[[x1, y1, 1.0], [x1, y2, 1.0], [x2, y1, 1.0]]);
+    super::diff_graphics::check(&vs, &ps, (&vs_code, &vo), (&ps_code, &po), n, |vs, ps| runner::draw_gs(vs, Some(gs.as_slice()), ps, &layout, &v0, 32, &[], &[], n as u32, clear)).unwrap();
     for (name, corners) in [
         ("corner v0 (radeonsi)", [[x1, y1], [x1, y2], [x2, y1]]),
         ("corner v1 (r600 EXA)", [[x1, y1], [x1, y2], [x2, y2]]),
@@ -2004,6 +2009,7 @@ fn gpu_ps_p0_reads_flat_integer_selectors() {
         vsi.outputs[1].component_type = component_type;
         let mut psi = draw_psi();
         psi.inputs[1].component_type = component_type;
+        let (vo, po) = (runner::options(Mode::Vertex(vsi.clone())), runner::options(Mode::Pixel(psi.clone())));
         let vs = compile(&vs_code, Mode::Vertex(vsi), "vs_6_6");
         let ps = compile(&ps_code, Mode::Pixel(psi), "ps_6_6");
         let layout = [
@@ -2016,6 +2022,7 @@ fn gpu_ps_p0_reads_flat_integer_selectors() {
                 .into_iter()
                 .flat_map(|[x, y]| [x, y, f32::from_bits(selector), 0.0, 0.0, 0.0])
                 .collect();
+            super::diff_graphics::check(&vs, &ps, (&vs_code, &vo), (&ps_code, &po), 16, |vs, ps| runner::draw(vs, ps, &layout, &vertices, 24, &[], &[], 16, [-1.0; 4])).unwrap();
             let pixels = runner::draw(&vs, &ps, &layout, &vertices, 24, &[], &[], 16, [-1.0; 4]).unwrap();
             for (i, pixel) in pixels.iter().enumerate() {
                 assert_eq!(*pixel, expected, "{format:?} selector {selector:#010x}, pixel {i}");
@@ -2067,6 +2074,10 @@ fn draw_console_views(
         runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 },
         runner::VertexElement { semantic: "COLOR", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 8 },
     ];
+    // `XCL_DXIL_DIFF=1`: the same draw with the direct DXIL translations, compared
+    let (vo, po) = (runner::options(Mode::Vertex(draw_vsi())), runner::options(Mode::Pixel(draw_psi())));
+    let draw = |vs: &[u8], ps: &[u8]| runner::draw_views(vs, ps, &layout, &verts, 24, sgprs, &[], textures, samplers, 16, [-1.0; 4]);
+    super::diff_graphics::check(&vsb, &psb, (vs.unwrap_or(&pass_vs), &vo), (ps.unwrap_or(&pass_ps), &po), 16, draw).unwrap();
     runner::draw_views(&vsb, &psb, &layout, &verts, 24, sgprs, &[], textures, samplers, 16, [-1.0; 4]).unwrap()
 }
 
@@ -2940,6 +2951,7 @@ fn gpu_mesh_mode_two_passes() {
     }
     let mut sg = vec![0u32; 128];
     sg[16..20].copy_from_slice(&[0x100, 16 << 16, 3, 0]);
+    super::diff_graphics::check_mesh(&cs, (&code, &opt), 32, |cs| runner::mesh_draw(cs, &msb, &ps, 2, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4])).unwrap();
     let (px, rec) = runner::mesh_draw(&cs, &msb, &ps, 2, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
     let (rd, vd) = (ms.record_dwords(), ms.vert_dwords());
     for g in 0..2usize {
