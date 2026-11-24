@@ -639,6 +639,18 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     computed
 }
 
+#[cfg(test)]
+thread_local! {
+    /// write-watch looks `refresh` started on this thread
+    static LOOKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The write-watch looks `refresh` started on this thread so far (tests).
+#[cfg(test)]
+pub(super) fn looks_on_this_thread() -> u64 {
+    LOOKS.with(|n| n.get())
+}
+
 /// Run `f` as XCL's own GPU work: ExecuteCommandLists inside it does not refresh.
 pub(super) fn own_work<R>(f: impl FnOnce() -> R) -> R {
     let was = BUSY.with(|b| b.replace(true));
@@ -659,6 +671,8 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
     if BUSY.with(|b| b.get()) {
         return;
     }
+    #[cfg(test)]
+    LOOKS.with(|n| n.set(n.get() + 1));
     let _refresh = REFRESH.lock().unwrap();
     own_work(|| refresh_once(queue));
 }
