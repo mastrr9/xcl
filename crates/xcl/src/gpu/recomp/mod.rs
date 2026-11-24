@@ -1202,6 +1202,21 @@ pub fn wave_lane_reads(code: &[u8]) -> (BTreeSet<&'static str>, BTreeSet<&'stati
     (a.hazards(&insts), a.resolved())
 }
 
+/// Whether `translate` gives a wave64 VS / PS the `upper_lanes` form where it may run in
+/// 32-lane waves (`Options::split_wave64`): it reads a lane ≥ 32 that holds a constant or a
+/// spill slot there.
+pub fn upper_lanes_form(code: &[u8]) -> bool {
+    let mut insts = Vec::new();
+    let mut off = 0;
+    while off + 4 <= code.len() {
+        let Ok(d) = rdna2::decode(&code[off..], off as u64) else { break };
+        off += d.len;
+        insts.push(d);
+    }
+    rdna2::resolve_far_jumps(&mut insts);
+    upper_lanes::analyze(&insts).reads.values().any(|r| matches!(r, upper_lanes::Read::Const(_) | upper_lanes::Read::Shadow))
+}
+
 /// Operations that cannot be split into two independent native wave32 halves while
 /// preserving one logical wave64. The split form (`Options::split_wave64`) exchanges masks
 /// and lane values between the halves and needs no such list; a program without any of these
