@@ -603,14 +603,16 @@ impl Vfs {
             }
             Target::Game { rel } => {
                 let in_ov = self.visible_in_overlay(&rel);
+                // A read needs no more than `read_path_rel` looks at: one stat, not three.
+                let is_write = Self::is_write(access, disposition, flags);
+                if !is_write && disposition != OPEN_ALWAYS {
+                    return self.read_decision(&rel, in_ov);
+                }
                 let in_orig = self.visible_in_original(&rel);
                 let visible = in_ov || in_orig;
-                let write = Self::is_write(access, disposition, flags) || (disposition == OPEN_ALWAYS && !visible);
+                let write = is_write || (disposition == OPEN_ALWAYS && !visible);
                 if !write {
-                    return match self.read_path_rel(&rel) {
-                        Some(p) => Decision::Use(p),
-                        None => Decision::Fail(ERROR_FILE_NOT_FOUND),
-                    };
+                    return self.read_decision(&rel, in_ov);
                 }
                 // Win32 CreateFile requires GENERIC_WRITE for TRUNCATE_EXISTING before checking existence.
                 if disposition == TRUNCATE_EXISTING && access & GENERIC_WRITE == 0 {
@@ -650,6 +652,18 @@ impl Vfs {
                     Err(e) => Decision::Fail(e),
                 }
             }
+        }
+    }
+
+    /// The open of game file `rel` for reading, as `read_path_rel` has it, `in_ov` being
+    /// `visible_in_overlay(rel)`.
+    fn read_decision(&self, rel: &str, in_ov: bool) -> Decision {
+        if in_ov {
+            Decision::Use(self.overlay_path(rel))
+        } else if self.is_whiteout(rel) {
+            Decision::Fail(ERROR_FILE_NOT_FOUND)
+        } else {
+            Decision::Use(self.original_path(rel))
         }
     }
 
@@ -1211,6 +1225,30 @@ mod tests {
         std::fs::write(&ov_file, b"hi").unwrap();
         assert_eq!(v.remove_dir("data\\ov_only.txt"), Err(ERROR_DIRECTORY));
         assert!(v.visible_in_overlay("data\\ov_only.txt"));
+    }
+
+    /// A read-only open is decided from the overlay copy and the whiteouts alone, the way
+    /// `read_path_rel` reads them.
+    #[test]
+    fn read_opens_decide_like_read_path_rel() {
+        let f = Fixture::new("read_decision");
+        let v = &f.vfs;
+        std::fs::write(v.prepare_write("data\\hello.txt", false).unwrap(), b"overlay").unwrap();
+        v.delete_file("data\\gone.txt").unwrap();
+        for rel in ["data\\hello.txt", "data\\gone.txt", "data\\missing.txt", "data", ""] {
+            let want = v.read_path_rel(rel).map_or(Decision::Fail(ERROR_FILE_NOT_FOUND), Decision::Use);
+            for (access, disposition, flags) in [
+                (0x8000_0000, OPEN_EXISTING, 0), // GENERIC_READ
+                (0x0000_0080, OPEN_EXISTING, 0), // FILE_READ_ATTRIBUTES
+                (0, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS), // a directory handle
+            ] {
+                let d = v.open_decision_for(Target::Game { rel: rel.into() }, access, disposition, flags);
+                assert_eq!(d, want, "{rel:?} {access:#x}");
+            }
+        }
+        // OPEN_ALWAYS reads only a file that is there
+        let d = v.open_decision_for(Target::Game { rel: "data\\hello.txt".into() }, 0x8000_0000, OPEN_ALWAYS, 0);
+        assert_eq!(d, Decision::Use(v.overlay_path("data\\hello.txt")));
     }
 
     #[test]
