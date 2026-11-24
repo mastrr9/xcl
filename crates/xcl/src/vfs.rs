@@ -259,11 +259,15 @@ impl Vfs {
             if !prefix.ends_with(':') {
                 continue;
             }
-            let needle = format!("\\{prefix}");
+            // each '\' followed by the prefix in turn (no needle string built per path)
             let mut from = 0;
-            while let Some(i) = l[from..].find(&needle) {
-                let at = from + i;
-                let after = at + needle.len();
+            while let Some(i) = l[from..].find('\\') {
+                let at = from + i + 1;
+                if !l[at..].starts_with(prefix.as_str()) {
+                    from = at;
+                    continue;
+                }
+                let after = at + prefix.len();
                 let rest = &p[after..];
                 if rest.is_empty() || rest.starts_with('\\') {
                     let tail = rest.trim_start_matches('\\');
@@ -345,9 +349,16 @@ impl Vfs {
         if !(b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic()) || p[2..].contains(':') {
             return false;
         }
+        let roots = || [&self.game_root_lc, &self.data_root_lc].into_iter().chain(&self.own_roots_lc);
+        // "X:\..." stays on drive X (or becomes a device name) whatever the current directories
+        // are: no GetFullPathNameW for a console drive none of the PC's folders is on ("G:\x").
+        let drive = b[0].to_ascii_lowercase();
+        if b.get(2) == Some(&b'\\') && roots().all(|root| matches!(root.as_bytes(), [d, b':', ..] if *d != drive)) {
+            return false;
+        }
         let Some(abs) = full(p) else { return false };
         let lc = trim_sep(&strip_verbatim(&norm(&abs))).to_lowercase();
-        [&self.game_root_lc, &self.data_root_lc].into_iter().chain(&self.own_roots_lc).any(|root| {
+        roots().any(|root| {
             lc.strip_prefix(root.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('\\'))
         })
     }
@@ -909,6 +920,29 @@ mod tests {
         for p in ["G:\\", "G:", "G:\\data\\*", "G:\\data\\hello.txt", "T:\\saves\\*", &real, "C:\\Windows\\*", "CONOUT$", "\\\\.\\pipe\\x"] {
             assert!(!v.in_drive_mount_root(p), "{p}");
         }
+    }
+
+    /// A console path on a drive none of the PC's folders is on is absolutised once (the own
+    /// folders check needs no GetFullPathNameW for it); on their drive it is still checked.
+    #[test]
+    fn a_console_drive_path_is_absolutised_once() {
+        let calls = std::cell::Cell::new(0);
+        let full = |p: &str| {
+            calls.set(calls.get() + 1);
+            Some(p.to_string())
+        };
+        let game = r"C:\Games\Title";
+        let mounts = ["G:", "GAME:", "C:"].map(|m| (m.to_string(), game.to_string())).to_vec();
+        let v = Vfs::new(Path::new(game), Path::new(r"C:\XclData\Title"), mounts);
+        assert_eq!(v.classify_with(r"G:\data\a.bin", full), Target::Game { rel: r"data\a.bin".into() });
+        assert_eq!(calls.replace(0), 1);
+        assert_eq!(v.classify_with(r"g:data\a.bin", full), Target::Game { rel: r"data\a.bin".into() });
+        assert_eq!(calls.replace(0), 2, "a drive-relative path is checked as before");
+        // "C:" (a console drive mount) is the PC's drive of the game and the data
+        assert_eq!(v.classify_with(r"C:\XclData\Title\x.bin", full), Target::Pass);
+        assert_eq!(calls.replace(0), 2);
+        assert_eq!(v.classify_with(r"C:\data\a.bin", full), Target::Game { rel: r"data\a.bin".into() });
+        assert_eq!(calls.replace(0), 2);
     }
 
     /// The console's "D:" mount on a PC whose game and XCL data are on its D: drive: paths
