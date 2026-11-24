@@ -64,6 +64,8 @@ pub mod partition;
 pub mod x64_masks;
 pub mod pso;
 pub use emit::mesh_passthrough;
+pub mod diff_kernel;
+pub mod diff_table;
 pub mod runner;
 pub mod ssa;
 #[cfg(test)]
