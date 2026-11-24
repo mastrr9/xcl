@@ -437,3 +437,41 @@ fn ps_get_lod_with_a_static_sampler() {
         super::coverage::translate_mode(&code, &Mode::Pixel(psi), ko, true).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
     }
 }
+
+/// `v_cvt_f16_u16` / `v_cvt_f16_i16` take an integer source, so a float inline constant is
+/// its f32 pattern there (the HLSL path's `valu16`), not the f16 one. Both backends on the GPU.
+#[test]
+fn cvt_f16_from_16_bit_int_inline_constants_on_both_backends() {
+    use crate::gpu::recomp::runner::{self, KernelState};
+    use crate::gpu::recomp::{dxc, Options};
+    let code = prog(&[
+        ("V_CVT_F16_U16", "ENC_VOP1", &[("VDST", 10), ("SRC0", 248)], None),
+        ("V_CVT_F16_I16", "ENC_VOP1", &[("VDST", 11), ("SRC0", 248)], None),
+        ("V_CVT_F16_U16", "ENC_VOP1", &[("VDST", 12), ("SRC0", 242)], None),
+    ]);
+    // the low half of 1/(2π) as an f32 (0x3E22F983) is 63875 / -1661, of 1.0 it is 0; the
+    // high half of the destination stays
+    let want = [0x1234_7BCC, 0x1234_E67D, 0x1234_0000];
+    match (runner::adapter(), runner::wave64_programs_supported(), dxc::location()) {
+        (Ok(_), Ok(true), Ok(_)) => {}
+        _ => return runner::skip_test("no GPU or DXC"),
+    }
+    let mem: Vec<u32> = code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let mut st = KernelState::default();
+    for r in st.vgpr.iter_mut() {
+        r[10..13].fill(0x1234_5678);
+    }
+    let waves = if runner::wave64_supported() == Ok(true) { vec![true, false] } else { vec![false] };
+    for wave64 in waves {
+        let t = crate::gpu::recomp::translate(&code, &Options { wave64, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let hlsl = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+        let direct = runner::direct_kernel(&code, wave64).unwrap();
+        for (label, dxil) in [("HLSL", &hlsl), ("direct", &direct)] {
+            let r = runner::run(dxil, &st, &mem).unwrap_or_else(|e| panic!("{label} wave64 {wave64}: {e}"));
+            for (l, v) in r.vgpr.iter().take(if wave64 { 64 } else { 32 }).enumerate() {
+                assert_eq!([v[10], v[11], v[12]], want, "{label} wave64 {wave64} lane {l}");
+            }
+        }
+    }
+}
