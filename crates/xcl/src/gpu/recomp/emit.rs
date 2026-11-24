@@ -2987,6 +2987,9 @@ impl Em {
             "v_min_f16" => fr(format!("min({}, {})", fh(0), fh(1))),
             "v_max_f16" => fr(format!("max({}, {})", fh(0), fh(1))),
             "v_fma_f16" => fr(format!("mad({}, {}, {})", fh(0), fh(1), fh(2))),
+            // on the bits, so a NaN q keeps its sign and payload (f32tof16 would make it 0x7FFF)
+            "v_div_fixup_f16" if m.omod == 0 && !m.clamp => format!("div_fixup_h({}, {}, {})", hb(0), hb(1), hb(2)),
+            "v_div_fixup_f16" => fr(format!("f16tof32(div_fixup_h({}, {}, {}))", hb(0), hb(1), hb(2))),
             "v_med3_f16" => fr(format!("med3f({}, {}, {})", fh(0), fh(1), fh(2))),
             "v_min3_f16" => fr(format!("min(min({}, {}), {})", fh(0), fh(1), fh(2))),
             "v_max3_f16" => fr(format!("max(max({}, {}), {})", fh(0), fh(1), fh(2))),
@@ -5621,6 +5624,19 @@ uint lerp8(uint a, uint b, uint c, uint k) { return ((((a >> k) & 0xFFu) + ((b >
 uint lerp_u8(uint a, uint b, uint c) { return lerp8(a, b, c, 0u) | lerp8(a, b, c, 8u) | lerp8(a, b, c, 16u) | lerp8(a, b, c, 24u); }
 uint sat_u32(uint64_t r) { return select(r > (uint64_t)0xFFFFFFFFu, 0xFFFFFFFFu, (uint)r); }
 uint sat_i32(int64_t r) { return select(r > (int64_t)0x7FFFFFFF, 0x7FFFFFFFu, select(r < -(int64_t)0x80000000u, 0x80000000u, (uint)r)); }
+// v_div_fixup_f16(q, d, n) on the f16 bits: the IEEE special cases of n / d in the ISA's order
+// (n NaN, d NaN quieted; 0/0 and inf/inf the NaN 0xFE00; x/0 and inf/x inf; 0/x and x/inf 0),
+// else q's bits with the sign of n / d, so a NaN or denormal q passes through unchanged.
+uint div_fixup_h(uint q, uint d, uint n) {
+    uint s = (n ^ d) & 0x8000u, an = n & 0x7FFFu, ad = d & 0x7FFFu;
+    uint r = (q & 0x7FFFu) | s;
+    r = select(or(ad == 0x7C00u, an == 0u), s, r);
+    r = select(or(ad == 0u, an == 0x7C00u), s | 0x7C00u, r);
+    r = select(or(and(an == 0u, ad == 0u), and(an == 0x7C00u, ad == 0x7C00u)), 0xFE00u, r);
+    r = select(ad > 0x7C00u, d | 0x0200u, r);
+    r = select(an > 0x7C00u, n | 0x0200u, r);
+    return r;
+}
 float div_fixup(float q, float d, float n) { return select(or(or(isnan(d), isnan(n)), or(d == 0.0f, or(isinf(d), isinf(n)))), n / d, q); }
 float fma_legacy(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? c : mad(a, b, c); }
 float mad_nf(float a, float b, float c) { precise float p = a * b; precise float r = p + c; return r; }
