@@ -7134,6 +7134,143 @@ fn gpu_signed_bfe_arithmetic_shift() {
     }
 }
 
+/// v_div_fixup_f16(q, d, n) as the ISA has it, on the bits: n NaN, d NaN, 0/0 and inf/inf
+/// give NaN (None), x/0 and inf/x infinity, 0/x and x/inf zero, else q with the sign of n / d.
+fn div_fixup_f16_ref(q: u16, d: u16, n: u16) -> Option<u16> {
+    let (an, ad, s) = (n & 0x7FFF, d & 0x7FFF, (n ^ d) & 0x8000);
+    if an > 0x7C00 || ad > 0x7C00 || (an == 0 && ad == 0) || (an == 0x7C00 && ad == 0x7C00) {
+        None
+    } else if ad == 0 || an == 0x7C00 {
+        Some(s | 0x7C00)
+    } else if an == 0 || ad == 0x7C00 {
+        Some(s)
+    } else {
+        Some((q & 0x7FFF) | s)
+    }
+}
+
+/// x rounded to the nearest binary16, ties to even, as bits (x is not NaN).
+fn f64_to_f16_rne(x: f64) -> u16 {
+    let s = if x.is_sign_negative() { 0x8000 } else { 0 };
+    let a = x.abs();
+    if a >= 65520.0 {
+        return s | 0x7C00;
+    }
+    // the binade's step: 2^-24 for denormals, else 2^(e - 10)
+    // the exponent from the bits: log2 rounds up just below a power of two
+    let exp = |v: f64| ((v.to_bits() >> 52) & 0x7FF) as i32 - 1023;
+    let e = if a < 2f64.powi(-14) { -14 } else { exp(a) };
+    let step = 2f64.powi(e.max(-14) - 10);
+    let k = a / step; // exact: a power-of-two scale
+    let mut m = k.floor();
+    let f = k - m;
+    if f > 0.5 || (f == 0.5 && m % 2.0 == 1.0) {
+        m += 1.0;
+    }
+    let v = m * step;
+    // rebuild the bits from the rounded value (m may have carried into the next binade)
+    if v == 0.0 {
+        return s;
+    }
+    if v < 2f64.powi(-14) {
+        return s | (v / 2f64.powi(-24)) as u16;
+    }
+    let e2 = exp(v);
+    s | (((e2 + 15) as u16) << 10) | (((v / 2f64.powi(e2) - 1.0) * 1024.0) as u16)
+}
+
+const F16_EDGES: [u16; 16] = [
+    0x0000, 0x8000, 0x7C00, 0xFC00, 0x7E00, 0x7C01, 0x0001, 0x83FF, 0x0400, 0x3C00, 0xBC00, 0x7BFF, 0x4248, 0x3555, 0xC500, 0x2E66,
+];
+
+#[test]
+fn div_fixup_f16_translates() {
+    let code = prog(&[("V_DIV_FIXUP_F16", "ENC_VOP3", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None)]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(t.hlsl.contains("div_fixup_h("), "{}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+}
+
+/// v_div_fixup_f16 on every pairing of edge values for d and n with a q of either sign (low
+/// halves, and the high halves through OPSEL), and LLVM's f16 division sequence (cvt, v_rcp_f32,
+/// v_mul_f32, cvt, v_div_fixup_f16) within an ulp of the rounded quotient, specials exact.
+#[test]
+fn gpu_v_div_fixup_f16() {
+    for wave64 in gpu_waves() {
+        div_fixup_f16(wave64);
+    }
+}
+
+fn div_fixup_f16(wave64: bool) {
+    let code = prog(&[
+        ("V_DIV_FIXUP_F16", "ENC_VOP3", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_DIV_FIXUP_F16", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL", 7)], None),
+        // n / d: d in v1, n in v2 (low halves)
+        ("V_CVT_F32_F16", "ENC_VOP1", &[("VDST", 5), ("SRC0", V + 1)], None),
+        ("V_CVT_F32_F16", "ENC_VOP1", &[("VDST", 6), ("SRC0", V + 2)], None),
+        ("V_RCP_F32", "ENC_VOP1", &[("VDST", 5), ("SRC0", V + 5)], None),
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 6), ("VSRC1", 5)], None),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 5), ("SRC0", V + 5)], None),
+        ("V_DIV_FIXUP_F16", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 5), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+    ]);
+    // (q, d, n): every d and n of F16_EDGES, q = 0x3A00 or its negation, then random halves
+    let mut cases: Vec<(u16, u16, u16)> = Vec::new();
+    for (i, &d) in F16_EDGES.iter().enumerate() {
+        for &n in &F16_EDGES {
+            cases.push((if i % 2 == 0 { 0x3A00 } else { 0xBA00 }, d, n));
+        }
+    }
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    while cases.len() < 8 * 64 {
+        let x = rng.next();
+        cases.push((x as u16, (x >> 16) as u16, (x >> 32) as u16));
+    }
+    let mut bad = Vec::new();
+    let mut lanes = 0;
+    for chunk in cases.chunks(if wave64 { 64 } else { 32 }) {
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let (q, d, n) = chunk[l % chunk.len()];
+            // the high halves hold the same case with q, d and n rotated one lane on
+            let (q2, d2, n2) = chunk[(l + 1) % chunk.len()];
+            (r[0], r[1], r[2]) = (q as u32 | (q2 as u32) << 16, d as u32 | (d2 as u32) << 16, n as u32 | (n2 as u32) << 16);
+        }
+        let (r, ran) = run_wave(&code, &st, wave64);
+        lanes = ran;
+        for (l, v) in r.vgpr.iter().take(ran).enumerate() {
+            for (dst, (q, d, n)) in [(3, chunk[l % chunk.len()]), (4, chunk[(l + 1) % chunk.len()])] {
+                let got = v[dst] as u16;
+                let ok = match div_fixup_f16_ref(q, d, n) {
+                    None => got & 0x7FFF > 0x7C00,
+                    Some(w) => got == w,
+                };
+                if !ok {
+                    bad.push(format!("v{dst}: v_div_fixup_f16(q {q:#06x}, d {d:#06x}, n {n:#06x}) = {got:#06x}, want {:?}", div_fixup_f16_ref(q, d, n).map(|w| format!("{w:#06x}"))));
+                }
+            }
+            let (_, d, n) = chunk[l % chunk.len()];
+            let got = v[7] as u16;
+            let ok = match div_fixup_f16_ref(0, d, n) {
+                None => got & 0x7FFF > 0x7C00,
+                Some(w) if (n & 0x7FFF) == 0 || (d & 0x7FFF) == 0 || (n & 0x7FFF) == 0x7C00 || (d & 0x7FFF) == 0x7C00 => got == w,
+                Some(_) => {
+                    let want = f64_to_f16_rne(f16_to_f64(n) / f16_to_f64(d));
+                    (got ^ want) & 0x8000 == 0 && (got & 0x7FFF).abs_diff(want & 0x7FFF) <= 1
+                }
+            };
+            if !ok {
+                bad.push(format!("{n:#06x} / {d:#06x} = {got:#06x}, want {:#06x}", f64_to_f16_rne(f16_to_f64(n) / f16_to_f64(d))));
+            }
+        }
+    }
+    bad.sort();
+    bad.dedup();
+    assert!(bad.is_empty(), "wave{lanes}:\n{}", bad.join("\n"));
+}
+
 #[test]
 fn gpu_cmp_class_f16_preserves_snan() {
     for wave64 in gpu_waves() {
