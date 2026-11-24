@@ -527,7 +527,7 @@ pub fn sgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
         if f == "LITERAL" || o.implicit {
             continue;
         }
-        if !["SREG", "SSRC", "SDST", "OPR_SRC"].iter().any(|k| o.ty.contains(k)) {
+        if !scalar_register_type(o.ty) {
             continue;
         }
         if f == "SRC0" && d.variant != Variant::Plain {
@@ -543,6 +543,19 @@ pub fn sgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
         dst.extend(v..(v + n).min(128));
     }
     (r, w)
+}
+
+/// `ty` contains SREG, SSRC, SDST or OPR_SRC: an operand type `sgpr_uses` follows. Compared
+/// in one pass over the bytes: `str::contains` builds a substring searcher for every needle,
+/// and the four of them made up most of the time `sgpr_uses` took.
+fn scalar_register_type(ty: &str) -> bool {
+    let t = ty.as_bytes();
+    let at = |i: usize, k: &[u8]| t.get(i..i + k.len()).is_some_and(|w| w.iter().zip(k).all(|(a, b)| a == b));
+    (0..t.len()).any(|i| match t[i] {
+        b'S' => at(i, b"SREG") || at(i, b"SSRC") || at(i, b"SDST"),
+        b'O' => at(i, b"OPR_SRC"),
+        _ => false,
+    })
 }
 
 pub fn vgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
@@ -1143,6 +1156,112 @@ mod tests {
 
     fn renamed_in_rdna2(llvm: &str, spec: &str) -> bool {
         matches!((llvm, spec), ("v_mac_legacy_f32", "v_fmac_legacy_f32") | ("v_mad_legacy_f32", "v_fma_legacy_f32"))
+    }
+
+    /// The encodings of LLVM's gfx10 disassembler tests (`llvm_gfx10_corpus`), as bytes.
+    fn llvm_encodings() -> Vec<Vec<u8>> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu");
+        let mut paths: Vec<_> = std::fs::read_dir(&dir).expect("tests/data/llvm-amdgpu").map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|x| x == "txt")).collect();
+        paths.sort();
+        let mut out = Vec::new();
+        for p in paths {
+            for line in std::fs::read_to_string(&p).unwrap().lines() {
+                let Some((_, enc)) = line.split_once("; encoding: [") else { continue };
+                let Some(enc) = enc.split(']').next() else { continue };
+                let bytes: Vec<u8> = enc.split(',').filter_map(|b| u8::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()).collect();
+                if bytes.len() >= 4 {
+                    out.push(bytes);
+                }
+            }
+        }
+        out
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 32) as u32
+        }
+    }
+
+    /// `sgpr_uses` as it was, with `str::contains` for the operand types.
+    fn sgpr_uses_contains(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
+        let (mut r, mut w) = (Vec::new(), Vec::new());
+        for o in d.ienc.operands {
+            let Some(f) = o.field else { continue };
+            if f == "LITERAL" || o.implicit {
+                continue;
+            }
+            if !["SREG", "SSRC", "SDST", "OPR_SRC"].iter().any(|k| o.ty.contains(k)) {
+                continue;
+            }
+            if f == "SRC0" && d.variant != Variant::Plain {
+                continue;
+            }
+            let Some(v) = field_value(d.enc, &d.words, f) else { continue };
+            let v = v * register_scale(f);
+            if v > 127 || v == 125 {
+                continue;
+            }
+            let n = (o.size as u64).div_ceil(32).max(1);
+            let dst = if o.output { &mut w } else { &mut r };
+            dst.extend(v..(v + n).min(128));
+        }
+        (r, w)
+    }
+
+    #[test]
+    fn sgpr_uses_match_the_contains_reference() {
+        let contains = |t: &str| ["SREG", "SSRC", "SDST", "OPR_SRC"].iter().any(|k| t.contains(k));
+        // every operand type of the tables, and needles at the edges, cut short, overlapping
+        let mut types: Vec<&str> = all_instructions().flat_map(|i| i.encs.iter()).flat_map(|e| e.operands.iter()).map(|o| o.ty).collect();
+        types.extend(["", "S", "SRE", "SREG", "xSREG", "SREGx", "SSSRC", "OPR_SR", "OPR_SRC", "OPR_OPR_SRC", "SDS", "SDST", "XXSDSTXX", "OPR_VGPR", "sreg", "ÜSREG"]);
+        for t in &types {
+            assert_eq!(scalar_register_type(t), contains(t), "{t:?}");
+        }
+        // every instruction of LLVM's corpus, and random dwords (whatever decodes)
+        let mut r = Lcg(7);
+        let mut checked = 0;
+        let mut inputs = llvm_encodings();
+        for _ in 0..200_000 {
+            inputs.push((0..5).flat_map(|_| r.next().to_le_bytes()).collect());
+        }
+        for b in inputs {
+            if let Ok(d) = decode(&b, 0) {
+                assert_eq!(sgpr_uses(&d), sgpr_uses_contains(&d), "{}", format(&d));
+                checked += 1;
+            }
+        }
+        assert!(checked > 100_000, "{checked}");
+    }
+
+    /// Median ns per instruction of `f` over the LLVM gfx10 corpus (7 runs of 20 passes).
+    fn per_instruction<T>(items: &[T], mut f: impl FnMut(&T) -> usize) -> f64 {
+        let mut runs = Vec::new();
+        for _ in 0..7 {
+            let t = std::time::Instant::now();
+            let n: usize = (0..20).map(|_| items.iter().map(&mut f).sum::<usize>()).sum();
+            runs.push(t.elapsed().as_secs_f64() * 1e9 / (20 * items.len()) as f64);
+            assert!(n > 0);
+        }
+        runs.sort_by(f64::total_cmp);
+        runs[3]
+    }
+
+    /// The decoder's parts the recompiler runs on every instruction, on the LLVM gfx10 corpus:
+    /// `cargo test --release --lib rdna2::tests::bench_decode -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_decode() {
+        let corpus = llvm_encodings();
+        let decoded: Vec<Decoded> = corpus.iter().filter_map(|b| decode(b, 0).ok()).collect();
+        println!("{} instructions, ns per instruction (median of 7):", corpus.len());
+        println!("decode {:.0}", per_instruction(&corpus, |b| decode(b, 0).map_or(1, |d| d.len)));
+        println!("sgpr_uses {:.0}", per_instruction(&decoded, |d| 1 + sgpr_uses(d).0.len()));
+        println!("vgpr_uses {:.0}", per_instruction(&decoded, |d| 1 + vgpr_uses(d).0.len()));
+        println!("branch_target {:.0}", per_instruction(&decoded, |d| 1 + branch_target(d).is_some() as usize));
+        println!("format {:.0}", per_instruction(&decoded, |d| format(d).len()));
     }
 
     /// Decode every instruction in LLVM's gfx10 disassembler tests and compare the
