@@ -26,7 +26,65 @@ const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 
 /// pages (64 KiB) mapped but not committed yet
-static LAZY: RwLock<BTreeSet<usize>> = RwLock::new(BTreeSet::new());
+static LAZY: RwLock<Pages> = RwLock::new(Pages(BTreeSet::new()));
+
+/// The lowest and highest lazy page (usize::MAX and 0 with none), published with every change
+/// so `ensure` – every ReadFile a title makes – can tell without the lock that a buffer holds
+/// none: the lock's shared count is a cache line all streaming threads write. Only changed
+/// under the write lock; each value read is a bound of every page added before the read.
+static LOWEST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+static HIGHEST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const PUBLISH: std::sync::atomic::Ordering = std::sync::atomic::Ordering::Release;
+const READ: std::sync::atomic::Ordering = std::sync::atomic::Ordering::Acquire;
+
+/// The lazy page set, keeping LOWEST and HIGHEST.
+struct Pages(BTreeSet<usize>);
+
+impl Pages {
+    fn insert(&mut self, page: usize) -> bool {
+        let new = self.0.insert(page);
+        if new {
+            self.publish();
+        }
+        new
+    }
+
+    fn remove(&mut self, page: &usize) -> bool {
+        let had = self.0.remove(page);
+        if had {
+            self.publish();
+        }
+        had
+    }
+
+    fn publish(&self) {
+        LOWEST.store(self.0.first().copied().unwrap_or(usize::MAX), PUBLISH);
+        HIGHEST.store(self.0.last().copied().unwrap_or(0), PUBLISH);
+    }
+
+    fn contains(&self, page: &usize) -> bool {
+        self.0.contains(page)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn range(&self, r: std::ops::Range<usize>) -> std::collections::btree_set::Range<'_, usize> {
+        self.0.range(r)
+    }
+
+    /// Whether a lazy page can start in `[p & !(PAGE - 1), p + len)` (`len` > 0), read without
+    /// the lock: false when the range lies wholly below the lowest or above the highest.
+    fn may_hold(p: usize, len: usize) -> bool {
+        overlaps(p, len, LOWEST.load(READ), HIGHEST.load(READ))
+    }
+}
+
+/// Whether a page in `lowest..=highest` can start in `[p & !(PAGE - 1), p + len)` (`len` > 0).
+fn overlaps(p: usize, len: usize, lowest: usize, highest: usize) -> bool {
+    p & !(PAGE - 1) <= highest && p.saturating_add(len - 1) >= lowest
+}
 
 fn install() {
     static ONCE: Once = Once::new();
@@ -85,7 +143,7 @@ pub(super) fn unmark(page: usize) -> bool {
 
 /// The lazy pages of `[p, p + len)` committed – memory a kernel call or XCL writes.
 pub fn ensure(p: usize, len: usize) {
-    if len == 0 {
+    if len == 0 || !Pages::may_hold(p, len) {
         return;
     }
     let pages: Vec<usize> = {
@@ -120,6 +178,44 @@ mod tests {
             ensure(r + PAGE + 4, 4);
             assert!(!LAZY.read().unwrap().contains(&(r + PAGE)));
             assert!(crate::gpu::shader::readable(r + PAGE, 4));
+            VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// `ensure` skips the lock only for a buffer wholly outside the lazy pages' span, and the
+    /// published span is the set's.
+    #[test]
+    fn ensure_skips_the_lock_only_outside_the_lazy_span() {
+        let (a, b) = (0x7_0000_0000usize, 0x7_0004_0000usize);
+        assert!(!overlaps(0x1_0000, 4, usize::MAX, 0), "no lazy page: never the lock");
+        assert!(overlaps(a + 8, 4, a, b));
+        assert!(overlaps(a - 4, 8, a, b), "a buffer reaching the lowest page");
+        assert!(overlaps(b + PAGE - 1, 1, a, b), "the last byte of the highest page");
+        assert!(overlaps(a + PAGE, PAGE, a, b), "between the two: the lock decides");
+        assert!(overlaps(0, usize::MAX, a, b));
+        assert!(!overlaps(a - 8, 8, a, b), "just below the lowest");
+        assert!(!overlaps(b + PAGE, 16, a, b), "above the highest page");
+        assert!(!overlaps(usize::MAX - 4, 100, a, b), "a range past the top");
+
+        let span = || {
+            let g = LAZY.read().unwrap_or_else(|e| e.into_inner());
+            let set = (g.0.first().copied().unwrap_or(usize::MAX), g.0.last().copied().unwrap_or(0));
+            (set, (LOWEST.load(READ), HIGHEST.load(READ)))
+        };
+        unsafe {
+            let r = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(r, 0);
+            mark(r);
+            mark(r + PAGE);
+            let (set, published) = span();
+            assert_eq!(set, published);
+            assert!(published.0 <= r && r + PAGE <= published.1);
+            assert!(Pages::may_hold(r + PAGE + 8, 4));
+            ensure(r + PAGE + 8, 4);
+            assert!(!LAZY.read().unwrap().contains(&(r + PAGE)), "a lazy page in the buffer is committed");
+            assert!(unmark(r));
+            let (set, published) = span();
+            assert_eq!(set, published);
             VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
         }
     }
