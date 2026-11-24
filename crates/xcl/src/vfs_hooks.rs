@@ -53,6 +53,13 @@ macro_rules! orig {
 
 const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
 
+/// A real path for the original (native) API, as a NUL-terminated wide string: long paths get
+/// the `\\?\` prefix (`vfs::native_path`) – a console path within MAX_PATH can be longer than
+/// it once a mount puts the game folder or the overlay in front of it.
+fn native(p: &str) -> Vec<u16> {
+    wide(&vfs::native_path(p))
+}
+
 // ---------------------------------------------------------------------------------------
 // CreateFile*
 // ---------------------------------------------------------------------------------------
@@ -90,10 +97,10 @@ fn apply_open_decision(
 ) -> HANDLE {
     match decision {
         Decision::Pass => passthrough(),
-        Decision::Use(path) => redirected(wide(&path).as_ptr(), disposition),
-        Decision::UseWithDisposition(path, disposition) => redirected(wide(&path).as_ptr(), disposition),
+        Decision::Use(path) => redirected(native(&path).as_ptr(), disposition),
+        Decision::UseWithDisposition(path, disposition) => redirected(native(&path).as_ptr(), disposition),
         Decision::CreateOverOriginal(path) => {
-            let handle = redirected(wide(&path).as_ptr(), disposition);
+            let handle = redirected(native(&path).as_ptr(), disposition);
             // Report that the virtual file existed before the open.
             if handle != INVALID_HANDLE_VALUE {
                 unsafe { SetLastError(vfs::ERROR_ALREADY_EXISTS) };
@@ -177,7 +184,7 @@ unsafe extern "system" fn hk_get_attr_w(n: *const u16) -> u32 {
     let Some(path) = from_wide_ptr(n) else { return orig(n) };
     match read_target(&path) {
         None => orig(n),
-        Some(Ok(p)) => orig(wide(&p).as_ptr()),
+        Some(Ok(p)) => orig(native(&p).as_ptr()),
         Some(Err(e)) => {
             SetLastError(e);
             INVALID_FILE_ATTRIBUTES
@@ -192,7 +199,7 @@ unsafe extern "system" fn hk_get_attr_a(n: *const u8) -> u32 {
     let Some(path) = from_ansi_ptr(n) else { return orig(n) };
     match read_target(&path) {
         None => orig(n),
-        Some(Ok(p)) => orig!(O_GET_ATTR_W as FnGetAttrW)(wide(&p).as_ptr()),
+        Some(Ok(p)) => orig!(O_GET_ATTR_W as FnGetAttrW)(native(&p).as_ptr()),
         Some(Err(e)) => {
             SetLastError(e);
             INVALID_FILE_ATTRIBUTES
@@ -206,7 +213,7 @@ unsafe extern "system" fn hk_get_attr_ex_w(n: *const u16, lvl: i32, info: *mut c
     let Some(path) = from_wide_ptr(n) else { return orig(n, lvl, info) };
     match read_target(&path) {
         None => orig(n, lvl, info),
-        Some(Ok(p)) => orig(wide(&p).as_ptr(), lvl, info),
+        Some(Ok(p)) => orig(native(&p).as_ptr(), lvl, info),
         Some(Err(e)) => {
             SetLastError(e);
             0
@@ -221,7 +228,7 @@ unsafe extern "system" fn hk_get_attr_ex_a(n: *const u8, lvl: i32, info: *mut c_
     let Some(path) = from_ansi_ptr(n) else { return orig(n, lvl, info) };
     match read_target(&path) {
         None => orig(n, lvl, info),
-        Some(Ok(p)) => orig!(O_GET_ATTR_EX_W as FnGetAttrExW)(wide(&p).as_ptr(), lvl, info),
+        Some(Ok(p)) => orig!(O_GET_ATTR_EX_W as FnGetAttrExW)(native(&p).as_ptr(), lvl, info),
         Some(Err(e)) => {
             SetLastError(e);
             0
@@ -235,14 +242,14 @@ unsafe extern "system" fn hk_set_attr_w(n: *const u16, attrs: u32) -> i32 {
     let Some(path) = from_wide_ptr(n) else { return orig(n, attrs) };
     match v.classify(&path) {
         Target::Pass => orig(n, attrs),
-        Target::Translated(p) => orig(wide(&p).as_ptr(), attrs),
+        Target::Translated(p) => orig(native(&p).as_ptr(), attrs),
         Target::Game { rel } => {
             if !v.visible_in_overlay(&rel) && !v.visible_in_original(&rel) {
                 SetLastError(vfs::ERROR_FILE_NOT_FOUND);
                 return 0;
             }
             match v.prepare_write(&rel, true) {
-                Ok(p) => orig(wide(&p).as_ptr(), attrs),
+                Ok(p) => orig(native(&p).as_ptr(), attrs),
                 Err(e) => {
                     SetLastError(e);
                     0
@@ -369,7 +376,7 @@ unsafe fn disk_free_ex(
         }
         Some(Ok(p)) => {
             let orig = orig!(O_DISK_FREE_EX_W as FnDiskFreeExW);
-            let w = wide(&p);
+            let w = native(&p);
             let r = if let Some(root) = pls {
                 let quota = crate::state::config().pls_quota_bytes();
                 SetLastError(err);
@@ -439,7 +446,7 @@ unsafe extern "system" fn hk_disk_free_w(n: *const u16, spc: *mut u32, bps: *mut
     let Some(path) = from_wide_ptr(n) else { return orig(n, spc, bps, nfree, ntotal) };
     let (r, real) = match read_target(&path) {
         None => (orig(n, spc, bps, nfree, ntotal), None),
-        Some(Ok(p)) => (orig(wide(&p).as_ptr(), spc, bps, nfree, ntotal), Some(p)),
+        Some(Ok(p)) => (orig(native(&p).as_ptr(), spc, bps, nfree, ntotal), Some(p)),
         Some(Err(e)) => {
             SetLastError(e);
             (0, None)
@@ -456,7 +463,7 @@ unsafe extern "system" fn hk_disk_free_a(n: *const u8, spc: *mut u32, bps: *mut 
     let Some(path) = from_ansi_ptr(n) else { return orig(n, spc, bps, nfree, ntotal) };
     let (r, real) = match read_target(&path) {
         None => (orig(n, spc, bps, nfree, ntotal), None),
-        Some(Ok(p)) => (orig!(O_DISK_FREE_W as FnDiskFreeW)(wide(&p).as_ptr(), spc, bps, nfree, ntotal), Some(p)),
+        Some(Ok(p)) => (orig!(O_DISK_FREE_W as FnDiskFreeW)(native(&p).as_ptr(), spc, bps, nfree, ntotal), Some(p)),
         Some(Err(e)) => {
             SetLastError(e);
             (0, None)
@@ -510,7 +517,7 @@ unsafe extern "system" fn hk_create_dir_w(n: *const u16, sa: *const c_void) -> i
     let Some(path) = from_wide_ptr(n) else { return orig(n, sa) };
     match v.classify(&path) {
         Target::Pass => orig(n, sa),
-        Target::Translated(p) => orig(wide(&p).as_ptr(), sa),
+        Target::Translated(p) => orig(native(&p).as_ptr(), sa),
         Target::Game { rel } => bool_result(v.create_dir(&rel)),
     }
 }
@@ -521,7 +528,7 @@ unsafe extern "system" fn hk_remove_dir_w(n: *const u16) -> i32 {
     let Some(path) = from_wide_ptr(n) else { return orig(n) };
     match v.classify(&path) {
         Target::Pass => orig(n),
-        Target::Translated(p) => orig(wide(&p).as_ptr()),
+        Target::Translated(p) => orig(native(&p).as_ptr()),
         Target::Game { rel } => bool_result(v.remove_dir(&rel)),
     }
 }
@@ -543,7 +550,7 @@ unsafe extern "system" fn hk_delete_file_w(n: *const u16) -> i32 {
     let Some(path) = from_wide_ptr(n) else { return orig(n) };
     match v.classify(&path) {
         Target::Pass => orig(n),
-        Target::Translated(p) => orig(wide(&p).as_ptr()),
+        Target::Translated(p) => orig(native(&p).as_ptr()),
         Target::Game { rel } => bool_result(v.delete_file(&rel)),
     }
 }
@@ -649,7 +656,7 @@ unsafe fn move_file_vfs(v: &vfs::Vfs, s: &str, d: &str, flags: u32, orig: impl F
             Ok(x) => x,
             Err(e) => return bool_result(Err(e)),
         };
-        return orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), flags);
+        return orig(native(&rs).as_ptr(), native(&rd).as_ptr(), flags);
     }
     let replace_existing = flags & MOVEFILE_REPLACE_EXISTING != 0;
     let drel_opt = match d_target {
@@ -674,7 +681,7 @@ unsafe fn move_file_vfs(v: &vfs::Vfs, s: &str, d: &str, flags: u32, orig: impl F
                         }
                         if source_in_overlay {
                             let rd = v.overlay_path(dr);
-                            if orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), flags) == 0 {
+                            if orig(native(&rs).as_ptr(), native(&rd).as_ptr(), flags) == 0 {
                                 // SAFETY: GetLastError reads thread-local Win32 error state.
                                 return Err(windows_sys::Win32::Foundation::GetLastError());
                             }
@@ -699,7 +706,7 @@ unsafe fn move_file_vfs(v: &vfs::Vfs, s: &str, d: &str, flags: u32, orig: impl F
                 if let Some(dr) = &drel {
                     if source_in_overlay && flags & MOVEFILE_DELAY_UNTIL_REBOOT == 0 {
                         // An in-place rename checks delete sharing before replacing the destination.
-                        let moved = orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), flags & !MOVEFILE_COPY_ALLOWED);
+                        let moved = orig(native(&rs).as_ptr(), native(&rd).as_ptr(), flags & !MOVEFILE_COPY_ALLOWED);
                         if moved != 0 {
                             v.commit_write(dr);
                             v.commit_overlay_removal(sr);
@@ -722,7 +729,7 @@ unsafe fn move_file_vfs(v: &vfs::Vfs, s: &str, d: &str, flags: u32, orig: impl F
                     // Move an overlay file directly when both paths are on one volume.
                     // Windows checks delete sharing before replacing the destination.
                     if source_in_overlay && flags & MOVEFILE_DELAY_UNTIL_REBOOT == 0 {
-                        if orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), flags & !MOVEFILE_COPY_ALLOWED) != 0 {
+                        if orig(native(&rs).as_ptr(), native(&rd).as_ptr(), flags & !MOVEFILE_COPY_ALLOWED) != 0 {
                             v.commit_overlay_removal(sr);
                             return Ok(());
                         }
@@ -751,7 +758,7 @@ unsafe fn move_file_vfs(v: &vfs::Vfs, s: &str, d: &str, flags: u32, orig: impl F
                     }
                 }
                 let (rd, drel) = dest_of(v, d)?;
-                if orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), flags | MOVEFILE_COPY_ALLOWED) == 0 {
+                if orig(native(&rs).as_ptr(), native(&rd).as_ptr(), flags | MOVEFILE_COPY_ALLOWED) == 0 {
                     // SAFETY: GetLastError reads thread-local Win32 error state.
                     return Err(windows_sys::Win32::Foundation::GetLastError());
                 }
@@ -805,7 +812,7 @@ unsafe fn copy_file_ex_w_vfs(
         Ok(x) => x,
         Err(e) => return bool_result(Err(e)),
     };
-    let ok = orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), prog, data, cancel, flags);
+    let ok = orig(native(&rs).as_ptr(), native(&rd).as_ptr(), prog, data, cancel, flags);
     if ok != 0 {
         if let Some(dr) = drel {
             v.commit_write(&dr);
@@ -832,7 +839,7 @@ unsafe fn copy_file_w_vfs(
         Ok(x) => x,
         Err(e) => return bool_result(Err(e)),
     };
-    let ok = orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), fail_if_exists);
+    let ok = orig(native(&rs).as_ptr(), native(&rd).as_ptr(), fail_if_exists);
     if ok != 0 {
         if let Some(dr) = drel {
             v.commit_write(&dr);
@@ -877,7 +884,7 @@ unsafe fn copy_file_2_vfs(
         Ok(x) => x,
         Err(e) => return crate::util::hresult_from_win32(e),
     };
-    let hr = orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), params);
+    let hr = orig(native(&rs).as_ptr(), native(&rd).as_ptr(), params);
     if hr >= 0 {
         if let Some(dr) = drel {
             v.commit_write(&dr);
@@ -925,8 +932,8 @@ unsafe extern "system" fn hk_replace_file_w(replaced: *const u16, replacement: *
     })();
     match r {
         Ok((rt, rs, rb)) => {
-            let rb = rb.map(|b| wide(&b));
-            orig(wide(&rt).as_ptr(), wide(&rs).as_ptr(), rb.as_ref().map_or(std::ptr::null(), |b| b.as_ptr()), flags, excl, res)
+            let rb = rb.map(|b| native(&b));
+            orig(native(&rt).as_ptr(), native(&rs).as_ptr(), rb.as_ref().map_or(std::ptr::null(), |b| b.as_ptr()), flags, excl, res)
         }
         Err(e) => bool_result(Err(e)),
     }
@@ -971,7 +978,7 @@ unsafe fn collect(pattern: &str) -> Vec<WIN32_FIND_DATAW> {
     let close = orig!(O_FIND_CLOSE as FnFindClose);
     let mut out = Vec::new();
     let mut d: WIN32_FIND_DATAW = std::mem::zeroed();
-    let h = first(wide(pattern).as_ptr(), 0, &mut d as *mut _ as *mut c_void, 0, std::ptr::null(), 0);
+    let h = first(native(pattern).as_ptr(), 0, &mut d as *mut _ as *mut c_void, 0, std::ptr::null(), 0);
     if h == INVALID_HANDLE_VALUE {
         return out;
     }
@@ -1063,7 +1070,7 @@ unsafe fn find_first_vfs(path: &str, out: *mut WIN32_FIND_DATAW) -> Option<Resul
         Target::Translated(p) if drive_root => Some(drive_root_entries(collect(&p)).map(|items| merged_handle(items, out))),
         Target::Translated(p) => {
             let first = orig!(O_FIND_FIRST_EX_W as FnFindFirstExW);
-            let h = first(wide(&p).as_ptr(), 0, out as *mut c_void, 0, std::ptr::null(), 0);
+            let h = first(native(&p).as_ptr(), 0, out as *mut c_void, 0, std::ptr::null(), 0);
             Some(if h == INVALID_HANDLE_VALUE { Err(windows_sys::Win32::Foundation::GetLastError()) } else { Ok(h) })
         }
         Target::Game { rel } => {
@@ -1572,6 +1579,58 @@ mod tests {
         assert_ne!(unsafe { move_file_vfs(&f.vfs, new_source, r"T:\new.txt", 0, real_move) }, 0);
         assert_eq!(std::fs::read(f.temp().join("new.txt")).unwrap(), b"new file");
         assert_eq!(f.read_vfs(new_source), None);
+    }
+
+    /// A console path within MAX_PATH whose real path – game folder, overlay or temp folder in
+    /// front – is longer than MAX_PATH: XCL's process is not long-path aware, so the native
+    /// calls get the `\\?\` form.
+    #[test]
+    fn console_paths_whose_real_path_exceeds_max_path() {
+        use windows_sys::Win32::Foundation::GENERIC_READ;
+        use windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING;
+        let f = HookFixture::new("long_path");
+        let v = &f.vfs;
+        let open = |path: &str, access: u32, disposition: u32| {
+            let decision = v.open_decision(path, access, disposition, FILE_ATTRIBUTE_NORMAL);
+            let handle = apply_open_decision(
+                decision,
+                disposition,
+                || panic!("{path} is a console path"),
+                |p, d| unsafe { CreateFileW(p, access, 0, std::ptr::null(), d, FILE_ATTRIBUTE_NORMAL, std::ptr::null_mut()) },
+            );
+            let error = unsafe { GetLastError() };
+            assert_ne!(handle, INVALID_HANDLE_VALUE, "CreateFileW({path}) failed with {error}");
+            assert_ne!(unsafe { CloseHandle(handle) }, 0);
+        };
+        // folders of 50 characters until the game folder's path passes MAX_PATH by 10
+        let game = v.game_root().to_string();
+        let mut rel = String::from("data");
+        while game.len() + 1 + rel.len() + "\\file.bin".len() < 270 {
+            rel.push_str(&format!("\\{}", "d".repeat(50)));
+        }
+        let console = format!("G:\\{rel}\\file.bin");
+        assert!(console.len() < 260, "{console}");
+        let Target::Game { rel: file_rel } = v.classify(&console) else { panic!("{console}") };
+        assert!(v.overlay_path(&file_rel).len() > 260 && v.original_path(&file_rel).len() > 260);
+
+        // a new game file goes to the overlay, is read back and moved there
+        open(&console, GENERIC_WRITE, CREATE_ALWAYS);
+        open(&console, GENERIC_READ, OPEN_EXISTING);
+        let moved = format!("G:\\{rel}\\moved.bin");
+        assert_eq!(unsafe { move_file_vfs(v, &console, &moved, 0, real_move) }, 1);
+        assert_eq!(f.read_vfs(&moved).as_deref(), Some(&b""[..]));
+        assert_eq!(f.read_vfs(&console), None);
+
+        // the same under T:\ (a translated path)
+        let temp = format!("T:\\{rel}\\file.bin");
+        let Target::Translated(real) = v.classify(&temp) else { panic!("{temp}") };
+        assert!(temp.len() < 260 && real.len() > 260, "{real}");
+        open(&temp, GENERIC_WRITE, CREATE_ALWAYS);
+        open(&temp, GENERIC_READ, OPEN_EXISTING);
+        // and copied between the two
+        let copied = format!("G:\\{rel}\\copied.bin");
+        assert_eq!(unsafe { copy_file_w_vfs(v, &temp, &copied, 1, real_copy) }, 1);
+        assert_eq!(f.read_vfs(&copied).as_deref(), Some(&b""[..]));
     }
 
     #[test]

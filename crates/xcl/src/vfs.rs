@@ -134,6 +134,37 @@ fn is_device(p: &str) -> bool {
         || (base.len() == 4 && (base.starts_with("com") || base.starts_with("lpt")) && base.as_bytes()[3].is_ascii_digit())
 }
 
+/// From this length (UTF-16 units) on, a plain path can fail in XCL's process, which is not
+/// long-path aware: CreateDirectoryW stops at MAX_PATH - 12, the file APIs at MAX_PATH - 1
+/// ("…\XCL\<title>\overlay\" or the game folder in front of a console path makes it longer
+/// than the title wrote it). The threshold std::fs uses for the same purpose.
+const LONG_PATH: usize = 248;
+
+/// The form of a real path to hand to a native file API: a long absolute drive or UNC path
+/// gets the `\\?\` (`\\?\UNC\`) prefix, which lifts the MAX_PATH limit; anything else is
+/// returned as it is. The prefix also turns off Windows' path normalisation, so it is only
+/// added to a path that normalisation leaves unchanged (no `.` / `..`, `/`, doubled
+/// separators, trailing dots, device names …): it then names exactly the file the plain path
+/// names. `full` absolutises (`full_path`, injected for unit tests).
+pub(crate) fn native_path_with(p: &str, full: impl Fn(&str) -> Option<String>) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if p.encode_utf16().count() < LONG_PATH {
+        return Cow::Borrowed(p);
+    }
+    let b = p.as_bytes();
+    let drive = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\';
+    let unc = b.len() >= 3 && b[0] == b'\\' && b[1] == b'\\' && b[2] != b'?' && b[2] != b'.';
+    if !(drive || unc) || full(p).as_deref() != Some(p) {
+        return Cow::Borrowed(p);
+    }
+    Cow::Owned(if drive { format!("\\\\?\\{p}") } else { format!("\\\\?\\UNC\\{}", &p[2..]) })
+}
+
+/// `native_path_with` using GetFullPathNameW.
+pub fn native_path(p: &str) -> std::borrow::Cow<'_, str> {
+    native_path_with(p, full_path)
+}
+
 /// Full path via GetFullPathNameW (no file system access).
 pub fn full_path(p: &str) -> Option<String> {
     use windows_sys::Win32::Storage::FileSystem::GetFullPathNameW;
@@ -762,6 +793,68 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn native_path_prefixes_only_long_normalised_absolute_paths() {
+        let same = |p: &str| Some(p.to_string());
+        let long = format!("C:\\{}\\{}\\file.bin", "a".repeat(150), "b".repeat(150));
+        assert_eq!(native_path_with(&long, same), format!("\\\\?\\{long}"));
+        // UNC shares take the \\?\UNC\ form
+        let share = format!("\\\\nas\\games\\{}\\file.bin", "c".repeat(300));
+        assert_eq!(native_path_with(&share, same), format!("\\\\?\\UNC\\nas\\games\\{}\\file.bin", "c".repeat(300)));
+        // up to std's threshold (MAX_PATH - 12) a path stays as it is
+        let short = format!("C:\\{}", "d".repeat(244));
+        assert_eq!(short.len(), 247);
+        assert_eq!(native_path_with(&short, same), short);
+        let edge = format!("C:\\{}", "d".repeat(245));
+        assert_eq!(native_path_with(&edge, same), format!("\\\\?\\{edge}"));
+        // the threshold counts UTF-16 units, not UTF-8 bytes
+        let wide = format!("C:\\{}", "é".repeat(200));
+        assert_eq!(native_path_with(&wide, same), wide);
+        // already verbatim / NT / device paths, relative paths and drive-relative paths stay
+        for p in [
+            format!("\\\\?\\{long}"),
+            format!("\\??\\{long}"),
+            format!("\\\\.\\{}", &long[..]),
+            long[3..].to_string(),
+            format!("C:{}", &long[2..].trim_start_matches('\\')),
+            format!("\\{}", &long[3..]),
+        ] {
+            assert_eq!(native_path_with(&p, same), p);
+        }
+        // a path that Windows would still normalise does not get the prefix (it would then name
+        // another file): "..", ".", "/", doubled separators, trailing dots or spaces
+        let normalise = |p: &str| Some(p.replace("\\..\\x", "").replace("\\.\\", "\\").replace('/', "\\").replace("\\\\", "\\"));
+        for p in [
+            format!("C:\\{}\\..\\x\\f", "a".repeat(250)),
+            format!("C:\\{}\\.\\f", "a".repeat(250)),
+            format!("C:\\{}/f", "a".repeat(250)),
+            format!("C:\\{}\\\\f", "a".repeat(250)),
+        ] {
+            assert_eq!(native_path_with(&p, normalise), p);
+        }
+        // nor one GetFullPathNameW refuses
+        assert_eq!(native_path_with(&long, |_| None), long);
+    }
+
+    /// The same with the real GetFullPathNameW: only a path it leaves unchanged gets `\\?\`.
+    #[test]
+    fn native_path_with_get_full_path_name() {
+        let root = full_path(&std::env::temp_dir().to_string_lossy()).unwrap();
+        let root = trim_sep(&root);
+        let long = format!("{root}\\{}\\{}\\file.bin", "a".repeat(150), "b".repeat(150));
+        assert_eq!(native_path(&long), format!("\\\\?\\{long}"));
+        for p in [
+            format!("{root}\\{}\\..\\{}\\file.bin", "a".repeat(150), "b".repeat(150)),
+            format!("{root}\\{}\\.\\{}\\file.bin", "a".repeat(150), "b".repeat(150)),
+            format!("{root}\\{}/{}\\file.bin", "a".repeat(150), "b".repeat(150)),
+            format!("{root}\\{}\\{}\\file.bin.", "a".repeat(150), "b".repeat(150)),
+            format!("{root}\\{}\\{}\\file.bin ", "a".repeat(150), "b".repeat(150)),
+        ] {
+            assert_eq!(native_path(&p), p);
+        }
+        assert_eq!(native_path("C:\\x\\y.bin"), "C:\\x\\y.bin");
     }
 
     #[test]
