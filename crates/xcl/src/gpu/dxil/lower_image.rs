@@ -578,7 +578,7 @@ impl Lw {
                         [v[0]; 4]
                     }
                     (Some(z), _, _, _) => {
-                        let v = self.s.sample_cmp(tex, smp, &coord, &[], *z, if dim == 3 { None } else { cl });
+                        let v = self.s.sample_cmp(tex, smp, &coord, &[], *z, cl);
                         [v[0]; 4]
                     }
                     (None, Some((dx, dy)), _, _) if dim == 3 => {
@@ -605,7 +605,7 @@ impl Lw {
                     }
                     (None, Some((dx, dy)), _, _) => self.s.sample_grad(tex, smp, &coord, &[], dx, dy, cl),
                     (None, None, Some(l), _) => self.s.sample_level(tex, smp, &coord, &[], *l),
-                    (None, None, None, Some(b)) if ps => self.s.sample_bias(tex, smp, &coord, &[], *b, if dim == 3 { None } else { cl }),
+                    (None, None, None, Some(b)) if ps => self.s.sample_bias(tex, smp, &coord, &[], *b, cl),
                     (None, None, None, Some(b)) => {
                         let l = floor(self, *b);
                         self.s.sample_level(tex, smp, &coord, &[], l)
@@ -615,7 +615,7 @@ impl Lw {
                         let l = floor(self, z);
                         self.s.sample_level(tex, smp, &coord, &[], l)
                     }
-                    _ => self.s.sample(tex, smp, &coord, &[], if dim == 3 { None } else { cl }),
+                    _ => self.s.sample(tex, smp, &coord, &[], cl),
                 }
             };
             let rb: Vec<Value> = r.iter().map(|&v| self.bits(v)).collect();

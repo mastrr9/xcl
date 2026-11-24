@@ -2144,6 +2144,90 @@ fn gpu_ps_image_sample_offset_implicit_lod_between_mips() {
     }
 }
 
+/// `image_sample_cl` on a cube in a pixel shader, on both backends: the LOD clamp raises the
+/// implicit LOD for cubes too. Constant coordinates (the middle of face +x) give zero
+/// derivatives, so the sampled mip is the clamp's: level k of the 4² cube holds 10·k + 1,
+/// point mip filter, clamp 2.0 → 21 (without the clamp: mip 0, 1).
+#[test]
+fn gpu_ps_image_sample_cl_cube_on_both_backends() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_SAMPLE_DESC};
+    let ps = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 255)], Some(1.5f32.to_bits())),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 255)], Some(1.5f32.to_bits())),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 128)], None), // face +x, cube 0
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 244)], None), // LOD clamp 2.0
+        ("IMAGE_SAMPLE_CL", "ENC_MIMG", &[("VDATA", 8), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 3)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 8), ("VSRC2", 8), ("VSRC3", 8), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    // face 0 (subresources 0..2) only: the others are never sampled
+    let mut data = Vec::new();
+    for k in 0..3u32 {
+        let n = 4 >> k;
+        for _ in 0..n * n {
+            data.extend_from_slice(&[(10 * k + 1) as f32; 4].map(f32::to_le_bytes).concat());
+        }
+    }
+    let res = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: 4,
+        Height: 4,
+        DepthOrArraySize: 6,
+        MipLevels: 3,
+        Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        ..Default::default()
+    };
+    let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBEARRAY,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    srv.Anonymous.TextureCubeArray = D3D12_TEXCUBE_ARRAY_SRV { MipLevels: 3, NumCubes: 1, ..Default::default() };
+    let tex = runner::ViewTexture { res, srv, data, row_bytes: 4 * 16 };
+    // S#: clamp u / v / w, point min / mag / mip, LOD 0..15.99, sampler 0
+    let s_sharp = [2 | 2 << 3 | 2 << 6, 0xFFF << 12, 1 << 26, 0];
+    let mut sgprs = vec![0u32; 32];
+    sgprs[16..24].copy_from_slice(&tsharp(0, 77, 11));
+    sgprs[24..28].copy_from_slice(&s_sharp);
+    let opt = runner::options(Mode::Pixel(draw_psi()));
+    let compile = |code: &[u8], mode: Mode, profile: &str| {
+        let t = translate(code, &runner::options(mode)).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        super::dxc::compile(&t.hlsl, "main", profile, &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl))
+    };
+    let vsb = compile(&draw_passthrough_vs(), Mode::Vertex(draw_vsi()), "vs_6_6");
+    let hps = compile(&ps, Mode::Pixel(draw_psi()), "ps_6_6");
+    let ko = crate::gpu::dxil::kernel::KernelOptions { wave64: opt.wave64, split: false, mem_windows: 1, sampler_base: 0 };
+    let dps = crate::gpu::dxil::kernel::translate_pixel(&ps, ko, &draw_psi()).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil;
+    let verts: Vec<f32> = [[-1.0f32, -1.0], [-1.0, 3.0], [3.0, -1.0]].iter().flat_map(|p| [p[0], p[1], 0.0, 0.0, 0.0, 0.0]).collect();
+    let layout = [
+        runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 },
+        runner::VertexElement { semantic: "COLOR", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 8 },
+    ];
+    let samplers = [crate::gpu::desc::sampler_d3d12(&s_sharp, false)];
+    for (backend, psb) in [("HLSL", &hps), ("direct", &dps)] {
+        let px = runner::draw_views(&vsb, psb, &layout, &verts, 24, &sgprs, &[], std::slice::from_ref(&tex), &samplers, 16, [-1.0; 4]).unwrap();
+        for (i, p) in px.iter().enumerate() {
+            assert_eq!(p[0], 21.0, "{backend}: pixel {i}");
+        }
+    }
+    // the bias and compare forms with a clamp on a cube: both backends build them (the direct
+    // container passes the validator in test builds), not drawn
+    for (name, first) in [("IMAGE_SAMPLE_B_CL", "bias"), ("IMAGE_SAMPLE_C_CL", "z")] {
+        let code = prog(&[
+            (name, "ENC_MIMG", &[("VDATA", 10), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 3)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 10), ("VSRC1", 10), ("VSRC2", 10), ("VSRC3", 10), ("DONE", 1), ("VM", 1)], None),
+        ]);
+        compile(&code, Mode::Pixel(draw_psi()), "ps_6_6");
+        crate::gpu::dxil::kernel::translate_pixel(&code, ko, &draw_psi()).unwrap_or_else(|e| panic!("direct DXIL, {name} (v4 = {first}, u, v, face, clamp): {e}"));
+    }
+}
+
 /// 48 SGPR spill slots in lanes 0..47 of v30 (`v_writelane` / `v_readlane`, as 287 retail
 /// pixel shaders do – 11 up to lane 47): slot k = `slot(k)`, then s44 = the sum of slots
 /// 0..31, s45 = the sum of slots 32..47.
