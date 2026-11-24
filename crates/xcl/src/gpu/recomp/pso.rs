@@ -357,7 +357,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     let ps_debug = stage == Stage::Pixel
         && (debug_color(blob).is_some() || ["XCL_DEBUG_LOD0", "XCL_DEBUG_PS_SUB", "XCL_DEBUG_PS_EXPR"].iter().any(|v| std::env::var_os(v).is_some()));
     if stage != Stage::Compute && !ps_debug && crate::gpu::dxil::kernel::enabled_graphics() {
-        match direct_graphics(blob, stage, sampler_base, windows) {
+        match direct_graphics(blob, stage, sampler_base, windows, split_wave64) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated(if stage == Stage::Vertex { "VS" } else { "PS" });
                 return Ok(c);
@@ -627,14 +627,18 @@ fn dump_direct(blob: &[u8], dxil: &[u8]) {
     }
 }
 
-/// A console vertex / pixel shader through the direct DXIL translator.
-fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -> Result<Compiled, String> {
+/// A console vertex / pixel shader through the direct DXIL translator; `split_wave64`: it may
+/// run in 32-lane waves here (`graphics_wave32`).
+fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let want = if stage == Stage::Vertex { 4 } else { 5 };
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == want)).ok_or("no hardware variant")?;
     let mode = interface(blob, &sh, f).ok_or("unknown shader interface")?;
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
+    if let Some(why) = direct_graphics_refusal(code, split_wave64) {
+        return Err(why.into());
+    }
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64: super::detect_wave64(code), split: false, mem_windows: windows, sampler_base };
     let k = match (&mode, stage) {
         (Mode::Vertex(vs), Stage::Vertex) => crate::gpu::dxil::kernel::translate_vertex(code, o, vs)?,
@@ -643,6 +647,14 @@ fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -
     };
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
+}
+
+/// Why a VS / PS program stays off the direct DXIL path: a wave64 one that may run in 32-lane
+/// waves here (`split_wave64`) and reads lanes ≥ 32 needs the `upper_lanes` form, which only
+/// the HLSL path has – the direct translator runs it as it would in 64 lanes, so a v_writelane to
+/// lane ≥ 32 is lost and the v_readlane reloading it asks for a lane the wave does not have.
+fn direct_graphics_refusal(code: &[u8], split_wave64: bool) -> Option<&'static str> {
+    (split_wave64 && super::detect_wave64(code) && super::upper_lanes_form(code)).then_some("a wave64 program reads lanes >= 32 in 32-lane waves (upper_lanes form)")
 }
 
 pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
@@ -1225,6 +1237,69 @@ mod shader_cache_tests {
                 assert_eq!(thread.join().unwrap().unwrap().dxil[0], 1);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod direct_graphics_tests {
+    use super::*;
+    use crate::gpu::rdna2::encode;
+
+    const V: u64 = 256;
+
+    fn code(lines: &[(&str, &str, &[(&str, u64)])]) -> Vec<u8> {
+        let mut out: Vec<u8> = lines.iter().flat_map(|(n, e, f)| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"))).collect();
+        out.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        out
+    }
+
+    /// A wave64 PS that spills s20 to lane 36 of v96 and reads it back gets the `upper_lanes`
+    /// form from the HLSL path where it may run in 32-lane waves: the direct path, which has no
+    /// such form, leaves it to the HLSL path there (and only there) – exactly the programs
+    /// `translate` gives the form.
+    #[test]
+    fn a_wave64_spill_to_an_upper_lane_stays_on_the_hlsl_path_in_32_lane_waves() {
+        let spill = code(&[
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 96), ("SRC0", 20), ("SRC1", 128 + 36)]),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 96), ("SRC1", 128 + 36)]),
+        ]);
+        assert!(super::super::detect_wave64(&spill) && super::super::upper_lanes_form(&spill));
+        assert!(direct_graphics_refusal(&spill, true).is_some());
+        assert_eq!(direct_graphics_refusal(&spill, false), None, "64-lane waves only: the direct path as before");
+        // a slot below lane 32 as well: the HLSL form reads it from its shadow too (its lane
+        // may not have been launched)
+        let low = code(&[
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 96), ("SRC0", 20), ("SRC1", 128 + 5)]),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 96), ("SRC1", 128 + 5)]),
+        ]);
+        assert!(direct_graphics_refusal(&low, true).is_some());
+        // a wave64 program with no read the form changes: the direct path
+        let plain = code(&[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 51), ("SRC0", 20)]),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 51), ("SRC1", 128 + 3)]),
+        ]);
+        assert!(super::super::detect_wave64(&plain));
+        assert_eq!(direct_graphics_refusal(&plain, true), None);
+        // a wave32 program (32-bit EXEC) has no lanes ≥ 32
+        let wave32 = code(&[
+            ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 96), ("SRC0", 20), ("SRC1", 128 + 36)]),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 96), ("SRC1", 128 + 36)]),
+        ]);
+        assert_eq!(direct_graphics_refusal(&wave32, true), None);
+    }
+
+    /// The program the refusal sends to the HLSL path really is translated differently there in
+    /// 32-lane waves: the read of lane 36 comes from the slot's shadow.
+    #[test]
+    fn the_hlsl_path_reads_the_upper_spill_slot_from_its_shadow() {
+        let spill = code(&[
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 96), ("SRC0", 20), ("SRC1", 128 + 36)]),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 96), ("SRC1", 128 + 36)]),
+        ]);
+        let ps = |split: bool| translate(&spill, &Options { mode: Mode::Pixel(Default::default()), wave64: true, split_wave64: split, ..Default::default() }).unwrap().hlsl;
+        assert!(ps(true).contains("xcl_sh96_36"), "{}", ps(true));
+        assert!(!ps(false).contains("xcl_sh96_36"));
     }
 }
 
