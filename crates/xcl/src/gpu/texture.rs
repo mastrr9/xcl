@@ -202,7 +202,9 @@ pub unsafe fn upload(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D1
 }
 
 /// What `upload_batch` keeps for a queue between batches: its allocator and list, a fence, and
-/// one persistently mapped upload buffer the batches' texels go through. Making them for every
+/// a persistently mapped upload buffer the batches' texels go through (in video memory where
+/// there are GPU upload heaps, in system memory without them or for batches too big for that
+/// one). Making them for every
 /// batch – an upload buffer per texture, an allocator, a list and a fence per batch – cost a
 /// retail game most of its frame once it streamed textures: each of those D3D12 calls waits for
 /// the video memory manager, 200 – 650 ms apiece then.
@@ -211,8 +213,10 @@ struct Uploader {
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
     value: u64,
-    /// (buffer, its mapped bytes, capacity)
-    staging: Option<(ID3D12Resource, *mut u8, u64)>,
+    /// whether staging buffers up to `GPU_UPLOAD_MAX` go in a GPU upload heap
+    gpu_upload: bool,
+    /// (buffer, its mapped bytes, capacity): in the UPLOAD heap, and in the GPU upload heap
+    staging: [Option<(ID3D12Resource, *mut u8, u64)>; 2],
 }
 
 // D3D12 objects are free-threaded; the mapped pointer is only used by the holder of the uploader
@@ -235,31 +239,76 @@ fn staging_capacity(bytes: u64) -> Option<u64> {
     }
 }
 
+/// the largest upload buffer kept in video memory (a GPU upload heap); bigger batches go
+/// through system memory, as streaming titles run out of video memory first
+const GPU_UPLOAD_MAX: u64 = 64 << 20;
+
+/// Whether `dev` makes GPU upload heaps: video memory the CPU writes through the PCIe BAR
+/// (resizable BAR; `D3D12_FEATURE_D3D12_OPTIONS16::GPUUploadHeapSupported`, with an Agility
+/// SDK that knows it). `XCL_GPU_UPLOAD=0` keeps every upload buffer in system memory.
+pub unsafe fn gpu_upload_heaps(dev: &ID3D12Device) -> bool {
+    if std::env::var("XCL_GPU_UPLOAD").is_ok_and(|v| v.trim() == "0") {
+        return false;
+    }
+    let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+    dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, &mut o as *mut _ as *mut std::ffi::c_void, std::mem::size_of_val(&o) as u32).is_ok() && o.GPUUploadHeapSupported.as_bool()
+}
+
+/// The heap of an upload buffer of `cap` bytes: a GPU upload heap where there are such heaps and
+/// it is not too big (the copies out of it then read video memory, not system memory over PCIe),
+/// else the UPLOAD heap.
+fn staging_heap(gpu_upload: bool, cap: u64) -> D3D12_HEAP_TYPE {
+    if gpu_upload && cap <= GPU_UPLOAD_MAX {
+        D3D12_HEAP_TYPE_GPU_UPLOAD
+    } else {
+        D3D12_HEAP_TYPE_UPLOAD
+    }
+}
+
 impl Uploader {
     unsafe fn new(dev: &ID3D12Device) -> Result<Uploader, String> {
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
         list.Close().map_err(err)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-        Ok(Uploader { alloc, list, fence, value: 0, staging: None })
+        Ok(Uploader { alloc, list, fence, value: 0, gpu_upload: gpu_upload_heaps(dev), staging: [None, None] })
     }
 
-    /// An upload buffer of at least `bytes`, mapped: the one kept, or a bigger one.
+    /// An upload buffer of at least `bytes`, mapped: the one kept for its heap, or a bigger one.
+    /// A GPU upload heap that cannot be had (no room in video memory) is not tried again; the
+    /// UPLOAD heap is used.
     unsafe fn staging(&mut self, dev: &ID3D12Device, bytes: u64) -> Result<(ID3D12Resource, *mut u8), String> {
-        if let Some((b, p, cap)) = &self.staging {
-            if *cap >= bytes {
-                return Ok((b.clone(), *p));
+        let cap = staging_capacity(bytes).ok_or("texture upload buffer size overflow")?;
+        let mut heap = staging_heap(self.gpu_upload, cap);
+        loop {
+            let slot = (heap == D3D12_HEAP_TYPE_GPU_UPLOAD) as usize;
+            if let Some((b, p, kept)) = &self.staging[slot] {
+                if *kept >= bytes {
+                    return Ok((b.clone(), *p));
+                }
+            }
+            // A cached uploader has passed its last copy fence. Return this reference before
+            // acquiring the replacement so the growth path does not keep two buffers itself.
+            drop(self.staging[slot].take());
+            let made = buffer_in(dev, cap, heap).and_then(|b| {
+                let mut p = std::ptr::null_mut();
+                // the CPU never reads it: an empty read range
+                b.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut p)).map_err(err)?;
+                Ok((b, p as *mut u8))
+            });
+            match made {
+                Ok((b, p)) => {
+                    self.staging[slot] = Some((b.clone(), p, cap));
+                    return Ok((b, p));
+                }
+                Err(e) if heap == D3D12_HEAP_TYPE_GPU_UPLOAD => {
+                    crate::xlog_warn!("texture uploads: no upload buffer of {} MiB in video memory ({e}) – system memory from here on", cap >> 20);
+                    self.gpu_upload = false;
+                    heap = D3D12_HEAP_TYPE_UPLOAD;
+                }
+                Err(e) => return Err(e),
             }
         }
-        let cap = staging_capacity(bytes).ok_or("texture upload buffer size overflow")?;
-        // A cached uploader has passed its last copy fence. Return this reference before
-        // acquiring the replacement so the growth path does not keep two buffers itself.
-        drop(self.staging.take());
-        let b = buffer(dev, cap)?;
-        let mut p = std::ptr::null_mut();
-        b.Map(0, None, Some(&mut p)).map_err(err)?;
-        self.staging = Some((b.clone(), p as *mut u8, cap));
-        Ok((b, p as *mut u8))
     }
 }
 
@@ -441,6 +490,12 @@ pub unsafe fn wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<(),
 }
 
 unsafe fn buffer(dev: &ID3D12Device, size: u64) -> Result<ID3D12Resource, String> {
+    buffer_in(dev, size, D3D12_HEAP_TYPE_UPLOAD)
+}
+
+/// An upload buffer of `size` bytes in `heap` (UPLOAD, or GPU_UPLOAD: video memory the CPU
+/// writes; its buffers start in COMMON and are promoted to COPY_SOURCE by the copies).
+unsafe fn buffer_in(dev: &ID3D12Device, size: u64, heap: D3D12_HEAP_TYPE) -> Result<ID3D12Resource, String> {
     let rd = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: size.max(256),
@@ -452,7 +507,8 @@ unsafe fn buffer(dev: &ID3D12Device, size: u64) -> Result<ID3D12Resource, String
         ..Default::default()
     };
     let mut r: Option<ID3D12Resource> = None;
-    dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut r)
+    let state = if heap == D3D12_HEAP_TYPE_UPLOAD { D3D12_RESOURCE_STATE_GENERIC_READ } else { D3D12_RESOURCE_STATE_COMMON };
+    dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &rd, state, None, &mut r)
         .map_err(|x| format!("texture upload buffer: {x}"))?;
     r.ok_or_else(|| "texture upload buffer".into())
 }
@@ -751,6 +807,110 @@ mod tests {
         }
     }
 
+    /// A 2D texture of `mips` levels in SHADER_READ.
+    unsafe fn texture_2d(dev: &ID3D12Device, w: u64, h: u32, mips: u16, format: DXGI_FORMAT) -> ID3D12Resource {
+        let rd = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: w,
+            Height: h,
+            DepthOrArraySize: 1,
+            MipLevels: mips,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let mut r: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &rd, SHADER_READ, None, &mut r).unwrap();
+        r.unwrap()
+    }
+
+    /// Mips, an odd size and BC7.
+    unsafe fn three_textures(dev: &ID3D12Device) -> [ID3D12Resource; 3] {
+        [texture_2d(dev, 64, 64, 7, DXGI_FORMAT_R8G8B8A8_UNORM), texture_2d(dev, 100, 30, 1, DXGI_FORMAT_R8G8B8A8_UNORM), texture_2d(dev, 256, 256, 9, DXGI_FORMAT_BC7_UNORM)]
+    }
+
+    /// Every subresource of `r`, filled with a pattern of `seed`.
+    unsafe fn filled_subresources(dev: &ID3D12Device, r: &ID3D12Resource, seed: u8) -> Vec<Subresource> {
+        let rd = r.GetDesc();
+        let n = rd.MipLevels as usize;
+        let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n];
+        let (mut rows, mut row_bytes) = (vec![0u32; n], vec![0u64; n]);
+        dev.GetCopyableFootprints(&rd, 0, n as u32, 0, Some(fps.as_mut_ptr()), Some(rows.as_mut_ptr()), Some(row_bytes.as_mut_ptr()), None);
+        (0..n)
+            .map(|k| {
+                let (r, b, d) = (rows[k] as usize, row_bytes[k] as usize, fps[k].Footprint.Depth as usize);
+                Subresource { rows: r, row_bytes: b, depth: d, data: (0..r * b * d).map(|i| (i as u8).wrapping_mul(31) ^ seed ^ k as u8).collect() }
+            })
+            .collect()
+    }
+
+    /// Upload buffers go in a GPU upload heap only where the device has them and up to
+    /// GPU_UPLOAD_MAX; otherwise, and for bigger ones, the UPLOAD heap.
+    #[test]
+    fn staging_heap_falls_back_to_upload() {
+        assert_eq!(staging_heap(false, STAGING_MIN), D3D12_HEAP_TYPE_UPLOAD, "no GPU upload heaps");
+        assert_eq!(staging_heap(false, GPU_UPLOAD_MAX), D3D12_HEAP_TYPE_UPLOAD);
+        assert_eq!(staging_heap(true, STAGING_MIN), D3D12_HEAP_TYPE_GPU_UPLOAD);
+        assert_eq!(staging_heap(true, GPU_UPLOAD_MAX), D3D12_HEAP_TYPE_GPU_UPLOAD);
+        assert_eq!(staging_heap(true, 2 * GPU_UPLOAD_MAX), D3D12_HEAP_TYPE_UPLOAD, "too big for video memory");
+    }
+
+    /// The same batch through an uploader without GPU upload heaps and, where the device has
+    /// them, one with: each keeps its upload buffer in the heap `staging_heap` names and the
+    /// textures read back what was uploaded. An uploader that has the heaps keeps one buffer of
+    /// each kind when a batch is too big for video memory, and small batches use the video one.
+    #[test]
+    fn gpu_upload_batches_use_the_gpu_upload_heap_where_there_is_one() {
+        let Some((dev, _)) = device() else {
+            println!("no D3D12 device – skipping");
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+        unsafe {
+            let supported = gpu_upload_heaps(&dev);
+            if !supported {
+                println!("no GPU upload heaps on this device – only the fallback is checked");
+            }
+            let textures = three_textures(&dev);
+            for gpu_upload in [false, true].into_iter().filter(|&g| !g || supported) {
+                // a queue of its own: its uploader is the one put in here
+                let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+                let key = windows::core::Interface::as_raw(&queue) as usize;
+                let mut up = Uploader::new(&dev).unwrap();
+                up.gpu_upload = gpu_upload;
+                put_back(key, up);
+                let heaps = || {
+                    let g = UPLOADERS.lock().unwrap();
+                    let u = g.as_ref().unwrap().get(&key).unwrap();
+                    u.staging.iter().map(|s| s.as_ref().map(|(b, _, _)| {
+                        let mut hp = D3D12_HEAP_PROPERTIES::default();
+                        b.GetHeapProperties(Some(&mut hp), None).unwrap();
+                        hp.Type
+                    })).collect::<Vec<_>>()
+                };
+                let items: Vec<_> = textures.iter().enumerate().map(|(i, r)| (r.clone(), filled_subresources(&dev, r, 0x20 * gpu_upload as u8 + i as u8), vec![SHADER_READ])).collect();
+                assert!(upload_batch(&dev, &queue, &items).unwrap().is_empty());
+                for (i, (r, want, _)) in items.iter().enumerate() {
+                    assert!(read_back(&dev, &queue, r, want) == *want, "GPU upload heap {gpu_upload}: texture {i} differs");
+                }
+                let want = staging_heap(gpu_upload, STAGING_MIN);
+                assert_eq!(heaps(), if gpu_upload { vec![None, Some(want)] } else { vec![Some(want), None] }, "GPU upload heap {gpu_upload}");
+                if gpu_upload {
+                    // a staging need past GPU_UPLOAD_MAX: a system-memory buffer beside it
+                    let mut g = UPLOADERS.lock().unwrap();
+                    let u = g.as_mut().unwrap().get_mut(&key).unwrap();
+                    let video = u.staging(&dev, STAGING_MIN).unwrap().0;
+                    let big = u.staging(&dev, GPU_UPLOAD_MAX + 1).unwrap().0;
+                    let again = u.staging(&dev, STAGING_MIN).unwrap().0;
+                    assert!(big != video && again == video, "a small batch after a big one uses the video-memory buffer");
+                    drop(g);
+                    assert_eq!(heaps(), vec![Some(D3D12_HEAP_TYPE_UPLOAD), Some(D3D12_HEAP_TYPE_GPU_UPLOAD)]);
+                }
+                UPLOADERS.lock().unwrap().as_mut().unwrap().remove(&key);
+            }
+        }
+    }
+
     /// Batches through one queue share its upload buffer (`Uploader`): two batches of three
     /// textures (mips, an odd size, BC7) each read back what was uploaded, and the second batch
     /// made no new upload buffer.
@@ -793,7 +953,7 @@ mod tests {
             };
             let textures = [make(64, 64, 7, DXGI_FORMAT_R8G8B8A8_UNORM), make(100, 30, 1, DXGI_FORMAT_R8G8B8A8_UNORM), make(256, 256, 9, DXGI_FORMAT_BC7_UNORM)];
             let key = windows::core::Interface::as_raw(&queue) as usize;
-            let kept = || UPLOADERS.lock().unwrap().as_ref().and_then(|m| m.get(&key)).and_then(|u| u.staging.as_ref()).map(|s| (windows::core::Interface::as_raw(&s.0) as usize, s.2));
+            let kept = || UPLOADERS.lock().unwrap().as_ref().and_then(|m| m.get(&key)).and_then(|u| u.staging.iter().flatten().next()).map(|s| (windows::core::Interface::as_raw(&s.0) as usize, s.2));
             let mut buffers = Vec::new();
             for round in 0..2u8 {
                 let items: Vec<_> = textures.iter().enumerate().map(|(i, r)| (r.clone(), subs(r, round * 16 + i as u8), vec![SHADER_READ])).collect();
@@ -925,7 +1085,8 @@ mod tests {
             let key = queue.as_raw() as usize;
             let kept = || {
                 let guard = UPLOADERS.lock().unwrap();
-                let stage = guard.as_ref().unwrap()[&key].staging.as_ref().unwrap();
+                // both batches are past GPU_UPLOAD_MAX: the system-memory slot
+                let stage = guard.as_ref().unwrap()[&key].staging[0].as_ref().unwrap();
                 (stage.0.as_raw() as usize, stage.2)
             };
             let batch = [rgba, bc7];
