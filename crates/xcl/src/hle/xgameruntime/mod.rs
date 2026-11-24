@@ -190,8 +190,17 @@ pub unsafe extern "system" fn XGameRuntimeUninitialize() {
     INIT_COUNT.fetch_sub(1, Ordering::AcqRel);
 }
 
+/// XGameRuntimeFeature values whose classes only the PC runtime answers (XGameInvite,
+/// XSpeechSynthesizer, XGameStreaming): without `System32\xgameruntime.dll` their QueryApiImpl
+/// fails, so they are not available.
+const PC_ONLY_FEATURES: [u32; 3] = [6, 13, 21];
+
+fn feature_available(feature: u32, pc_runtime: bool) -> bool {
+    matches!(feature, 0 | 2..=13 | 15..=21) && (pc_runtime || !PC_ONLY_FEATURES.contains(&feature))
+}
+
 pub unsafe extern "system" fn XGameRuntimeIsFeatureAvailable(feature: u32) -> bool {
-    matches!(feature, 0 | 2..=13 | 15..=21)
+    feature_available(feature, api::pc_runtime_present())
 }
 
 // ---------------------------------------------------------------------------------------
@@ -990,12 +999,17 @@ mod tests {
             (20, "XGameEvent"),
             (21, "XGameStreaming"),
         ];
+        let pc = api::pc_runtime_present();
         for (feature, name) in features {
+            let pc_only = matches!(name, "XGameInvite" | "XSpeechSynthesizer" | "XGameStreaming");
             assert_eq!(
                 unsafe { XGameRuntimeIsFeatureAvailable(feature) },
-                feature != 1 && feature != 14,
+                feature != 1 && feature != 14 && (pc || !pc_only),
                 "unexpected availability for {name} ({feature})"
             );
+            // the classes only the PC runtime answers are unavailable without it
+            assert_eq!(feature_available(feature, false), feature != 1 && feature != 14 && !pc_only, "{name} without the PC runtime");
+            assert_eq!(feature_available(feature, true), feature != 1 && feature != 14, "{name} with the PC runtime");
         }
         assert!(!unsafe { XGameRuntimeIsFeatureAvailable(22) });
         assert!(!unsafe { XGameRuntimeIsFeatureAvailable(u32::MAX) });
