@@ -439,7 +439,9 @@ pub fn parse_opus_head(data: &[u8]) -> Option<OpusHead> {
     if data.len() < 19 || &data[..8] != b"OpusHead" {
         return None;
     }
-    if data[8] != 1 {
+    // RFC 7845 5.1: version 1 is current, and a reader SHOULD accept any version whose upper
+    // four bits match (0 to 15) and refuse 16 and above as incompatible.
+    if data[8] > 15 {
         return None;
     }
     let channels = data[9];
@@ -464,10 +466,11 @@ pub fn parse_opus_head(data: &[u8]) -> Option<OpusHead> {
         }
         let sc = data[19];
         let cc = data[20];
-        if sc == 0 || cc > sc {
+        let decoded_ch = sc as usize + cc as usize;
+        // RFC 7845 5.1.1: N > 0, M <= N, and M + N decoded channels MUST be no larger than 255.
+        if sc == 0 || cc > sc || decoded_ch > 255 {
             return None;
         }
-        let decoded_ch = sc as usize + cc as usize;
         let map = data[21..len].to_vec();
         if map.iter().any(|&idx| idx != 255 && idx as usize >= decoded_ch) {
             return None;
@@ -1609,6 +1612,32 @@ pub(crate) mod tests {
             assert_eq!(h.output_gain, -256);
             assert_eq!(h.mapping_family, if ch <= 2 { 0 } else { 1 });
         }
+    }
+
+    #[test]
+    fn opus_head_accepts_minor_versions_and_caps_decoded_channels() {
+        let mut head = build_opus_head(2, 48_000, 312, 0);
+        for version in 0..=15u8 {
+            head[8] = version;
+            assert!(parse_opus_head(&head).is_some(), "version {version} is compatible");
+        }
+        for version in [16u8, 17, 0x21, 255] {
+            head[8] = version;
+            assert!(parse_opus_head(&head).is_none(), "version {version} is incompatible");
+        }
+
+        // Family 255, 3 output channels, mapping [255, 1, 0].
+        let family_255 = |streams: u8, coupled: u8| {
+            let mut h = build_opus_head(1, 48_000, 0, 0);
+            h[9] = 3;
+            h[18] = 255;
+            h.extend([streams, coupled, 255, 1, 0]);
+            h
+        };
+        assert!(parse_opus_head(&family_255(128, 127)).is_some(), "M + N = 255 is allowed");
+        assert!(parse_opus_head(&family_255(128, 128)).is_none(), "M + N = 256 is refused");
+        assert!(parse_opus_head(&family_255(200, 200)).is_none());
+        assert!(parse_opus_head(&family_255(255, 1)).is_none());
     }
 
     /// A sound of the game (`XCL_SAMPLE_AWC`: an AWC with one Opus stream, its data chunk as
