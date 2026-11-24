@@ -277,6 +277,11 @@ struct Bindings {
     vertex_titles: std::collections::BTreeMap<u32, (u64, u32, u32)>,
     /// the title's (address, bytes, format) of the index buffer (`XCL_TRACE_FRAME`)
     index_title: Option<(u64, u32, i32)>,
+    /// vertex buffer slots (bit = slot; 31 stands for any slot above) and the index buffer that
+    /// were bound at a mirror (`gpu_va_mirrored`): only these are synced before a draw, and a
+    /// list with none skips `sync_title_buffers` before taking any other lock
+    vertex_mirrored: u32,
+    index_mirrored: bool,
     /// the title set the console's rect list topology
     rect_list: bool,
 }
@@ -3256,26 +3261,31 @@ fn pc_va(va: u64) -> u64 {
 /// whole buffer at every bind filled unified memory within two minutes of a retail title's
 /// menus, and missed what the title wrote after the bind.)
 unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: bool) -> u64 {
+    gpu_va_mirrored(list, va, bytes, what, mirror).0
+}
+
+/// `gpu_va`, and whether the address given back is the buffer's mirror (which each draw syncs).
+unsafe fn gpu_va_mirrored(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: bool) -> (u64, bool) {
     let t = pc_va(va);
     if t != va || va == 0 || bytes == 0 {
-        return t;
+        return (t, false);
     }
     // in a window by number: a PC resource's GPU address
     if crate::gpu::uma::get().is_none_or(|u| u.contains(va as usize)) {
-        return t;
+        return (t, false);
     }
     // a buffer bound before has its mirror: no `readable` (a `VirtualQuery` walk of the title's
     // memory when it is not resident – most of a retail title's render thread at a bind per
     // draw); `sync_title_buffers` checks what it reads
     if let Some(p) = mirror.then(|| mirrored(va, bytes)).flatten() {
-        return pc_va(p as u64);
+        return (pc_va(p as u64), true);
     }
     if !crate::gpu::shader::readable(va as usize, bytes) {
-        return t;
+        return (t, false);
     }
     if mirror {
         if let Some(p) = mirror_of(va, bytes, what) {
-            return pc_va(p as u64);
+            return (pc_va(p as u64), true);
         }
     }
     let p = super::bind::allocate_upload_memory(list, bytes, 16);
@@ -3285,13 +3295,13 @@ unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: b
         if n < 4 {
             crate::xlog_warn!("D3D12.X: {what} at {va:#x} ({bytes} bytes) is outside unified memory and there is no room for a copy");
         }
-        return t;
+        return (t, false);
     }
     std::ptr::copy_nonoverlapping(va as *const u8, p, bytes);
     if n < 4 || n.is_power_of_two() {
         crate::xlog_warn!("D3D12.X: {what} at {va:#x} ({bytes} bytes) is outside unified memory – bound as a copy made now (#{n})");
     }
-    pc_va(p as u64)
+    (pc_va(p as u64), false)
 }
 
 /// Ranges of the title's memory with a mirror in unified memory: (start, bytes, mirror). A
@@ -3344,17 +3354,33 @@ unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
     Some(p + (va - start) as usize)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// `sync_title_buffers` calls on this thread that got past the list's own check (looked
+    /// its buffers up in the mirror table)
+    static SYNC_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Before a draw on `list`: the parts of mirrored buffers it reads are copied from the title's
 /// memory. `indexed`: (first index, index count, base vertex); else `first_vertex`, `vertices`.
 pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32, u32, i32)>, first_vertex: u32, vertices: u32, instances: u32) {
     if MIRROR_BYTES.load(Ordering::Relaxed) == 0 {
         return;
     }
+    // only the buffers this list bound at a mirror: a list with none (most of them – what is
+    // in unified memory, or was bound as a copy, has nothing to sync) is done here, without a
+    // `Vec` or the mirror table's lock
     let (vbs, ib) = {
         let g = LISTS.lock().unwrap();
         let Some(b) = g.as_ref().and_then(|m| m.get(&(list as usize))).map(|s| &s.bindings) else { return };
-        (b.vertex_titles.values().copied().collect::<Vec<_>>(), b.index_title)
+        if b.vertex_mirrored == 0 && !b.index_mirrored {
+            return;
+        }
+        let vbs = b.vertex_titles.iter().filter(|&(&k, _)| b.vertex_mirrored & (1 << k.min(31)) != 0).map(|(_, &v)| v).collect::<Vec<_>>();
+        (vbs, b.index_title.filter(|_| b.index_mirrored))
     };
+    #[cfg(test)]
+    SYNC_SCANS.with(|c| c.set(c.get() + 1));
     let mirrors: Vec<Option<usize>> = {
         let mut v: Vec<Option<usize>> = vbs.iter().map(|&(va, bytes, _)| mirrored(va, bytes as usize)).collect();
         v.push(ib.and_then(|(va, bytes, _)| mirrored(va, bytes as usize)));
@@ -3377,6 +3403,10 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
             let (from, len) = (first as u64 * size, count as u64 * size);
             if let Some(m) = mirrors[vbs.len()] {
                 copy(va, m, bytes, from, len);
+            }
+            if mirrors[..vbs.len()].iter().all(Option::is_none) {
+                // no vertex buffer to sync: the vertices the indices name are not needed
+                return;
             }
             let n = (len.min((bytes as u64).saturating_sub(from)) / size) as usize;
             if n == 0 || !crate::gpu::shader::readable((va + from) as usize, n * size as usize) {
@@ -3472,11 +3502,19 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
     if views.is_null() || n == 0 {
         return f(this, start, n, views);
     }
+    // views bound at a mirror: bit k for view k, `mirrored_high` for any view past 31
+    let (mut mirrored_bits, mut mirrored_high) = (0u32, false);
     let v: Vec<D3D12_VERTEX_BUFFER_VIEW> = (0..n as usize)
         .map(|k| {
             let mut v = views.add(k).read_unaligned();
             let title = v.BufferLocation;
-            v.BufferLocation = gpu_va(this, v.BufferLocation, v.SizeInBytes as usize, "vertex buffer", true);
+            let (at, m) = gpu_va_mirrored(this, v.BufferLocation, v.SizeInBytes as usize, "vertex buffer", true);
+            v.BufferLocation = at;
+            if m && k < 32 {
+                mirrored_bits |= 1 << k;
+            } else if m {
+                mirrored_high = true;
+            }
             if super::present::trace_frame() {
                 static N: AtomicU64 = AtomicU64::new(0);
                 let i = N.fetch_add(1, Ordering::Relaxed);
@@ -3506,9 +3544,21 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
         for (k, view) in kept.into_iter().enumerate() {
             b.vertex_buffers.insert(start + k as u32, view);
             b.vertex_titles.insert(start + k as u32, titles[k]);
+            note_vertex_mirrored(b, start + k as u32, if k < 32 { mirrored_bits & (1 << k) != 0 } else { mirrored_high });
         }
     });
     f(this, start, n, v.as_ptr())
+}
+
+/// Records whether vertex buffer `slot` of a list was bound at a mirror (`Bindings::vertex_mirrored`).
+/// Slots above 31 (past D3D12's 32) share bit 31, which only a bind at a mirror changes: a
+/// bit set too often only syncs more.
+fn note_vertex_mirrored(b: &mut Bindings, slot: u32, mirrored: bool) {
+    if mirrored {
+        b.vertex_mirrored |= 1 << slot.min(31);
+    } else if slot < 31 {
+        b.vertex_mirrored &= !(1 << slot);
+    }
 }
 
 /// command list #47 IASetIndexBuffer(view) (PC #43): the address is the title's
@@ -3517,15 +3567,18 @@ pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, vi
     let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
     if view.is_null() {
         s.index_buffer = None;
+        s.bindings.index_mirrored = false;
         drop(g);
         return set_index_buffer(this, None);
     }
     let mut v = view.read_unaligned();
     s.bindings.index_title = Some((v.BufferLocation, v.SizeInBytes, v.Format.0));
     drop(g);
-    v.BufferLocation = gpu_va(this, v.BufferLocation, v.SizeInBytes as usize, "index buffer", true);
+    let (at, m) = gpu_va_mirrored(this, v.BufferLocation, v.SizeInBytes as usize, "index buffer", true);
+    v.BufferLocation = at;
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
         s.index_buffer = Some(v);
+        s.bindings.index_mirrored = m;
     }
     set_index_buffer(this, Some(&v));
 }
@@ -6146,6 +6199,68 @@ mod tests {
             assert_eq!(gpu_va(std::ptr::null_mut(), va, bytes, "test vertex buffer", true), first);
             // the range stays reserved (and unreadable): the mirror table is never emptied, so its
             // address must not come back for another test's memory
+        }
+    }
+
+    /// A draw on a list that bound no buffer at a mirror skips `sync_title_buffers` at the list's
+    /// own check (no mirror table lookup), even once mirrors exist and the list's buffer is one
+    /// of them; a list that bound the buffer at its mirror still has the vertices it draws
+    /// copied there, and rebinding that slot elsewhere makes the list skip again.
+    #[test]
+    fn a_list_without_mirrored_bindings_skips_the_buffer_sync() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+        if crate::gpu::uma::get().is_none() {
+            crate::gpu::recomp::runner::skip_test("no unified memory");
+            return;
+        }
+        let scans = || SYNC_SCANS.with(|c| c.get());
+        // two fake lists: `sync_title_buffers` only looks their bindings up by address
+        let (a, b) = (Box::new(0u64), Box::new(0u64));
+        let (a, b) = (&*a as *const u64 as *mut c_void, &*b as *const u64 as *mut c_void);
+        unsafe {
+            let len = 0x1_0000usize;
+            let src = VirtualAlloc(std::ptr::null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as *mut u8;
+            assert!(!src.is_null());
+            let (va, bytes, stride) = (src as u64 + 0x200, 0x400u32, 16u32);
+            let (at, m) = gpu_va_mirrored(std::ptr::null_mut(), va, bytes as usize, "test vertex buffer", true);
+            assert!(m && at != va, "the first bind makes a mirror");
+            let mirror = mirrored(va, bytes as usize).expect("mirror") as *const u8;
+            assert!(MIRROR_BYTES.load(Ordering::Relaxed) > 0);
+
+            // list a: the same buffer, but not bound at its mirror (a copy made at the bind)
+            with_bindings(a, |bd| {
+                bd.vertex_titles.insert(0, (va, bytes, stride));
+                note_vertex_mirrored(bd, 0, false);
+            });
+            // list b: bound at the mirror
+            with_bindings(b, |bd| {
+                bd.vertex_titles.insert(0, (va, bytes, stride));
+                note_vertex_mirrored(bd, 0, true);
+            });
+
+            for k in 0..bytes as usize {
+                *(va as *mut u8).add(k) = 0x5a ^ k as u8;
+            }
+            let before = scans();
+            sync_title_buffers(a, None, 0, 4, 1);
+            assert_eq!(scans(), before, "a list without mirrored bindings stops at its own check");
+            sync_title_buffers(b, None, 0, 4, 1);
+            assert_eq!(scans(), before + 1, "a list with a mirrored binding looks its mirrors up");
+            // the 4 vertices drawn (4 × 16 bytes) are in the mirror as the title wrote them
+            for k in 0..4 * stride as usize {
+                assert_eq!(*mirror.add(k), 0x5a ^ k as u8, "mirror byte {k}");
+            }
+
+            // b binds slot 0 somewhere without a mirror: it skips from now on
+            with_bindings(b, |bd| note_vertex_mirrored(bd, 0, false));
+            sync_title_buffers(b, None, 0, 4, 1);
+            assert_eq!(scans(), before + 1);
+
+            if let Some(m) = LISTS.lock().unwrap().as_mut() {
+                m.remove(&(a as usize));
+                m.remove(&(b as usize));
+            }
+            // `src` stays allocated: the mirror table is never emptied (see the test above)
         }
     }
 }
