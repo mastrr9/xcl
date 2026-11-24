@@ -113,3 +113,37 @@ fn bc7_dictionary_indices_line_up() {
         assert!(ok, "entry {k}: {:?}", ix.ix);
     }
 }
+
+/// The window table finds the bucket a scan of the starts finds, and the symbol, frequency and
+/// remainder taken from that bucket give the state the first version's arithmetic gave (rebuilt
+/// from the symbol), for every slot of every model and a few state heads.
+#[test]
+fn bucket_window_step_matches_a_scan_of_the_starts() {
+    use super::tables::{FREQ, MODELS};
+    let t = super::victory::Tables::builtin();
+    for model in 0..MODELS {
+        let (start, freq) = (&t.start[model], &FREQ[model]);
+        for slot in 1..1u32 << 16 {
+            let b = start[1..].iter().filter(|&&s| s <= slot).count();
+            assert_eq!(super::victory::bucket_of(t, model as u8, slot), b, "model {model} slot {slot}");
+            // first version: the symbol, then its frequency and range start rebuilt from it
+            let sym = match b {
+                0 | 1 => b as u32,
+                _ => (1 << (b - 1)) + ((u64::from(slot - start[b]) * t.recip[model][b]) >> 32) as u32,
+            };
+            let (f_old, c) = if sym == 0 {
+                (freq[0] - 1, 1)
+            } else {
+                let k = (32 - sym.leading_zeros()) as usize;
+                (freq[k], ((sym - (1 << (k - 1))).wrapping_mul(freq[k]).wrapping_add(start[k])) & 0xffff)
+            };
+            let (sym_new, f_new, rem) = super::victory::slot_symbol(t, model as u8, slot);
+            assert_eq!((sym_new, f_new), (sym, f_old), "model {model} slot {slot}");
+            for head in [0x100u32, 0xABCD, 0xFFFF] {
+                let x = head << 16 | slot;
+                let old = (x >> 16).wrapping_mul(f_old).wrapping_sub(c).wrapping_add(slot);
+                assert_eq!((x >> 16).wrapping_mul(f_new).wrapping_add(rem), old, "model {model} slot {slot}");
+            }
+        }
+    }
+}
