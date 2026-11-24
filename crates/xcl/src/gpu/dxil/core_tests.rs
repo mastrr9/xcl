@@ -32,6 +32,55 @@ fn straight_line_and_loop_kernels_validate() {
     }
 }
 
+/// VOP3 abs / neg on v_cvt_f32_f16, v_pack_b32_f16 and v_cndmask_b32 act on the sign bit of
+/// the selected f16 half or of the dword. The HLSL path drops them on main (open PRs #802 and
+/// #1720 apply them there), so this checks the direct backend against the hardware values.
+#[test]
+fn vop3_abs_neg_on_cvt_f32_f16_pack_and_cndmask() {
+    use crate::gpu::recomp::runner::{self, KernelState};
+    let code = prog(&[
+        // -(2.0), from the low half
+        ("V_CVT_F32_F16", "ENC_VOP3", &[("VDST", 10), ("SRC0", 257), ("NEG", 1)], None),
+        // |-1.0|, from the low half of v4 (no OP_SEL: LLVM gives this op no op_sel on gfx10)
+        ("V_CVT_F32_F16", "ENC_VOP3", &[("VDST", 11), ("SRC0", 260), ("ABS", 1)], None),
+        // lo = |hi half of v1|, hi = -(lo half of v1)
+        ("V_PACK_B32_F16", "ENC_VOP3", &[("VDST", 12), ("SRC0", 257), ("SRC1", 257), ("OP_SEL", 1), ("ABS", 1), ("NEG", 2)], None),
+        // -src0, |src1|; mask all ones picks src1, mask 0 picks src0
+        ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 13), ("SRC0", 258), ("SRC1", 259), ("SRC2", 20), ("ABS", 2), ("NEG", 1)], None),
+        ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 14), ("SRC0", 258), ("SRC1", 259), ("SRC2", 22), ("ABS", 2), ("NEG", 1)], None),
+    ]);
+    // a NaN keeps its payload and a denormal stays, since the modifiers only touch the sign bit
+    let want = [0xC000_0000, 0x3F80_0000, 0xC000_3C00, 0x7FC0_0001, 0x8000_0001];
+    match (runner::adapter(), runner::wave64_programs_supported()) {
+        (Ok(_), Ok(true)) => {}
+        (Ok(_), Ok(false)) => return runner::skip_test("no wave64"),
+        _ => return runner::skip_test("no GPU"),
+    }
+    // test builds validate the direct container with DXC
+    if crate::gpu::recomp::dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let mem: Vec<u32> = code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let mut st = KernelState::default();
+    st.sgpr[20..22].fill(u32::MAX);
+    for r in st.vgpr.iter_mut() {
+        // v1: f16 -1.0 high, 2.0 low; v2: +denormal; v3: negative quiet NaN with a payload;
+        // v4: f16 -1.0 low
+        r[1] = 0xBC00_4000;
+        r[2] = 0x0000_0001;
+        r[3] = 0xFFC0_0001;
+        r[4] = 0x0000_BC00;
+    }
+    let waves = if runner::wave64_supported() == Ok(true) { vec![true, false] } else { vec![false] };
+    for wave64 in waves {
+        let direct = runner::direct_kernel(&code, wave64).unwrap();
+        let r = runner::run(&direct, &st, &mem).unwrap_or_else(|e| panic!("direct wave64 {wave64}: {e}"));
+        for (l, v) in r.vgpr.iter().take(if wave64 { 64 } else { 32 }).enumerate() {
+            assert_eq!([v[10], v[11], v[12], v[13], v[14]], want, "direct wave64 {wave64} lane {l}");
+        }
+    }
+}
+
 /// Development aid: `XCL_DUMP_HLSL=<file>` compiles a compute shader with DXC
 /// and prints the disassembly (DXC's lowering of an HLSL intrinsic is the
 /// reference for the direct path's).
