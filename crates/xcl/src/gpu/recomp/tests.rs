@@ -8874,6 +8874,73 @@ fn round_mode_classification_and_lowering() {
 }
 
 #[test]
+fn s_getreg_b32_reads_modelled_mode_bits_and_cycles() {
+    let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
+    let getreg = |sd: u64, id: u64, offset: u64, width: u64| ins("S_GETREG_B32", "ENC_SOPK", &[("SDST", sd), ("SIMM16", hwreg_imm(id, offset, width))], None);
+    let round_mode_c = || ins("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0xC)], None);
+
+    // No non-default round mode anywhere: MODE[3:0] reads 0, no tracked mode in the HLSL.
+    let cvt = ins("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)], None);
+    let t = translate(&program_of(&[getreg(1, 1, 0, 4), getreg(2, 29, 0, 20), cvt]), &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("s1 = 0u;") && t.hlsl.contains("s2 = 0u;"), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("xcl_fp16_rm"), "{}", t.hlsl);
+
+    // A read of MODE[3:2] makes the program track the mode it sets, even without f16 ops.
+    let t = translate(&program_of(&[round_mode_c(), getreg(3, 1, 2, 2)]), &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("static uint xcl_fp16_rm = 0u;") && t.hlsl.contains("xcl_fp16_rm = 3u;"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("s3 = (((xcl_fp16_rm << 2u) >> 2u) & 3u);"), "{}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+
+    // A read of MODE[1:0] alone does not need the tracked value: f32 always rounds to nearest even.
+    let t = translate(&program_of(&[round_mode_c(), getreg(4, 1, 0, 2)]), &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("s4 = 0u;") && !t.hlsl.contains("xcl_fp16_rm"), "{}", t.hlsl);
+
+    // Fields and registers the model has no value for are reported, not guessed.
+    for (id, offset, width, why) in [
+        (1, 0, 32, "s_getreg_b32: MODE field not modelled"), // denormal / clamp / IEEE bits
+        (1, 4, 4, "s_getreg_b32: MODE field not modelled"),
+        (2, 0, 32, "s_getreg_b32: hardware register not modelled"), // STATUS
+        (23, 0, 32, "s_getreg_b32: hardware register not modelled"), // HW_ID1
+    ] {
+        let t = translate(&program_of(&[getreg(5, id, offset, width)]), &opt).unwrap();
+        assert!(!t.complete(), "{id} {offset} {width}");
+        assert!(t.unsupported_why.contains_key(why), "{:?}", t.unsupported_why);
+    }
+}
+
+#[test]
+fn gpu_s_getreg_b32_reads_back_the_round_mode() {
+    if !gpu_ready() {
+        return;
+    }
+    let getreg = |sd: u64, id: u64, offset: u64, width: u64| ins("S_GETREG_B32", "ENC_SOPK", &[("SDST", sd), ("SIMM16", hwreg_imm(id, offset, width))], None);
+    let code = program_of(&[
+        getreg(1, 1, 0, 4), // RNE / RNE: 0
+        ins("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0xC)], None),
+        getreg(2, 1, 0, 4), // f16/f64 RTZ: 0xC
+        getreg(3, 1, 3, 1), // MODE[3]: 1
+        ins("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 2, 1))], Some(0)),
+        getreg(4, 1, 2, 2), // -inf (2), saved
+        ins("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0x4)], None),
+        getreg(5, 1, 1, 3), // MODE[3:1] of 0b0100: 2
+        ins("S_SETREG_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 2, 2)), ("SDST", 4)], None), // restore
+        getreg(6, 1, 0, 4), // 8
+        getreg(7, 29, 0, 20), // SHADER_CYCLES: no clock in this model
+    ]);
+    let mut st = KernelState::default();
+    for s in 1..=7 {
+        st.sgpr[s] = 0xDEAD_BEEF;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    assert_eq!(&r.sgpr[1..=7], &[0, 0xC, 1, 2, 2, 8, 0], "s_getreg_b32 MODE / SHADER_CYCLES reads");
+}
+
+#[test]
 fn gpu_nonfused_mad_and_mac_prevent_fma_contraction() {
     if !gpu_ready() {
         return;

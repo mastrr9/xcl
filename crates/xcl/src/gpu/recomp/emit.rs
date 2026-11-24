@@ -65,7 +65,8 @@ pub(super) struct Em {
     has_f16_round_op: bool,
     /// program contains an f64 instruction whose rounding obeys `MODE[3:2]`
     has_f64_round_op: bool,
-    /// program writes a non-default `MODE[3:2]` and uses f16 ops (emits `xcl_fp16_rm`)
+    /// program writes a non-default `MODE[3:2]` and uses f16 ops or reads `MODE[3:2]` back with
+    /// `s_getreg_b32` (emits `xcl_fp16_rm`)
     dynamic_f16_rm: bool,
     track_frexp_denorm: bool,
     /// multi-warp Compute/Mesh shader containing `s_barrier`: use early-exit-safe, bounded
@@ -466,7 +467,7 @@ enum Dst {
     Null,
 }
 
-/// Decode `OPR_HWREG` (`SIMM16` of `s_setreg*`): `(id, offset, width)`.
+/// Decode `OPR_HWREG` (`SIMM16` of `s_getreg_b32` / `s_setreg*`): `(id, offset, width)`.
 /// `id == 1` is `HW_REG_MODE`, where `[1:0]` is `FP_ROUND_MODE_SP` (f32) and `[3:2]` is
 /// `FP_ROUND_MODE_DP` (f64 and f16).
 fn decode_hwreg(simm16: u16) -> (u32, u32, u32) {
@@ -643,12 +644,14 @@ impl Em {
         Some(threads.div_ceil(hw_lanes).max(1))
     }
 
-    /// Pre-scan the program for f16/f64 rounding-sensitive ops, non-default `MODE[3:2]` writes,
-    /// and multi-warp `s_barrier` usage (for early-exit-safe, bounded `xcl_s_barrier`).
+    /// Pre-scan the program for f16/f64 rounding-sensitive ops, non-default `MODE[3:2]` writes
+    /// and reads (`s_getreg_b32`), and multi-warp `s_barrier` usage (for early-exit-safe, bounded
+    /// `xcl_s_barrier`).
     pub fn configure_round_modes(&mut self, insts: &[Decoded], stop_at_endpgm: bool) {
         self.track_frexp_denorm = tracks_frexp_f32_denorm(insts);
         self.img_writes = image_write_srsrcs(insts);
         let mut writes_nonzero_dp = false;
+        let mut reads_dp = false;
         let mut has_s_barrier = false;
         for d in insts {
             let name = d.inst.name.to_ascii_lowercase();
@@ -688,10 +691,18 @@ impl Em {
                         writes_nonzero_dp = true;
                     }
                 }
+                "s_getreg_b32" => {
+                    let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) as u16;
+                    let (id, offset, width) = decode_hwreg(simm);
+                    if id == 1 && offset <= 3 && offset + width > 2 {
+                        reads_dp = true;
+                    }
+                }
                 _ => {}
             }
         }
-        self.dynamic_f16_rm = writes_nonzero_dp && self.has_f16_round_op && !self.has_f64_round_op;
+        // a program that reads MODE[3:2] back needs the tracked value even without f16 ops
+        self.dynamic_f16_rm = writes_nonzero_dp && (self.has_f16_round_op || reads_dp) && !self.has_f64_round_op;
         self.safe_barrier = has_s_barrier
             && self.compute_or_mesh_hw_waves().is_some_and(|w| w > 1)
             && std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0");
@@ -1470,9 +1481,32 @@ impl Em {
         Ok(())
     }
 
+    /// `s_getreg_b32`: D = `HW_REG[offset +: size]`, zero-extended. Modelled: `MODE[3:0]`, the
+    /// round modes as this model runs them (f32 always round-to-nearest-even, f16/f64 the
+    /// tracked `xcl_fp16_rm`, or 0 while the program never sets a non-default one), and
+    /// `SHADER_CYCLES`, which reads 0 like `s_memtime` (no clock in this model). The other
+    /// `MODE` fields (denormals, clamp, IEEE) and the other registers are not modelled.
+    fn getreg(&mut self, d: &Decoded) -> Result<(), &'static str> {
+        let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) as u16;
+        let (id, offset, width) = decode_hwreg(simm);
+        let val = match id {
+            1 if offset + width > 4 => return Err("MODE field not modelled"),
+            1 if self.dynamic_f16_rm => format!("(((xcl_fp16_rm << 2u) >> {offset}u) & {}u)", (1u32 << width) - 1),
+            1 | 29 => "0u".into(),
+            _ => return Err("hardware register not modelled"),
+        };
+        let sd = Self::field(d, "SDST");
+        let dst = if sname(sd).is_some() { Dst::S(sd) } else { Dst::Null };
+        self.write32(&dst, &val);
+        Ok(())
+    }
+
     fn salu(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         if matches!(name, "s_setreg_imm32_b32" | "s_setreg_b32") {
             return self.setreg(d, name);
+        }
+        if name == "s_getreg_b32" {
+            return self.getreg(d);
         }
         if matches!(name, "s_movrels_b32" | "s_movrels_b64" | "s_movreld_b32" | "s_movreld_b64" | "s_movrelsd_2_b32") {
             return self.smovrel(d, name);
