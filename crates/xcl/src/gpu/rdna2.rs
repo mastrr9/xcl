@@ -871,6 +871,11 @@ pub fn find_programs(blob: &[u8]) -> Vec<(usize, usize)> {
         // walk forward from `start` and require every dword up to s_endpgm to decode
         let slice = &blob[start..e + 4];
         let lines = disassemble(slice, 0, false);
+        // a dword equal to s_endpgm inside an instruction (its literal, say) ends nothing:
+        // the program goes on to the next s_endpgm
+        if lines.last().is_some_and(|l| l.pc != (e - start) as u64) {
+            continue;
+        }
         let good = lines.iter().filter(|l| l.ok).count();
         if !lines.is_empty() && good * 10 >= lines.len() * 9 {
             progs.push((start, e + 4 - start));
@@ -899,6 +904,21 @@ mod tests {
         let d = decode(&[0xff, 0x03, 0x80, 0xbe, 0x78, 0x56, 0x34, 0x12], 0).unwrap();
         assert_eq!(d.len, 8);
         assert_eq!(format(&d), "s_mov_b32 s0, 0x12345678");
+    }
+
+    /// A literal equal to the s_endpgm dword (as an f32: -1.0078125) belongs to its
+    /// instruction, so the program goes on past it; two programs back to back are still two.
+    #[test]
+    fn find_programs_ignores_endpgm_literal() {
+        let le = |w: &[u32]| w.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        // v_mov_b32 v1, 0xbf810000; v_add_f32 v1, v2, v3; s_endpgm
+        let a = le(&[0x7E02_02FF, 0xBF81_0000, 0x0602_0702, 0xBF81_0000]);
+        assert_eq!(disassemble(&a, 0, true).len(), 3);
+        assert_eq!(find_programs(&a), [(0, 16)]);
+        // s_mov_b32 s0, 0xbf810000; s_endpgm, then the first program again
+        let b = le(&[0xBE80_03FF, 0xBF81_0000, 0xBF81_0000]);
+        let both = [b.clone(), a.clone()].concat();
+        assert_eq!(find_programs(&both), [(0, 12), (12, 16)]);
     }
 
     #[test]
