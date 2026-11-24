@@ -1701,6 +1701,8 @@ pub unsafe extern "system" fn GetModuleHandleA(name: *const u8) -> usize {
 }
 
 const FROM_ADDRESS: u32 = 0x4;
+const PIN: u32 = 0x1;
+const UNCHANGED_REFCOUNT: u32 = 0x2;
 
 unsafe fn module_handle_ex(flags: u32, name: Option<String>, addr: usize, out: *mut usize) -> BOOL {
     if out.is_null() {
@@ -1722,7 +1724,15 @@ unsafe fn module_handle_ex(flags: u32, name: Option<String>, addr: usize, out: *
     } else {
         match name {
             None => main_or_real_base(),
-            Some(n) => module_handle_impl(&n),
+            Some(n) => {
+                let h = module_handle_impl(&n);
+                // a real Windows module: the game's handle carries the reference (or the pin)
+                // its flags ask for, which its FreeLibrary gives back
+                if flags & UNCHANGED_REFCOUNT == 0 {
+                    resolver::add_game_ref(h, flags & PIN != 0);
+                }
+                h
+            }
         }
     };
     *out = h;
@@ -2496,6 +2506,36 @@ mod tests {
             } else if !sp.is_null() {
                 assert_eq!(VirtualFreeEx(cur, sp, 0, mem::MEM_RELEASE), 1);
             }
+        }
+    }
+
+    /// LoadLibrary and GetModuleHandleEx (no UNCHANGED_REFCOUNT) give the game a reference on a
+    /// real Windows module, so its FreeLibrary gives back that one and not the reference XCL
+    /// keeps for the imports it resolved there: the module stays loaded.
+    #[test]
+    fn free_library_gives_back_the_games_own_reference() {
+        unsafe {
+            let still_loaded = |h: usize| {
+                let mut out = std::ptr::null_mut();
+                ll::GetModuleHandleExW(FROM_ADDRESS | UNCHANGED_REFCOUNT, h as *const u16, &mut out) != 0 && out as usize == h
+            };
+            // a system DLL nothing else in the test process loads
+            let w = crate::util::wide("wtsapi32.dll");
+            let h = LoadLibraryW(w.as_ptr());
+            assert_ne!(h, 0);
+            assert_eq!(FreeLibrary(h), 1);
+            assert!(still_loaded(h), "FreeLibrary after LoadLibrary released XCL's reference");
+
+            let mut out = 0usize;
+            assert_eq!(GetModuleHandleExW(0, w.as_ptr(), &mut out), 1);
+            assert_eq!(out, h);
+            assert_eq!(FreeLibrary(out), 1);
+            assert!(still_loaded(h), "FreeLibrary after GetModuleHandleEx(0) released XCL's reference");
+
+            // UNCHANGED_REFCOUNT takes none
+            assert_eq!(GetModuleHandleExW(UNCHANGED_REFCOUNT, w.as_ptr(), &mut out), 1);
+            assert_eq!(out, h);
+            assert!(still_loaded(h));
         }
     }
 

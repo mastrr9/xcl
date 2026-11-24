@@ -367,7 +367,35 @@ pub fn classify(dll: &str, what: &ImportName) -> Source {
 // ---------------------------------------------------------------------------------------
 
 /// LoadLibrary as seen by the game. Returns an HMODULE-like value or None.
+///
+/// A real Windows module comes with a reference of the game's own, as Windows' LoadLibrary
+/// gives one, so that the game's FreeLibrary gives back that reference and not the one XCL
+/// keeps for the imports it resolved into the module (`system_module`'s cache).
 pub fn load_library(name: &str) -> Option<usize> {
+    let h = find_or_load_library(name)?;
+    add_game_ref(h, false);
+    Some(h)
+}
+
+/// Take a reference on a real Windows module for the game (`pin`: pin it instead, as
+/// GET_MODULE_HANDLE_EX_FLAG_PIN does); the game's FreeLibrary gives it back. Images XCL
+/// mapped and HLE pseudo handles are never unloaded and take none.
+pub fn add_game_ref(h: usize, pin: bool) {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN,
+    };
+    if h == 0 || modules::find_mapped_by_base(h).is_some() || modules::hle_name_by_handle(h).is_some() {
+        return;
+    }
+    let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | if pin { GET_MODULE_HANDLE_EX_FLAG_PIN } else { 0 };
+    let mut out = std::ptr::null_mut();
+    // SAFETY: with FROM_ADDRESS the "name" is an address; `h` is the base of a loaded module.
+    if unsafe { GetModuleHandleExW(flags, h as *const u16, &mut out) } == 0 || out as usize != h {
+        crate::xlog_warn!("no reference taken on module {h:#x}");
+    }
+}
+
+fn find_or_load_library(name: &str) -> Option<usize> {
     let key = dll_key(name);
     let reg = registry();
     match reg.route(&key) {
