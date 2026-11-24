@@ -58,6 +58,51 @@ fn f64_conversions_validate() {
     translate(&code, KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }).map_err(|e| e[..e.len().min(600)].to_string()).unwrap();
 }
 
+/// `s_setreg_b32` of MODE[3] alone (hwreg offset 3, width 1) in a program rounding f16 by
+/// MODE[3:2]: the direct translator subtracted the offset from 2 for every width (an
+/// overflow panic in debug builds). Bit 3 set rounds toward -inf; both backends on the GPU.
+#[test]
+fn setreg_of_mode_bit_3_alone_on_both_backends() {
+    use crate::gpu::recomp::runner::{self, KernelState};
+    use crate::gpu::recomp::{dxc, Options};
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 129)], None),
+        // hwreg(HW_REG_MODE, 3, 1)
+        ("S_SETREG_B32", "ENC_SOPK", &[("SDST", 0), ("SIMM16", 1 | 3 << 6)], None),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 257)], None),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 11), ("SRC0", 258)], None),
+    ]);
+    for (wave64, split) in [(false, false), (true, true), (true, false)] {
+        translate(&code, KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 }).unwrap_or_else(|e| panic!("wave64 {wave64} split {split}: {e}"));
+    }
+    match (runner::adapter(), runner::wave64_programs_supported(), dxc::location()) {
+        (Ok(_), Ok(true), Ok(_)) => {}
+        _ => return runner::skip_test("no GPU or DXC"),
+    }
+    // ±(1 + 3·2^-13): 3/8 of an f16 ulp above ±1.0, so toward -inf gives 1.0 and -(1 + 2^-10)
+    let want = [0x1234_3C00, 0x1234_BC01];
+    let mem: Vec<u32> = code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let mut st = KernelState::default();
+    for r in st.vgpr.iter_mut() {
+        r[1] = 0x3F80_0C00;
+        r[2] = 0xBF80_0C00;
+        r[10..12].fill(0x1234_5678);
+    }
+    let waves = if runner::wave64_supported() == Ok(true) { vec![true, false] } else { vec![false] };
+    for wave64 in waves {
+        let t = crate::gpu::recomp::translate(&code, &Options { wave64, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let hlsl = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+        let direct = runner::direct_kernel(&code, wave64).unwrap();
+        for (label, dxil) in [("HLSL", &hlsl), ("direct", &direct)] {
+            let r = runner::run(dxil, &st, &mem).unwrap_or_else(|e| panic!("{label} wave64 {wave64}: {e}"));
+            for (l, v) in r.vgpr.iter().take(if wave64 { 64 } else { 32 }).enumerate() {
+                assert_eq!([v[10], v[11]], want, "{label} wave64 {wave64} lane {l}");
+            }
+        }
+    }
+}
+
 #[test]
 fn f64_bisect() {
     let cases: Vec<(&str, Vec<u8>)> = vec![
