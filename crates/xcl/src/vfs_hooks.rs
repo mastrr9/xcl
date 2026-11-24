@@ -1033,25 +1033,43 @@ fn collect_game_entries(
     Ok(items)
 }
 
+/// A listing directly in a console drive's root ("G:\*", "T:\*"): a drive root has no "." / ".."
+/// entries (FindFirstFileW("C:\*") starts with a real name), and an empty one fails the search.
+fn drive_root_entries(mut items: Vec<WIN32_FIND_DATAW>) -> Result<Vec<WIN32_FIND_DATAW>, u32> {
+    items.retain(|d| {
+        let n = name_of(d);
+        n != "." && n != ".."
+    });
+    if items.is_empty() {
+        return Err(vfs::ERROR_FILE_NOT_FOUND);
+    }
+    Ok(items)
+}
+
+/// A find handle of the VFS over `items` (not empty), the first of them in `out`.
+unsafe fn merged_handle(items: Vec<WIN32_FIND_DATAW>, out: *mut WIN32_FIND_DATAW) -> HANDLE {
+    *out = items[0];
+    let h = Box::into_raw(Box::new(MergedFind { items, pos: 1 })) as HANDLE;
+    MERGED.lock().unwrap().get_or_insert_with(HashSet::new).insert(h as usize);
+    h
+}
+
 /// Some(handle) when the VFS handled the call; None to pass through.
 unsafe fn find_first_vfs(path: &str, out: *mut WIN32_FIND_DATAW) -> Option<Result<HANDLE, u32>> {
     let v = vfs::get()?;
+    let drive_root = v.in_drive_mount_root(path);
     match v.classify(path) {
         Target::Pass => None,
+        Target::Translated(p) if drive_root => Some(drive_root_entries(collect(&p)).map(|items| merged_handle(items, out))),
         Target::Translated(p) => {
             let first = orig!(O_FIND_FIRST_EX_W as FnFindFirstExW);
             let h = first(wide(&p).as_ptr(), 0, out as *mut c_void, 0, std::ptr::null(), 0);
             Some(if h == INVALID_HANDLE_VALUE { Err(windows_sys::Win32::Foundation::GetLastError()) } else { Ok(h) })
         }
         Target::Game { rel } => {
-            let items = match collect_game_entries(v, &rel, |p| collect(p)) {
-                Ok(items) => items,
-                Err(e) => return Some(Err(e)),
-            };
-            *out = items[0];
-            let h = Box::into_raw(Box::new(MergedFind { items, pos: 1 })) as HANDLE;
-            MERGED.lock().unwrap().get_or_insert_with(HashSet::new).insert(h as usize);
-            Some(Ok(h))
+            let items = collect_game_entries(v, &rel, |p| collect(p));
+            let items = if drive_root { items.and_then(drive_root_entries) } else { items };
+            Some(items.map(|items| merged_handle(items, out)))
         }
     }
 }
@@ -1703,6 +1721,44 @@ mod tests {
             FindClose(h);
         }
         out
+    }
+
+    /// G:\* and T:\* list like a drive root: no "." / "..", which the folders behind them have
+    /// (a title walking G:\ without skipping them went into G:\.\ and G:\..\), and an empty
+    /// root fails like FindFirstFileW on an empty volume.
+    #[test]
+    fn a_console_drive_root_lists_no_dot_entries() {
+        let f = HookFixture::new("droot_dots");
+        let v = &f.vfs;
+        let names = |items: Vec<WIN32_FIND_DATAW>| {
+            let mut n: Vec<String> = items.iter().map(name_of).collect();
+            n.sort();
+            n
+        };
+
+        // what the folders behind the mounts list natively
+        let game_native = names(real_collect(&format!("{}\\*", f.game().display())));
+        assert_eq!(game_native, vec![".", "..", "data"]);
+        assert_eq!(names(real_collect(&format!("{}\\*", f.temp().display()))), vec![".", ".."]);
+
+        // G:\*: the game folder's entries without the dots
+        assert!(v.in_drive_mount_root("G:\\*"));
+        let Target::Game { rel } = v.classify("G:\\*") else { panic!("G:\\* is a game path") };
+        let root = collect_game_entries(v, &rel, real_collect).and_then(drive_root_entries);
+        assert_eq!(names(root.unwrap()), vec!["data"]);
+        // a folder below the root keeps them
+        assert!(!v.in_drive_mount_root("G:\\data\\*"));
+
+        // T:\*: empty, then one file
+        assert!(v.in_drive_mount_root("T:\\*"));
+        let Target::Translated(t) = v.classify("T:\\*") else { panic!("T:\\* is translated") };
+        assert_eq!(drive_root_entries(real_collect(&t)).err(), Some(vfs::ERROR_FILE_NOT_FOUND));
+        std::fs::write(f.temp().join("save.dat"), b"s").unwrap();
+        assert_eq!(names(drive_root_entries(real_collect(&t)).unwrap()), vec!["save.dat"]);
+
+        // only the dots go
+        assert_eq!(drive_root_entries(real_collect(&format!("{}\\data\\..\\data\\*", f.game().display()))).map(names),
+            Ok(vec!["gone.txt".to_string(), "hello.txt".to_string()]));
     }
 
     #[test]

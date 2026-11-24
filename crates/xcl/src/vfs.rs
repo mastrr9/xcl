@@ -325,6 +325,32 @@ impl Vfs {
         self.classify_with(path, full_path)
     }
 
+    /// Whether `path` names an entry directly in the root of a console drive mount ("G:\*",
+    /// "T:\save.dat"): a drive root has no "." / ".." entries, so its listing must not show the
+    /// ones of the folder the mount stands for.
+    pub fn in_drive_mount_root(&self, path: &str) -> bool {
+        self.in_drive_mount_root_with(path, full_path)
+    }
+
+    fn in_drive_mount_root_with(&self, path: &str, full: impl Fn(&str) -> Option<String>) -> bool {
+        let p = norm(path);
+        if is_device(&p) {
+            return false;
+        }
+        let p = strip_verbatim(&p);
+        if p.starts_with("\\\\") || self.in_own_folders(&p, &full) {
+            return false;
+        }
+        let Some(translated) = self.apply_mounts(&p) else { return false };
+        let Some(abs) = full(&translated) else { return false };
+        let abs = trim_sep(&strip_verbatim(&norm(&abs))).to_lowercase();
+        let Some((dir, name)) = abs.rsplit_once('\\') else { return false };
+        !name.is_empty()
+            && self.mounts.iter().any(|(prefix, target)| {
+                prefix.ends_with(':') && full(target).is_some_and(|t| trim_sep(&strip_verbatim(&norm(&t))).to_lowercase() == dir)
+            })
+    }
+
     pub fn is_game_path(&self, p: &Path) -> bool {
         matches!(self.classify(&p.to_string_lossy()), Target::Game { .. })
     }
@@ -759,6 +785,23 @@ mod tests {
         assert_eq!(v.classify("CONOUT$"), Target::Pass);
         assert_eq!(v.classify("\\\\.\\pipe\\x"), Target::Pass);
         assert_eq!(v.classify("C:\\Windows\\notepad.exe"), Target::Pass);
+    }
+
+    /// Entries directly in a console drive's root, whichever way the title spells it; not the
+    /// drive root itself, not deeper entries, not the PC's own path of the folder.
+    #[test]
+    fn entries_directly_in_a_console_drive_root() {
+        let f = Fixture::new("droot");
+        let v = &f.vfs;
+        for p in ["G:\\*", "g:/*", "G:*", "GAME:\\*", "G:\\data", "G:\\data\\..\\*", "T:\\*", "T:\\save.dat"] {
+            assert!(v.in_drive_mount_root(p), "{p}");
+        }
+        let real = format!("{}\\*", f.game().display());
+        let mangled = "C:\\somewhere\\G:\\*";
+        assert!(v.in_drive_mount_root(mangled), "{mangled}");
+        for p in ["G:\\", "G:", "G:\\data\\*", "G:\\data\\hello.txt", "T:\\saves\\*", &real, "C:\\Windows\\*", "CONOUT$", "\\\\.\\pipe\\x"] {
+            assert!(!v.in_drive_mount_root(p), "{p}");
+        }
     }
 
     /// The console's "D:" mount on a PC whose game and XCL data are on its D: drive: paths
