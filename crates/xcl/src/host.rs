@@ -24,6 +24,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::xlog_info!("XCL {} – host for '{}'", env!("CARGO_PKG_VERSION"), boot.title);
     crate::xlog_info!("game: {} (read-only folder: {})", boot.exe_path.display(), boot.game_root.display());
     crate::xlog_info!("XCL data: {}", boot.data_dir.display());
+    crate::crash_log::install(&boot.logs_dir());
 
     if std::env::var_os("XCL_UMA_MB").is_none() && boot.config.uma_mb != 0 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());

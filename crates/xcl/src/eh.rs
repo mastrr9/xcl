@@ -109,6 +109,7 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             modules::describe_address(addr)
         );
         crate::xlog_error!("{msg}");
+        crate::crash_log::append(&msg);
         crate::report::write_final(Some(msg));
         crate::log::flush();
     }
@@ -131,6 +132,7 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
         let (tid, stack) = (windows_sys::Win32::System::Threading::GetCurrentThreadId(), stack_callers_n(&probe as *const usize as usize, 16));
         if status != 0 {
             crate::xlog_error!("process ends with status {status:#x} (thread {tid}); on the stack: {stack}");
+            crate::crash_log::append(&format!("process ends with status {status:#x} (thread {tid}); on the stack: {stack}"));
             dump_threads();
         } else {
             crate::xlog_info!("process ends (thread {tid}); on the stack: {stack}");
@@ -559,6 +561,17 @@ unsafe extern "C" fn invalid_parameter(_expr: *const u16, _function: *const u16,
 /// the stack that point into code).
 unsafe fn stack_callers(rsp: usize) -> String {
     stack_callers_n(rsp, 6)
+}
+
+/// The calling thread's id.
+pub fn current_thread_id() -> u32 {
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
+}
+
+/// Up to `max` callers of the calling function, read from its own stack (`stack_callers`).
+pub fn callers_here(max: usize) -> String {
+    let probe = 0usize;
+    unsafe { stack_callers_n(&probe as *const usize as usize, max) }
 }
 
 /// `stack_callers` with up to `max` callers.
