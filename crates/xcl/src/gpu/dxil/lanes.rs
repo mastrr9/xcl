@@ -190,10 +190,19 @@ impl Lw {
         } else {
             lo
         };
-        let l = self.lane31;
-        let sh = self.bin(BinOp::LShr, w, l);
-        let b = self.andc(sh, 1);
-        let v = self.nz(b);
+        // a word of all ones or zeros (EXEC of full waves at the entry, `s_mov_b64 exec, -1`)
+        // gives every lane the same bit: a constant, so VGPR write selects and lane guards
+        // under it fold away (`Lw::sel`, `Lw::guarded`)
+        let v = match self.s.m.const_u64(w) {
+            Some(0) => self.b(false),
+            Some(0xFFFF_FFFF) => self.b(true),
+            _ => {
+                let l = self.lane31;
+                let sh = self.bin(BinOp::LShr, w, l);
+                let b = self.andc(sh, 1);
+                self.nz(b)
+            }
+        };
         self.exec_cache.insert(key, v);
         v
     }
@@ -813,6 +822,58 @@ mod ps_ballot_tests {
                 bad.len(),
                 &bad[..bad.len().min(6)]
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::kernel::{translate_compute, KernelOptions};
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::CsInterface;
+
+    fn prog(list: &[(&str, &str, &[(&str, u64)], Option<u32>)]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for (n, e, f, l) in list {
+            v.extend(encode(n, e, f, *l).unwrap_or_else(|x| panic!("{n}: {x}")));
+        }
+        v.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        v
+    }
+
+    /// (basic blocks, `select`s) of the entry function in a container's DXIL part.
+    fn blocks_and_selects(c: &[u8]) -> (u64, usize) {
+        let n = u32::from_le_bytes(c[28..32].try_into().unwrap()) as usize;
+        let part = (0..n)
+            .map(|i| u32::from_le_bytes(c[32 + 4 * i..36 + 4 * i].try_into().unwrap()) as usize)
+            .find(|&o| &c[o..o + 4] == b"DXIL")
+            .expect("DXIL part");
+        let len = u32::from_le_bytes(c[part + 4..part + 8].try_into().unwrap()) as usize;
+        // part header (8 bytes), program and bitcode headers (24 bytes), bitcode
+        let root = super::super::bitreader_tests::parse(&c[part + 8 + 24..part + 8 + len]);
+        let f = root.find(12).expect("function block");
+        // FUNC_CODE_DECLAREBLOCKS = 1, FUNC_CODE_INST_VSELECT = 29
+        (f.records_with(1)[0][0], f.records_with(29).len())
+    }
+
+    /// With every wave of the group full, EXEC at the entry is a constant (all ones): this
+    /// lane's bit of it is `true`, so VGPR writes need no select and memory accesses no
+    /// branch. A group with a partial wave keeps both.
+    #[test]
+    fn full_waves_need_no_lane_guards() {
+        let code = prog(&[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 242)], None),
+            ("V_ADD_F32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 256), ("VSRC1", 1)], None),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("DATA", 2), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+        ]);
+        let cs = |threads: u32| CsInterface { threads: [threads, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+        for (wave64, split) in [(false, false), (true, false), (true, true)] {
+            let o = KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+            let full = translate_compute(&code, o, &cs(64)).unwrap_or_else(|e| panic!("full, wave64 {wave64} split {split}: {}", &e[..e.len().min(600)]));
+            let part = translate_compute(&code, o, &cs(48)).unwrap_or_else(|e| panic!("partial, wave64 {wave64} split {split}: {}", &e[..e.len().min(600)]));
+            let (fb, fs) = blocks_and_selects(&full.dxil);
+            let (pb, ps) = blocks_and_selects(&part.dxil);
+            assert!(fb < pb && fs < ps, "wave64 {wave64} split {split}: full waves {fb} blocks / {fs} selects, partial {pb} / {ps}");
         }
     }
 }
