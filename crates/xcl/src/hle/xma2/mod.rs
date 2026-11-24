@@ -1662,6 +1662,10 @@ impl Decoder {
         if cfg.stream_channels.is_empty() || cfg.stream_channels.len() > MAX_STREAMS {
             return Err(format!("invalid stream count {}", cfg.stream_channels.len()));
         }
+        // an XMA stream is mono or stereo: the stream decoder keeps state for two channels
+        if let Some((i, c)) = cfg.stream_channels.iter().enumerate().find(|(_, &c)| !(1..=2).contains(&c)) {
+            return Err(format!("stream {i} has {c} channels (1 or 2)"));
+        }
         let sum: usize = cfg.stream_channels.iter().map(|&c| c as usize).sum();
         if sum == 0 || sum != cfg.channels as usize {
             return Err(format!("channel sum {sum} != {}", cfg.channels));
@@ -2360,5 +2364,17 @@ pub(crate) mod tests {
         assert!(dec.decode_buffer_i16(&ones, true).unwrap().is_empty());
         let garbage = vec![0x5Au8; PACKET_SIZE];
         let _ = dec.decode_buffer_i16(&garbage, true);
+    }
+
+    #[test]
+    fn decoder_new_refuses_streams_that_are_not_mono_or_stereo() {
+        for (channels, streams) in [(3u16, vec![3u8]), (2, vec![2, 0]), (0, vec![0])] {
+            let cfg = StreamConfig { version: Version::Xma2, sample_rate: 48_000, channels, stream_channels: streams.clone() };
+            assert!(Decoder::new(cfg).is_err(), "{streams:?} accepted");
+        }
+        for (channels, streams) in [(1u16, vec![1u8]), (2, vec![2]), (6, vec![2, 2, 1, 1])] {
+            let cfg = StreamConfig { version: Version::Xma2, sample_rate: 48_000, channels, stream_channels: streams.clone() };
+            assert!(Decoder::new(cfg).is_ok(), "{streams:?} refused");
+        }
     }
 }
