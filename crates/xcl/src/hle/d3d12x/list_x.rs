@@ -90,7 +90,13 @@ unsafe fn list_type(list: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
 }
 
 unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
-    let b = D3D12_RESOURCE_BARRIER {
+    transitions(list, [(res, before, after)]);
+}
+
+/// The transitions `t` (resource, before, after) in one ResourceBarrier: one drain for all of
+/// them, where a call each drained again for every resource.
+unsafe fn transitions<const N: usize>(list: *mut c_void, t: [(usize, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES); N]) {
+    let b = t.map(|(res, before, after)| D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
@@ -101,8 +107,8 @@ unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RESOURCE_STATE
                 StateAfter: after,
             }),
         },
-    };
-    pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(list, PC_RESOURCE_BARRIER)(list, 1, &b);
+    });
+    pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(list, PC_RESOURCE_BARRIER)(list, N as u32, b.as_ptr());
 }
 
 /// `op` with the window buffer `res` as a copy destination (back to COMMON after it)
@@ -1998,9 +2004,10 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
         }
         return;
     }
-    transition(this, s, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    as_copy_dest(this, d, || copy_buffer_region(this, d, doff, s, soff, size));
-    transition(this, s, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    // two windows: both moved in one barrier call before the copy and one after it
+    transitions(this, [(s, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE), (d, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+    copy_buffer_region(this, d, doff, s, soff, size);
+    transitions(this, [(s, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON), (d, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
 }
 
 /// Process-wide committed scratch budget, including buffers awaiting GPU completion.
@@ -2812,12 +2819,12 @@ unsafe fn apply_predication_copy(this: *mut c_void, uma_buf: usize, off: u64, pb
     if was_active {
         f(this, 0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
     }
-    transition(this, uma_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    // the window and the predicate buffer move together: one barrier call before the copy and
+    // one after it, not one for each
     let pb_before = if was_in_state { D3D12_RESOURCE_STATE_PREDICATION } else { D3D12_RESOURCE_STATE_COMMON };
-    transition(this, pb, pb_before, D3D12_RESOURCE_STATE_COPY_DEST);
+    transitions(this, [(uma_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE), (pb, pb_before, D3D12_RESOURCE_STATE_COPY_DEST)]);
     copy_buffer_region(this, pb, 0, uma_buf, off, 8);
-    transition(this, uma_buf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-    transition(this, pb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PREDICATION);
+    transitions(this, [(uma_buf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON), (pb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PREDICATION)]);
     f(this, pb, 0, op);
     PREDICATION_USED.store(true, Ordering::Release);
     if let Some(s) = LISTS.lock().unwrap().get_or_insert_with(HashMap::new).get_mut(&(this as usize)) {
@@ -4975,6 +4982,8 @@ mod tests {
             vt: *const usize,
             ty: Mutex<D3D12_COMMAND_LIST_TYPE>,
             events: Mutex<Vec<PredEvent>>,
+            /// barriers per ResourceBarrier call
+            calls: Mutex<Vec<u32>>,
         }
 
         #[repr(C)]
@@ -4988,6 +4997,7 @@ mod tests {
         }
 
         unsafe extern "system" fn fake_resource_barrier(this: *mut c_void, count: u32, barriers: *const D3D12_RESOURCE_BARRIER) {
+            (*(this as *const FakePredList)).calls.lock().unwrap().push(count);
             let mut events = (*(this as *const FakePredList)).events.lock().unwrap();
             for i in 0..count as usize {
                 let b = &*barriers.add(i);
@@ -5049,6 +5059,7 @@ mod tests {
             vt: unsafe { ext_vt.as_ptr().add(1) },
             ty: Mutex::new(D3D12_COMMAND_LIST_TYPE_DIRECT),
             events: Mutex::new(Vec::new()),
+            calls: Mutex::new(Vec::new()),
         });
         let list_ptr = &*fake as *const FakePredList as *mut c_void;
         let list_key = list_ptr as usize;
@@ -5064,6 +5075,7 @@ mod tests {
         let uma_buf = 0xDEAD_BEEFusize;
 
         let take_events = || std::mem::take(&mut *fake.events.lock().unwrap());
+        let take_calls = || std::mem::take(&mut *fake.calls.lock().unwrap());
 
         unsafe {
             // Seed ListState with fake dedicated predication resource and verify initial rejections.
@@ -5113,6 +5125,8 @@ mod tests {
                     PredEvent::SetPred(pb_raw, 0, D3D12_PREDICATION_OP_EQUAL_ZERO),
                 ]
             );
+            // the two transitions before the copy go in one ResourceBarrier, the two after it in one more
+            assert_eq!(take_calls(), vec![2, 2]);
 
             // Rejections while a predicate is active must neither emit events nor disturb tracked state.
             for ty in [D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE] {
@@ -5145,6 +5159,8 @@ mod tests {
                     PredEvent::SetPred(pb_raw, 0, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO),
                 ]
             );
+            // the two transitions before the copy go in one ResourceBarrier, the two after it in one more
+            assert_eq!(take_calls(), vec![2, 2]);
 
             // (e) ClearState clears predication while keeping pred_in_state == true:
             // re-arming omits redundant SetPred(0, ...) yet transitions pb_raw from PREDICATION -> COPY_DEST,
@@ -5162,6 +5178,8 @@ mod tests {
                     PredEvent::SetPred(pb_raw, 0, D3D12_PREDICATION_OP_EQUAL_ZERO),
                 ]
             );
+            // the two transitions before the copy go in one ResourceBarrier, the two after it in one more
+            assert_eq!(take_calls(), vec![2, 2]);
 
             on_clear_state(list_ptr, 0);
             before_close(list_ptr);
@@ -5169,6 +5187,7 @@ mod tests {
                 take_events(),
                 vec![PredEvent::Barrier(pb_raw, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COMMON)]
             );
+            assert_eq!(take_calls(), vec![1]);
             before_close(list_ptr);
             assert!(take_events().is_empty(), "second before_close must be idempotent");
 
