@@ -75,6 +75,10 @@ static O_CREATE_FILE_2: AtomicUsize = AtomicUsize::new(0);
 /// memory without the CPU – write-watch does not see it).
 fn log_open(api: &str, path: &str, flags: u32) {
     static N: AtomicUsize = AtomicUsize::new(0);
+    // once the 24 are logged, no lower-case copy of every path opened after them
+    if N.load(Ordering::Relaxed) >= 24 {
+        return;
+    }
     // the title's own data, not drivers' caches, system files or DLLs
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".dll") || lower.ends_with(".exe") || lower.contains(r"\appdata\") || lower.contains(r"\windows\") || lower.starts_with(r"\\") {
