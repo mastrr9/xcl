@@ -59,7 +59,7 @@ pub fn optimal_mode(layout: u32, flags: u32, bits_per_pixel: u64, width: u64, he
         27
     } else if !uav {
         5
-    } else if bits_per_pixel * width * height as u64 <= 0x8_0000 {
+    } else if bits_per_pixel.saturating_mul(width).saturating_mul(height as u64) <= 0x8_0000 {
         21
     } else {
         27
@@ -276,7 +276,8 @@ impl Texture {
     }
 
     pub fn alignment(&self) -> u64 {
-        self.planes.iter().map(|p| p.align()).max().unwrap_or(0x100)
+        // a Blank plane has no alignment (0): with only those, the fallback
+        self.planes.iter().map(|p| p.align()).filter(|&a| a != 0).max().unwrap_or(0x100)
     }
 
     /// the surface of plane `plane` and where it starts (None: metadata or no such plane)
@@ -782,5 +783,24 @@ mod tests {
             assert_eq!(usages_and_bytes(&t), [(1, 4)]);
             assert_eq!((t.size(), t.alignment()), (rgb10a2.size(), rgb10a2.alignment()));
         }
+    }
+
+    /// `XGSuggestSwizzleMode` falls back to `optimal_mode` with the descriptor's own width and
+    /// height when it cannot lay the texture out, so their product must not overflow (a panic in
+    /// a debug build, inside an `extern "system"` function; 21 instead of 27 in release).
+    #[test]
+    fn optimal_mode_takes_any_size() {
+        let r = std::panic::catch_unwind(|| optimal_mode(0, 4, 32, 1 << 62, 4));
+        assert_eq!(r.ok(), Some(27));
+    }
+
+    /// A texture whose planes are all Blank (a BCn render target without CMASK) reports the
+    /// 0x100 fallback, not 0, as its base alignment.
+    #[test]
+    fn alignment_without_planes_is_a_power_of_two() {
+        let t = Texture { planes: vec![Plane { usage: 1, offset: 0, kind: PlaneKind::Blank }], main: 0, mips: 1, empty: false, dimension: 3 };
+        assert_eq!(t.alignment(), 0x100);
+        let meta = Texture { planes: vec![Plane { usage: 1, offset: 0, kind: PlaneKind::Blank }, Plane { usage: 2, offset: 0, kind: PlaneKind::Meta { bytes: 0x1000, align: 0x1000 } }], main: 0, mips: 1, empty: false, dimension: 3 };
+        assert_eq!(meta.alignment(), 0x1000);
     }
 }
