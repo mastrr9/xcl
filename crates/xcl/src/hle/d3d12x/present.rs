@@ -1198,7 +1198,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     let qraw = queue as *mut c_void;
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return };
     let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
-    q.ExecuteCommandLists(&[Some(cl)]);
+    submit_copy(q, cl);
     p.copy_sources = resolved.into_iter().map(|(r, _, _)| r).collect();
     p.dumps = dumps;
     p.value += 1;
@@ -1238,6 +1238,20 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     if n == 0 {
         crate::xlog_info!("present: first game frame shown ({w}x{h})");
     }
+}
+
+/// The presenter's copy, on the title's queue (an adopted one: its ExecuteCommandLists is
+/// XCL's hook). The copy reads the title's back buffer, a PC resource, and none of the title's
+/// memory, so it goes without the hook's write-watch look (`title_textures::refresh`): that look
+/// scans every watched page whatever was written – 0.83 ms over 1.6 GB on a retail title's
+/// menus (#582, 4 looks a presented frame there, this one of them). The CPU writes it would have
+/// found stay marked and go up at the title's next submit, before any work of the title that
+/// reads them. The queue still waits for the tile mappings and clears the look would have had it
+/// wait for.
+unsafe fn submit_copy(q: &ID3D12CommandQueue, cl: ID3D12CommandList) {
+    super::sparse::before_execute(q, &[], 0x1000);
+    super::vram::before_execute(q);
+    super::title_textures::own_work(|| q.ExecuteCommandLists(&[Some(cl)]));
 }
 
 /// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder (`XCL_FRAME_DUMP=n`,
@@ -1818,6 +1832,50 @@ mod frame_dump_tests {
             let blend = px(1, 2);
             assert!(blend[0] <= 2 && (126..=130).contains(&blend[1]) && (125..=129).contains(&blend[2]) && blend[3] == 255, "unexpected blend {blend:?}");
             rb.Unmap(0, None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod submit_tests {
+    use super::*;
+    use super::super::real::{self, Kind};
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+    /// On a title's queue (adopted, so its ExecuteCommandLists is XCL's hook) the title's own
+    /// submits look for CPU writes first; the presenter's copy goes without that look, and runs.
+    #[test]
+    fn the_presenters_copy_skips_the_write_watch_look() {
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>());
+                if warp.and_then(|a| D3D12CreateDevice(&a, D3D_FEATURE_LEVEL_11_0, &mut dev)).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no D3D12 device");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            real::adopt(q.as_raw(), Kind::CommandQueue);
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            list.Close().unwrap();
+            let cl: ID3D12CommandList = list.cast().unwrap();
+            let looks = super::super::title_textures::looks_on_this_thread;
+
+            let before = looks();
+            q.ExecuteCommandLists(&[Some(cl.clone())]);
+            assert_eq!(looks(), before + 1, "a title submit on the hooked queue looks for CPU writes");
+            submit_copy(&q, cl.clone());
+            assert_eq!(looks(), before + 1, "the presenter's copy looks for none");
+            q.ExecuteCommandLists(&[Some(cl.clone())]);
+            assert_eq!(looks(), before + 2, "the title's next submit looks again");
+
+            // all three ran on the queue
+            let f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            q.Signal(&f, 1).unwrap();
+            fence::wait(&f, 1, &dev, None, 5_000).expect("the queue ran the copy");
         }
     }
 }
