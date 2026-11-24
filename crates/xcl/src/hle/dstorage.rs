@@ -46,6 +46,8 @@ use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, Res
 
 use crate::util::{HRESULT, S_OK};
 
+mod read_ahead;
+
 const DLL: &str = "xcrdapi.dll";
 
 const E_NOTIMPL: HRESULT = 0x8000_4001u32 as i32;
@@ -510,6 +512,8 @@ struct FileInner {
     id: u32,
     path: Vec<u16>,
     file: Mutex<Option<Arc<std::fs::File>>>,
+    /// more handles for parallel reads (`read_ahead`)
+    readers: read_ahead::FileReaders,
 }
 
 impl FileInner {
@@ -544,7 +548,7 @@ unsafe extern "system" fn factory_open_file(_p: *mut c_void, path: *const u16, r
             return e.raw_os_error().map_or(E_INVALIDARG, |c| (0x8007_0000u32 | (c as u32 & 0xFFFF)) as i32);
         }
     };
-    let inner = Arc::new(FileInner { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), path: name.encode_utf16().collect(), file: Mutex::new(Some(Arc::new(file))) });
+    let inner = Arc::new(FileInner { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), path: name.encode_utf16().collect(), file: Mutex::new(Some(Arc::new(file))), readers: Default::default() });
     let o = new_object(file_vtbl(), inner);
     let hr = file_qi(o, riid, out);
     file_release(o);
@@ -564,7 +568,9 @@ unsafe extern "system" fn file_release(p: *mut c_void) -> u32 {
 }
 
 unsafe extern "system" fn file_close(p: *mut c_void) {
-    inner::<FileInner>(p).file.lock().unwrap().take();
+    let f = inner::<FileInner>(p);
+    f.file.lock().unwrap().take();
+    f.readers.close();
 }
 
 /// a handle of the title's own (it closes it)
@@ -843,8 +849,9 @@ pub fn counters() -> (u64, u64, u64) {
     (REQUESTS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed))
 }
 
-/// Run a request; the destination gets the bytes or nothing.
-unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
+/// Run a request; the destination gets the bytes or nothing. `read`: a file source's bytes
+/// already read by the queue's reader (`read_ahead`), or its read's failure.
+unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>, read: Option<read_ahead::ReadResult>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
     {
         // the first requests: where a title's data goes and how it is packed
@@ -887,9 +894,14 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         b
     } else {
         let f = file.and_then(|f| f.handle()).ok_or(E_FILE_HANDLE)?;
-        let mut b = vec![0u8; r.source_size as usize];
-        read_exact_at(&f, r.offset, &mut b)?;
-        b
+        match read {
+            Some(read) => read?,
+            None => {
+                let mut b = vec![0u8; r.source_size as usize];
+                read_exact_at(&f, r.offset, &mut b)?;
+                b
+            }
+        }
     };
 
     let bc = r.bcpack();
@@ -1087,9 +1099,27 @@ impl QueueInner {
         let _active = ActiveGuard(self);
         // the first failure of the requests since the last status entry
         let mut since_status = S_OK;
-        for batch in rx {
-            for e in batch {
+        // the entries received, so the reader can read the next file requests' sources while
+        // the worker runs the first; they still run one at a time in queue order
+        let mut ahead = std::collections::VecDeque::new();
+        let mut read_ahead = read_ahead::ReadAhead::new();
+        loop {
+            if ahead.is_empty() {
+                match rx.recv() {
+                    Ok(batch) => ahead.extend(batch),
+                    Err(_) => break,
+                }
+            }
+            while let Ok(batch) = rx.try_recv() {
+                ahead.extend(batch);
+            }
+            if !self.closed.load(Ordering::Acquire) {
+                read_ahead.top_up(self, &ahead);
+            }
+            {
+                let Some(e) = ahead.pop_front() else { continue };
                 if self.closed.load(Ordering::Acquire) {
+                    read_ahead.stop();
                     if let Entry::Status(s, i) = e {
                         if let Some(slot) = s.slots.get(i as usize) {
                             slot.store(E_QUEUE_CLOSED, Ordering::Release);
@@ -1103,7 +1133,8 @@ impl QueueInner {
                             // Cancelled requests are skipped without affecting status or error record.
                             continue;
                         }
-                        if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
+                        let read = read_ahead.take(seq);
+                        if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref(), read) } {
                             self.fail(hr, req, file.as_deref());
                             if since_status >= 0 {
                                 since_status = hr;
