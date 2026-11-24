@@ -45,6 +45,23 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         VirtualProtectEx,
         VirtualQuery,
         VirtualQueryEx,
+        VirtualAlloc2,
+        VirtualAlloc2FromApp,
+        VirtualAllocFromApp,
+        VirtualAllocExNuma,
+        CreateFileMappingW,
+        CreateFileMappingA,
+        CreateFileMappingNumaW,
+        CreateFileMappingNumaA,
+        CreateFileMappingFromApp,
+        CreateFileMapping2,
+        MapViewOfFile,
+        MapViewOfFileEx,
+        MapViewOfFileExNuma,
+        MapViewOfFileFromApp,
+        MapViewOfFile3,
+        MapViewOfFile3FromApp,
+        MapViewOfFileNuma2,
         XMemAlloc,
         XMemFree,
         XMemAllocDefault,
@@ -498,6 +515,105 @@ pub unsafe extern "system" fn VirtualProtect(addr: *const c_void, size: usize, p
 
 pub unsafe extern "system" fn VirtualProtectEx(proc_: HANDLE, addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
     mem::VirtualProtectEx(proc_, addr, size, sanitize_protect(p), old)
+}
+
+// The other ways to allocate and map memory get VirtualAllocEx's treatment: the console's
+// allocation flags (large / 64 KiB pages, MEM_GRAPHICS, MEM_TITLE) and graphics protections are
+// dropped – Windows refuses MEM_LARGE_PAGES / SEC_LARGE_PAGES without SeLockMemoryPrivilege, and
+// the rest as invalid – everything else, extended parameters (address requirements and alignment,
+// NUMA node) and placeholder flags included, reaches Windows as the title gave it.
+
+const PLACEHOLDER_FLAGS: u32 = mem::MEM_RESERVE_PLACEHOLDER | mem::MEM_REPLACE_PLACEHOLDER;
+/// FILE_MAP_LARGE_PAGES: only for a section made with SEC_LARGE_PAGES, which is dropped
+const FILE_MAP_LARGE_PAGES: u32 = 0x2000_0000;
+
+/// VirtualAlloc2's allocation type: VirtualAlloc's, with Windows' placeholder flags kept.
+pub fn sanitize_alloc2_type(t: u32) -> u32 {
+    sanitize_alloc_type(t & !PLACEHOLDER_FLAGS) | (t & PLACEHOLDER_FLAGS)
+}
+
+/// A view's allocation type (MapViewOfFile3): 0, MEM_RESERVE and MEM_REPLACE_PLACEHOLDER; large
+/// pages need a SEC_LARGE_PAGES section, which is dropped.
+pub fn sanitize_view_type(t: u32) -> u32 {
+    t & (mem::MEM_RESERVE | mem::MEM_REPLACE_PLACEHOLDER)
+}
+
+/// A section's protection and attributes without SEC_LARGE_PAGES.
+pub fn sanitize_section(p: u32) -> u32 {
+    p & !mem::SEC_LARGE_PAGES
+}
+
+type Params = *mut mem::MEM_EXTENDED_PARAMETER;
+type Sa = *const windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+
+pub unsafe extern "system" fn VirtualAlloc2(proc_: HANDLE, addr: *const c_void, size: usize, t: u32, p: u32, params: Params, n: u32) -> *mut c_void {
+    let q = mem::VirtualAlloc2(proc_, addr, size, sanitize_alloc2_type(t), sanitize_protect(p), params, n);
+    trace_mem("VirtualAlloc2", addr as usize, size, t as u64, p, q as usize);
+    q
+}
+
+pub unsafe extern "system" fn VirtualAlloc2FromApp(proc_: HANDLE, addr: *const c_void, size: usize, t: u32, p: u32, params: Params, n: u32) -> *mut c_void {
+    mem::VirtualAlloc2FromApp(proc_, addr, size, sanitize_alloc2_type(t), sanitize_protect(p), params, n)
+}
+
+pub unsafe extern "system" fn VirtualAllocFromApp(addr: *const c_void, size: usize, t: u32, p: u32) -> *mut c_void {
+    mem::VirtualAllocFromApp(addr, size, sanitize_alloc_type(t), sanitize_protect(p))
+}
+
+pub unsafe extern "system" fn VirtualAllocExNuma(proc_: HANDLE, addr: *const c_void, size: usize, t: u32, p: u32, node: u32) -> *mut c_void {
+    mem::VirtualAllocExNuma(proc_, addr, size, sanitize_alloc_type(t), sanitize_protect(p), node)
+}
+
+pub unsafe extern "system" fn CreateFileMappingW(f: HANDLE, sa: Sa, p: u32, high: u32, low: u32, name: *const u16) -> HANDLE {
+    mem::CreateFileMappingW(f, sa, sanitize_section(p), high, low, name)
+}
+
+pub unsafe extern "system" fn CreateFileMappingA(f: HANDLE, sa: Sa, p: u32, high: u32, low: u32, name: *const u8) -> HANDLE {
+    mem::CreateFileMappingA(f, sa, sanitize_section(p), high, low, name)
+}
+
+pub unsafe extern "system" fn CreateFileMappingNumaW(f: HANDLE, sa: Sa, p: u32, high: u32, low: u32, name: *const u16, node: u32) -> HANDLE {
+    mem::CreateFileMappingNumaW(f, sa, sanitize_section(p), high, low, name, node)
+}
+
+pub unsafe extern "system" fn CreateFileMappingNumaA(f: HANDLE, sa: Sa, p: u32, high: u32, low: u32, name: *const u8, node: u32) -> HANDLE {
+    mem::CreateFileMappingNumaA(f, sa, sanitize_section(p), high, low, name, node)
+}
+
+pub unsafe extern "system" fn CreateFileMappingFromApp(f: HANDLE, sa: Sa, p: u32, size: u64, name: *const u16) -> HANDLE {
+    mem::CreateFileMappingFromApp(f, sa, sanitize_section(p), size, name)
+}
+
+pub unsafe extern "system" fn CreateFileMapping2(f: HANDLE, sa: Sa, access: u32, p: u32, attrs: u32, size: u64, name: *const u16, params: Params, n: u32) -> HANDLE {
+    mem::CreateFileMapping2(f, sa, access, sanitize_section(p), sanitize_section(attrs), size, name, params, n)
+}
+
+pub unsafe extern "system" fn MapViewOfFile(h: HANDLE, access: u32, high: u32, low: u32, size: usize) -> *mut c_void {
+    mem::MapViewOfFile(h, access & !FILE_MAP_LARGE_PAGES, high, low, size).Value
+}
+
+pub unsafe extern "system" fn MapViewOfFileEx(h: HANDLE, access: u32, high: u32, low: u32, size: usize, addr: *const c_void) -> *mut c_void {
+    mem::MapViewOfFileEx(h, access & !FILE_MAP_LARGE_PAGES, high, low, size, addr).Value
+}
+
+pub unsafe extern "system" fn MapViewOfFileExNuma(h: HANDLE, access: u32, high: u32, low: u32, size: usize, addr: *const c_void, node: u32) -> *mut c_void {
+    mem::MapViewOfFileExNuma(h, access & !FILE_MAP_LARGE_PAGES, high, low, size, addr, node).Value
+}
+
+pub unsafe extern "system" fn MapViewOfFileFromApp(h: HANDLE, access: u32, offset: u64, size: usize) -> *mut c_void {
+    mem::MapViewOfFileFromApp(h, access & !FILE_MAP_LARGE_PAGES, offset, size).Value
+}
+
+pub unsafe extern "system" fn MapViewOfFile3(h: HANDLE, proc_: HANDLE, addr: *const c_void, offset: u64, size: usize, t: u32, p: u32, params: Params, n: u32) -> *mut c_void {
+    mem::MapViewOfFile3(h, proc_, addr, offset, size, sanitize_view_type(t), sanitize_protect(p), params, n).Value
+}
+
+pub unsafe extern "system" fn MapViewOfFile3FromApp(h: HANDLE, proc_: HANDLE, addr: *const c_void, offset: u64, size: usize, t: u32, p: u32, params: Params, n: u32) -> *mut c_void {
+    mem::MapViewOfFile3FromApp(h, proc_, addr, offset, size, sanitize_view_type(t), sanitize_protect(p), params, n).Value
+}
+
+pub unsafe extern "system" fn MapViewOfFileNuma2(h: HANDLE, proc_: HANDLE, offset: u64, addr: *const c_void, size: usize, t: u32, p: u32, node: u32) -> *mut c_void {
+    mem::MapViewOfFileNuma2(h, proc_, offset, addr, size, sanitize_view_type(t), sanitize_protect(p), node).Value
 }
 
 /// XALLOC_ATTRIBUTES bit fields.
@@ -2177,6 +2293,63 @@ mod tests {
         assert_eq!(sleep_hold_min(Some("0")), None);
         assert_eq!(sleep_hold_min(Some(" 250 ")), Some(250));
         assert_eq!(sleep_hold_min(Some("on")), Some(SLEEP_HOLD_MIN_MS));
+    }
+
+    /// The console's large-page flags through VirtualAlloc2, VirtualAllocExNuma, a section and its
+    /// views: dropped, so the calls succeed without SeLockMemoryPrivilege (before: Windows' NULL,
+    /// ERROR_PRIVILEGE_NOT_HELD). VirtualAlloc2's address requirements reach Windows intact, and
+    /// placeholders still work (a two-view ring buffer).
+    #[test]
+    fn large_page_flags_are_dropped_by_the_other_allocation_apis() {
+        use std::ptr::{null, null_mut};
+        assert_eq!(sanitize_alloc2_type(mem::MEM_RESERVE | mem::MEM_COMMIT | mem::MEM_LARGE_PAGES), mem::MEM_RESERVE | mem::MEM_COMMIT);
+        assert_eq!(sanitize_alloc2_type(mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER), mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER);
+        assert_eq!(sanitize_view_type(mem::MEM_LARGE_PAGES), 0);
+        assert_eq!(sanitize_view_type(mem::MEM_REPLACE_PLACEHOLDER | mem::MEM_LARGE_PAGES), mem::MEM_REPLACE_PLACEHOLDER);
+        assert_eq!(sanitize_section(mem::PAGE_READWRITE | mem::SEC_COMMIT | mem::SEC_LARGE_PAGES), mem::PAGE_READWRITE | mem::SEC_COMMIT);
+        unsafe {
+            let me = thr::GetCurrentProcess();
+            let large = mem::MEM_RESERVE | mem::MEM_COMMIT | mem::MEM_LARGE_PAGES;
+            // VirtualAlloc2 with an address requirement: 1 MiB aligned, below 64 GiB
+            let mut req: mem::MEM_ADDRESS_REQUIREMENTS = std::mem::zeroed();
+            req.HighestEndingAddress = ((64usize << 30) - 1) as *mut c_void;
+            req.Alignment = 1 << 20;
+            let mut param: mem::MEM_EXTENDED_PARAMETER = std::mem::zeroed();
+            param.Anonymous1._bitfield = mem::MemExtendedParameterAddressRequirements as u64;
+            param.Anonymous2.Pointer = &mut req as *mut _ as *mut c_void;
+            let p = VirtualAlloc2(me, null(), 2 << 20, large, mem::PAGE_READWRITE, &mut param, 1) as usize;
+            assert_ne!(p, 0, "VirtualAlloc2: error {}", fnd::GetLastError());
+            assert_eq!(p % (1 << 20), 0, "alignment from the extended parameter");
+            assert!(p + (2 << 20) <= 64 << 30, "highest address from the extended parameter");
+            *(p as *mut u64) = 7;
+            mem::VirtualFree(p as *mut c_void, 0, mem::MEM_RELEASE);
+            let p = VirtualAllocExNuma(me, null(), 2 << 20, large, mem::PAGE_READWRITE, 0);
+            assert!(!p.is_null(), "VirtualAllocExNuma: error {}", fnd::GetLastError());
+            mem::VirtualFree(p, 0, mem::MEM_RELEASE);
+            // a large-page section and a large-page view of it
+            let s = CreateFileMappingW(fnd::INVALID_HANDLE_VALUE, null(), mem::PAGE_READWRITE | mem::SEC_COMMIT | mem::SEC_LARGE_PAGES, 0, 2 << 20, null());
+            assert!(!s.is_null(), "CreateFileMappingW: error {}", fnd::GetLastError());
+            let v = MapViewOfFile(s, mem::FILE_MAP_ALL_ACCESS | FILE_MAP_LARGE_PAGES, 0, 0, 0);
+            assert!(!v.is_null(), "MapViewOfFile: error {}", fnd::GetLastError());
+            *(v as *mut u64) = 9;
+            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: v });
+            fnd::CloseHandle(s);
+            // a ring buffer: one 64 KiB section mapped twice into a split placeholder
+            let n = 0x1_0000usize;
+            let s = CreateFileMappingW(fnd::INVALID_HANDLE_VALUE, null(), mem::PAGE_READWRITE, 0, n as u32, null());
+            assert!(!s.is_null());
+            let r = VirtualAlloc2(me, null(), 2 * n, mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER, mem::PAGE_NOACCESS, null_mut(), 0) as usize;
+            assert_ne!(r, 0, "placeholder reservation: error {}", fnd::GetLastError());
+            assert_ne!(VirtualFree(r as *mut c_void, n, mem::MEM_RELEASE | mem::MEM_PRESERVE_PLACEHOLDER), 0);
+            let a = MapViewOfFile3(s, me, r as *const c_void, 0, n, mem::MEM_REPLACE_PLACEHOLDER | mem::MEM_LARGE_PAGES, mem::PAGE_READWRITE, null_mut(), 0);
+            let b = MapViewOfFile3(s, me, (r + n) as *const c_void, 0, n, mem::MEM_REPLACE_PLACEHOLDER, mem::PAGE_READWRITE, null_mut(), 0);
+            assert_eq!((a as usize, b as usize), (r, r + n), "error {}", fnd::GetLastError());
+            *(a as *mut u32) = 0x1234_5678;
+            assert_eq!(*(b as *const u32), 0x1234_5678, "both views are the same memory");
+            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: a });
+            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: b });
+            fnd::CloseHandle(s);
+        }
     }
 
     #[test]
