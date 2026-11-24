@@ -1655,6 +1655,9 @@ pub struct Decoder {
     trim_start: u16,
     trim_end: u16,
     flushed: bool,
+    /// No packet fed since `new` or the last `flush`: the next buffer decodes the same
+    /// whatever was decoded before it.
+    pristine: bool,
 }
 
 impl Decoder {
@@ -1691,11 +1694,21 @@ impl Decoder {
             trim_start: 0,
             trim_end: 0,
             flushed: false,
+            pristine: true,
         })
     }
 
     pub fn channels(&self) -> u16 {
         self.cfg.channels
+    }
+
+    pub fn config(&self) -> &StreamConfig {
+        &self.cfg
+    }
+
+    /// True until a packet is fed after `new` or `flush` (an `END_OF_STREAM` buffer flushes).
+    pub fn is_pristine(&self) -> bool {
+        self.pristine
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -1716,10 +1729,12 @@ impl Decoder {
         self.trim_start = 0;
         self.trim_end = 0;
         self.flushed = false;
+        self.pristine = true;
     }
 
     /// Feed a single 2048-byte XMA packet to the active stream and advance stream selection.
     fn feed_packet(&mut self, pkt: &[u8]) -> Result<(), String> {
+        self.pristine = false;
         // Explicit XMA2 empty/padding packet sentinel (unused tail of a multi-packet block).
         if pkt.len() >= 4 && pkt[0..4] == [0xFF, 0xFF, 0xFF, 0xFF] {
             return Ok(());
@@ -2199,6 +2214,44 @@ pub(crate) mod tests {
         check_split(&st.vec4_vlc, &VEC4_LENS, &VEC4_SYMS, -1, "vec4_vlc");
         check_pairs(&st.vec2_vlc, &VEC2_TABLE, -1, "vec2_vlc");
         check_pairs(&st.vec1_vlc, &VEC1_TABLE, 0, "vec1_vlc");
+    }
+
+    #[test]
+    fn a_flushed_decoder_decodes_a_buffer_like_a_new_one() {
+        // XAudio2 reuses the PCM of a one-shot buffer only if a decoder that has played
+        // something else and been flushed gives the same samples as a new one.
+        let cases: Vec<(u32, u16, Vec<u8>, Version, Vec<u8>)> = vec![
+            (48_000, 1, vec![1], Version::Xma2, pad_packet(MONO_48K_PREFIX)),
+            (48_000, 2, vec![2], Version::Xma2, pad_packet(STEREO_MS_PREFIX)),
+            (44_100, 2, vec![2], Version::Xma2, pad_packet(VAR_SUBFRAMES_PREFIX)),
+            (32_000, 1, vec![1], Version::Xma2, pad_packet(ALL_COEFF_PATHS_PREFIX)),
+            (24_000, 2, vec![2], Version::Xma1, pad_packet(XMA1_STEREO_PREFIX)),
+            (48_000, 6, vec![2, 2, 2], Version::Xma2, expand_sparse(SURROUND_5_1_SPARSE)),
+            (48_000, 1, vec![1], Version::Xma2, expand_sparse(CROSS_PACKET_SPARSE)),
+        ];
+        for (rate, channels, stream_channels, version, data) in &cases {
+            let cfg = StreamConfig { version: *version, sample_rate: *rate, channels: *channels, stream_channels: stream_channels.clone() };
+            let mut fresh = Decoder::new(cfg.clone()).unwrap();
+            assert!(fresh.is_pristine());
+            let want = fresh.decode_buffer_i16(data, true).unwrap();
+            assert!(!want.is_empty());
+            assert!(fresh.is_pristine(), "END_OF_STREAM leaves the decoder flushed");
+            // Something else first: the same buffer cut short, a corrupted copy, and a buffer
+            // left without END_OF_STREAM then flushed, as FlushSourceBuffers does.
+            let mut corrupt = data.clone();
+            for i in (7..corrupt.len()).step_by(131) {
+                corrupt[i] ^= 0x5A;
+            }
+            let half = &data[..(data.len() / 2).max(PACKET_SIZE).min(data.len())];
+            for (before, eos) in [(half, true), (&corrupt[..], true), (&data[..], false)] {
+                let mut used = Decoder::new(cfg.clone()).unwrap();
+                let _ = used.decode_buffer_i16(before, eos);
+                assert!(!used.is_pristine() || eos);
+                used.flush();
+                assert!(used.is_pristine());
+                assert_eq!(used.decode_buffer_i16(data, true).unwrap(), want, "{rate} Hz, {channels} ch");
+            }
+        }
     }
 
     #[test]

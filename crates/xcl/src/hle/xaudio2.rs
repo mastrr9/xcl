@@ -183,6 +183,9 @@ pub struct AudioStats {
     pub xma_voices: u64,
     /// XMA/XMA2 buffers decoded to PCM16
     pub xma_buffers_decoded: u64,
+    /// of those, one-shot buffers whose samples came from an identical buffer decoded before
+    #[serde(default)]
+    pub xma_buffers_reused: u64,
     /// XMA/XMA2 buffers that failed decoding (fell back to silence)
     pub xma_decode_errors: u64,
     /// Opus voices decoded to PCM16 via MSOpusDecoder
@@ -234,6 +237,7 @@ pub fn stats() -> AudioStats {
         source_voices: SOURCE_VOICES.load(Ordering::Relaxed),
         xma_voices: XMA_VOICES.load(Ordering::Relaxed),
         xma_buffers_decoded: XMA_BUFFERS_DECODED.load(Ordering::Relaxed),
+        xma_buffers_reused: XMA_PCM_CACHE_HITS.load(Ordering::Relaxed),
         xma_decode_errors: XMA_DECODE_ERRORS.load(Ordering::Relaxed),
         opus_voices: OPUS_VOICES_CREATED.load(Ordering::Relaxed),
         opus_buffers_decoded: OPUS_BUFFERS_DECODED.load(Ordering::Relaxed),
@@ -1007,6 +1011,96 @@ fn pcm16_le_bytes(samples: &[i16]) -> Box<[u8]> {
     samples.iter().flat_map(|s| s.to_le_bytes()).collect()
 }
 
+/// PCM of one-shot XMA buffers already decoded. A title plays a sound effect by submitting the
+/// same END_OF_STREAM buffer to a fresh or flushed voice each time, and decoding it again
+/// on the game thread for every footstep or shot costs far more than copying the samples.
+/// A decoder with nothing fed since it was made or flushed decodes such a buffer the same
+/// every time, so the samples depend only on the stream layout and the buffer's bytes.
+/// Entries keep a copy of those bytes, so a hit is an exact match, never a hash guess.
+struct XmaPcmCache {
+    entries: HashMap<u64, Vec<Arc<XmaPcmEntry>>>,
+    order: std::collections::VecDeque<Arc<XmaPcmEntry>>,
+    bytes: usize,
+}
+
+struct XmaPcmEntry {
+    key: u64,
+    cfg: xma2::StreamConfig,
+    src: Box<[u8]>,
+    pcm: Box<[i16]>,
+}
+
+impl XmaPcmEntry {
+    fn size(&self) -> usize {
+        self.src.len() + self.pcm.len() * 2
+    }
+}
+
+/// Larger buffers are music or speech, played once; caching them would only hold memory.
+const XMA_PCM_CACHE_MAX_SRC: usize = 512 * 1024;
+const XMA_PCM_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+static XMA_PCM_CACHE: Mutex<Option<XmaPcmCache>> = Mutex::new(None);
+static XMA_PCM_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+
+fn xma_pcm_key(cfg: &xma2::StreamConfig, data: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (cfg.version == xma2::Version::Xma1).hash(&mut h);
+    cfg.sample_rate.hash(&mut h);
+    cfg.channels.hash(&mut h);
+    cfg.stream_channels.hash(&mut h);
+    data.hash(&mut h);
+    h.finish()
+}
+
+impl XmaPcmCache {
+    fn get(&self, key: u64, cfg: &xma2::StreamConfig, data: &[u8]) -> Option<&XmaPcmEntry> {
+        self.entries.get(&key)?.iter().map(|e| &**e).find(|e| e.cfg == *cfg && *e.src == *data)
+    }
+
+    fn insert(&mut self, e: XmaPcmEntry) {
+        let e = Arc::new(e);
+        self.bytes += e.size();
+        self.entries.entry(e.key).or_default().push(e.clone());
+        self.order.push_back(e);
+        while self.bytes > XMA_PCM_CACHE_MAX_BYTES {
+            let Some(old) = self.order.pop_front() else { break };
+            self.bytes -= old.size();
+            if let Some(v) = self.entries.get_mut(&old.key) {
+                v.retain(|x| !Arc::ptr_eq(x, &old));
+                if v.is_empty() {
+                    self.entries.remove(&old.key);
+                }
+            }
+        }
+    }
+}
+
+/// `decoder.decode_buffer_i16(data, eos)`, reusing the samples of an identical one-shot
+/// buffer decoded before. The decoder ends in the same (flushed) state either way.
+fn decode_xma_buffer(decoder: &mut xma2::Decoder, data: &[u8], eos: bool) -> Result<Vec<i16>, String> {
+    if !eos || !decoder.is_pristine() || data.is_empty() || data.len() > XMA_PCM_CACHE_MAX_SRC {
+        return decoder.decode_buffer_i16(data, eos);
+    }
+    let key = xma_pcm_key(decoder.config(), data);
+    if let Some(c) = XMA_PCM_CACHE.lock().unwrap().as_ref() {
+        if let Some(e) = c.get(key, decoder.config(), data) {
+            XMA_PCM_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            decoder.flush();
+            return Ok(e.pcm.to_vec());
+        }
+    }
+    let res = decoder.decode_buffer_i16(data, eos);
+    if let Ok(pcm) = &res {
+        if !pcm.is_empty() {
+            let e = XmaPcmEntry { key, cfg: decoder.config().clone(), src: data.into(), pcm: pcm.as_slice().into() };
+            XMA_PCM_CACHE.lock().unwrap().get_or_insert_with(|| XmaPcmCache { entries: HashMap::new(), order: Default::default(), bytes: 0 }).insert(e);
+        }
+    }
+    res
+}
+
 unsafe fn submit_decoded_buffer(
     this: *mut c_void,
     orig: SubmitSourceBufferFn,
@@ -1039,7 +1133,7 @@ unsafe fn submit_decoded_buffer(
                 (res, info, false)
             }
             VoiceDecoder::Xma { decoder, info } => {
-                let res = decoder.decode_buffer_i16(data, eos);
+                let res = decode_xma_buffer(decoder, data, eos);
                 (res, *info, true)
             }
         }
@@ -1295,6 +1389,52 @@ mod tests {
             expected.extend_from_slice(&s.to_le_bytes());
         }
         assert_eq!(&*pcm16_le_bytes(&samples), &expected[..]);
+    }
+
+    #[test]
+    fn a_one_shot_xma_buffer_is_decoded_once_and_reused_exactly() {
+        use xma2::tests::{pad_packet, MONO_48K_PREFIX};
+        let cfg = xma2::StreamConfig { version: xma2::Version::Xma2, sample_rate: 48_000, channels: 1, stream_channels: vec![1] };
+        let data = pad_packet(MONO_48K_PREFIX);
+        let want = xma2::Decoder::new(cfg.clone()).unwrap().decode_buffer_i16(&data, true).unwrap();
+        let mut dec = xma2::Decoder::new(cfg.clone()).unwrap();
+        let first = decode_xma_buffer(&mut dec, &data, true).unwrap();
+        assert_eq!(first, want);
+        let key = xma_pcm_key(&cfg, &data);
+        assert!(XMA_PCM_CACHE.lock().unwrap().as_ref().unwrap().get(key, &cfg, &data).is_some());
+        for _ in 0..3 {
+            assert!(dec.is_pristine());
+            assert_eq!(decode_xma_buffer(&mut dec, &data, true).unwrap(), want);
+        }
+        // A changed byte, another layout, or a buffer that isn't the whole sound is decoded.
+        let mut other = data.clone();
+        other[100] ^= 1;
+        assert!(XMA_PCM_CACHE.lock().unwrap().as_ref().unwrap().get(xma_pcm_key(&cfg, &other), &cfg, &other).is_none());
+        assert_eq!(decode_xma_buffer(&mut dec, &other, true), xma2::Decoder::new(cfg.clone()).unwrap().decode_buffer_i16(&other, true));
+        let stereo = xma2::StreamConfig { channels: 2, stream_channels: vec![2], ..cfg.clone() };
+        assert!(XMA_PCM_CACHE.lock().unwrap().as_ref().unwrap().get(xma_pcm_key(&stereo, &data), &stereo, &data).is_none());
+        let mut streaming = xma2::Decoder::new(cfg.clone()).unwrap();
+        let part = decode_xma_buffer(&mut streaming, &data, false).unwrap();
+        assert_eq!(part, xma2::Decoder::new(cfg.clone()).unwrap().decode_buffer_i16(&data, false).unwrap());
+        assert!(!streaming.is_pristine());
+    }
+
+    #[test]
+    fn the_xma_pcm_cache_drops_its_oldest_entries_past_its_limit() {
+        let cfg = xma2::StreamConfig { version: xma2::Version::Xma2, sample_rate: 48_000, channels: 1, stream_channels: vec![1] };
+        let mut c = XmaPcmCache { entries: HashMap::new(), order: Default::default(), bytes: 0 };
+        let pcm_len = XMA_PCM_CACHE_MAX_BYTES / 16;
+        for i in 0..10u8 {
+            let src = vec![i; 16];
+            let key = xma_pcm_key(&cfg, &src);
+            c.insert(XmaPcmEntry { key, cfg: cfg.clone(), src: src.into(), pcm: vec![0i16; pcm_len].into() });
+        }
+        assert!(c.bytes <= XMA_PCM_CACHE_MAX_BYTES);
+        let has = |c: &XmaPcmCache, i: u8| c.get(xma_pcm_key(&cfg, &[i; 16]), &cfg, &[i; 16]).is_some();
+        assert!(!has(&c, 0) && !has(&c, 1) && !has(&c, 2));
+        assert!((3..10).all(|i| has(&c, i)));
+        assert_eq!(c.order.len(), 7);
+        assert_eq!(c.entries.values().map(Vec::len).sum::<usize>(), 7);
     }
 
     #[test]
