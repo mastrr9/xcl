@@ -220,16 +220,49 @@ pub unsafe extern "system" fn XThreadIsTimeSensitive() -> bool {
     TIME_SENSITIVE.with(|c| c.get())
 }
 
+/// Whether to log the `n`th (1-based) occurrence of a warning that a title can trigger on every
+/// frame: the first 8, then every 1024th. Each warning flushes the log file under a global
+/// lock, so a call the title makes in a hot loop must not cost a file write each time.
+pub(crate) fn log_repeat(n: u64) -> bool {
+    n <= 8 || n % 1024 == 0
+}
+
+/// Count a warning in `counter` and return its occurrence number when it should be logged.
+pub(crate) fn count_repeat(counter: &AtomicU64) -> Option<u64> {
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    log_repeat(n).then_some(n)
+}
+
+thread_local! {
+    /// How often this thread called XThread{Verify,Assert}NotTimeSensitive while marked
+    /// time-sensitive.
+    static TIME_SENSITIVE_VIOLATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Count a call made on a time-sensitive thread and return its number on this thread when it
+/// should be logged. The thread calling this is the one that must not block.
+fn time_sensitive_violation() -> Option<u64> {
+    if !TIME_SENSITIVE.with(|c| c.get()) {
+        return None;
+    }
+    let n = TIME_SENSITIVE_VIOLATIONS.with(|c| {
+        let n = c.get() + 1;
+        c.set(n);
+        n
+    });
+    log_repeat(n).then_some(n)
+}
+
 pub unsafe extern "system" fn XThreadVerifyNotTimeSensitive() -> HRESULT {
-    if TIME_SENSITIVE.with(|c| c.get()) {
-        crate::xlog_warn!("XThreadVerifyNotTimeSensitive called on a time-sensitive thread");
+    if let Some(n) = time_sensitive_violation() {
+        crate::xlog_warn!("XThreadVerifyNotTimeSensitive called on a time-sensitive thread (call {n} on this thread)");
     }
     S_OK
 }
 
 pub unsafe extern "system" fn XThreadAssertNotTimeSensitive() {
-    if TIME_SENSITIVE.with(|c| c.get()) {
-        crate::xlog_warn!("XThreadAssertNotTimeSensitive called on a time-sensitive thread");
+    if let Some(n) = time_sensitive_violation() {
+        crate::xlog_warn!("XThreadAssertNotTimeSensitive called on a time-sensitive thread (call {n} on this thread)");
     }
 }
 
@@ -960,7 +993,10 @@ pub unsafe extern "system" fn XUserFindControllerForUserWithUiResult(b: *mut XAs
 // ---------------------------------------------------------------------------------------
 
 pub unsafe extern "system" fn XStoreCreateContext(_user: *mut c_void, out: *mut *mut c_void) -> HRESULT {
-    crate::xlog_warn!("XStoreCreateContext → unavailable (offline mode, XCL does not fake licenses)");
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    if let Some(n) = count_repeat(&CALLS) {
+        crate::xlog_warn!("XStoreCreateContext → unavailable (offline mode, XCL does not fake licenses; call {n})");
+    }
     if !out.is_null() {
         *out = std::ptr::null_mut();
     }
@@ -1057,6 +1093,26 @@ mod tests {
             XUserCloseHandle(u);
             assert_eq!(XUserGetId(std::ptr::null_mut(), &mut id), E_INVALIDARG);
         }
+    }
+
+    #[test]
+    fn repeated_warnings_are_logged_eight_times_then_rarely() {
+        std::thread::spawn(|| unsafe {
+            assert_eq!(time_sensitive_violation(), None, "a normal thread is not counted");
+            XThreadSetTimeSensitive(true);
+            let logged: Vec<u64> = (0..3000).filter_map(|_| time_sensitive_violation()).collect();
+            assert_eq!(logged, [1, 2, 3, 4, 5, 6, 7, 8, 1024, 2048]);
+            assert_eq!(XThreadVerifyNotTimeSensitive(), S_OK);
+            XThreadAssertNotTimeSensitive();
+            XThreadSetTimeSensitive(false);
+            assert_eq!(time_sensitive_violation(), None);
+        })
+        .join()
+        .unwrap();
+
+        let counter = AtomicU64::new(0);
+        let logged: Vec<u64> = (0..5000).filter_map(|_| count_repeat(&counter)).collect();
+        assert_eq!(logged, [1, 2, 3, 4, 5, 6, 7, 8, 1024, 2048, 3072, 4096]);
     }
 
     #[test]

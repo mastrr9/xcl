@@ -222,9 +222,22 @@ pub unsafe extern "system" fn UninitializeApiImpl() {
 static ERROR_CB: Mutex<Option<(usize, usize)>> = Mutex::new(None);
 static ERROR_OPTIONS: AtomicUsize = AtomicUsize::new(0);
 
+/// How often each HRESULT reached XErrorReport (see `log_repeat`).
+static ERROR_REPORTS: Mutex<BTreeMap<u32, u64>> = Mutex::new(BTreeMap::new());
+
 pub unsafe extern "system" fn XErrorReport(hr: HRESULT, message: *const u8) {
-    let text = crate::util::from_cstr_ptr(message).unwrap_or_default();
-    crate::xlog_warn!("XErrorReport {:#x}: {text}", hr as u32);
+    // A title can report the same failure every frame (say, an Xbox Live call that fails
+    // offline), so log each HRESULT a few times, then rarely.
+    let n = {
+        let mut reports = ERROR_REPORTS.lock().unwrap();
+        let n = reports.entry(hr as u32).or_insert(0);
+        *n += 1;
+        *n
+    };
+    if log_repeat(n) {
+        let text = crate::util::from_cstr_ptr(message).unwrap_or_default();
+        crate::xlog_warn!("XErrorReport {:#x}: {text} (report {n} of this error)", hr as u32);
+    }
     // Copy and release `ERROR_CB` before invoking the guest callback so re-entrant calls to
     // `XErrorSetCallback` or `XErrorReport` do not deadlock.
     let entry = *ERROR_CB.lock().unwrap();
@@ -1602,7 +1615,10 @@ pub unsafe extern "system" fn XGameGetXboxTitleId(out: *mut u32) -> HRESULT {
     let t = &crate::state::config().title_id;
     *out = u32::from_str_radix(t.trim_start_matches("0x"), 16).unwrap_or(0);
     if *out == 0 {
-        crate::xlog_warn!("XGameGetXboxTitleId: no TitleId in MicrosoftGame.Config / xcl.toml → 0");
+        static ZERO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if let Some(n) = count_repeat(&ZERO) {
+            crate::xlog_warn!("XGameGetXboxTitleId: no TitleId in MicrosoftGame.Config / xcl.toml → 0 (call {n})");
+        }
     }
     S_OK
 }
