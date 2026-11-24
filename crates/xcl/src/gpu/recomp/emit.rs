@@ -104,6 +104,9 @@ const NOOPS: &[&str] = &[
     "s_inst_prefetch", "s_clause", "s_code_end", "s_setprio", "s_sleep", "s_icache_inv", "s_dcache_inv", "s_gl1_inv", "s_ttracedata",
     "s_ttracedata_imm", "v_nop", "s_denorm_mode", "s_sendmsg", "s_sendmsghalt",
     "s_set_gpr_idx_off", "s_version", "buffer_gl0_inv", "buffer_gl1_inv", "ds_nop",
+    // hints and state this model does not keep: performance level, waking waves from s_sleep
+    // (itself a no-op), a pipeline flush, the exception flags
+    "s_incperflevel", "s_decperflevel", "s_wakeup", "v_pipeflush", "v_clrexcp",
 ];
 
 fn sname(code: u64) -> Option<String> {
@@ -1384,6 +1387,8 @@ impl Em {
                     "s_cbranch_vccnz" => Flow::Cond(format!("!({})", self.mask_zero(106)), t),
                     "s_cbranch_execz" => Flow::Cond(self.mask_zero(126), t),
                     "s_cbranch_execnz" => Flow::Cond(format!("!({})", self.mask_zero(126)), t),
+                    // the conditional-debug flags are set only by an attached debugger: never taken
+                    "s_cbranch_cdbgsys" | "s_cbranch_cdbguser" | "s_cbranch_cdbgsys_or_user" | "s_cbranch_cdbgsys_and_user" => Flow::Cond("false".into(), t),
                     _ => {
                         self.unsupported(d, "conditional branch");
                         Flow::Next
