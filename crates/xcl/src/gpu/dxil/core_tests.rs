@@ -91,6 +91,56 @@ fn long_programs_translate() {
     println!("4001 instructions: {:?}", t.elapsed());
 }
 
+/// VOP3 abs / neg on v_cvt_f64_f32 apply to the f32 source before the widening. The HLSL path
+/// drops them on main (open PR #802 applies them there), so this checks the direct backend
+/// against the hardware values.
+#[test]
+fn vop3_abs_neg_on_cvt_f64_f32() {
+    use crate::gpu::recomp::runner::{self, KernelState};
+    let code = prog(&[
+        // -(+denormal)
+        ("V_CVT_F64_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 257), ("NEG", 1)], None),
+        // |negative quiet NaN with a payload|
+        ("V_CVT_F64_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", 258), ("ABS", 1)], None),
+        // -|1.5|
+        ("V_CVT_F64_F32", "ENC_VOP3", &[("VDST", 14), ("SRC0", 259), ("ABS", 1), ("NEG", 1)], None),
+    ]);
+    match (runner::adapter(), runner::wave64_programs_supported()) {
+        (Ok(_), Ok(true)) => {}
+        (Ok(_), Ok(false)) => return runner::skip_test("no wave64"),
+        _ => return runner::skip_test("no GPU"),
+    }
+    // test builds validate the direct container with DXC
+    if crate::gpu::recomp::dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let mem: Vec<u32> = code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let mut st = KernelState::default();
+    for r in st.vgpr.iter_mut() {
+        r[1] = 0x0000_0001; // 2^-149, the smallest f32 denormal
+        r[2] = 0xFFC0_0001; // negative quiet NaN, payload 1
+        r[3] = 0x3FC0_0000; // 1.5
+    }
+    let waves = if runner::wave64_supported() == Ok(true) { vec![true, false] } else { vec![false] };
+    for wave64 in waves {
+        let direct = runner::direct_kernel(&code, wave64).unwrap();
+        let r = runner::run(&direct, &st, &mem).unwrap_or_else(|e| panic!("direct wave64 {wave64}: {e}"));
+        for (l, v) in r.vgpr.iter().take(if wave64 { 64 } else { 32 }).enumerate() {
+            let at = format!("direct wave64 {wave64} lane {l}");
+            // -2^-149 is exact in f64 (0xB6A0_0000_0000_0000); with f32 denormals flushed on
+            // input it is -0.0. Either way the sign is set.
+            let d = (v[11] as u64) << 32 | v[10] as u64;
+            assert!(d == 0xB6A0_0000_0000_0000 || d == 0x8000_0000_0000_0000, "{at}: {d:#018X}");
+            // a NaN with the sign cleared; widening keeps the payload in the top mantissa
+            // bits (0x7FF8_0000_2000_0000), which D3D does not promise, so only NaN-ness and
+            // the sign are checked
+            let n = (v[13] as u64) << 32 | v[12] as u64;
+            assert!(n >> 63 == 0 && n >> 52 & 0x7FF == 0x7FF && n & 0xF_FFFF_FFFF_FFFF != 0, "{at}: {n:#018X}");
+            assert_eq!([v[14], v[15]], [0, 0xBFF8_0000], "{at}: -1.5");
+        }
+    }
+}
+
 /// A direct-translated VS links with an HLSL-path PS and vice versa (both declare their
 /// signatures as the HLSL entry structs do), drawing the same pixels as two direct stages.
 #[test]

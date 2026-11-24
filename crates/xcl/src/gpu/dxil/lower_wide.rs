@@ -868,7 +868,16 @@ impl Lw {
                     }
                     "v_cvt_f64_f32" => {
                         let t = self.f64ty();
-                        let x = self.f(lh[0].0);
+                        // abs / neg on the f32's sign bit, as f64v does on an f64's
+                        let mut b = lh[0].0;
+                        if m.abs[0] {
+                            b = self.andc(b, 0x7FFF_FFFF);
+                        }
+                        if m.neg[0] {
+                            let k = self.c(0x8000_0000);
+                            b = self.xor(b, k);
+                        }
+                        let x = self.f(b);
                         self.s.m.cast(CastOp::FPExt, x, t)
                     }
                     "v_cvt_f64_i32" => {
