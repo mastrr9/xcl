@@ -6153,7 +6153,51 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     hr
 }
 
-/// Rewrite a pipeline state stream with stand-in shaders. None if not possible.
+/// The stand-in for a pipeline stream with a mesh shader: a mesh pipeline by D3D12's rules
+/// whatever the title's stream holds. `ms` (and `ps` when the title's stream has a pixel shader)
+/// under the title's root signature, triangles (what `ms` emits; `two_pass_mesh_stream` states
+/// the same for the real pipeline), and of the title's state only its targets: render target and
+/// depth formats as the PC's (as `translated_mesh_stream_once` converts them), sample desc,
+/// sample mask and node mask, the first of each. A VS, input layout, stream output or strip cut
+/// has no place in a mesh pipeline, and the title's blend, rasterizer, depth-stencil, flags and
+/// view instancing could only make the driver refuse a pipeline that draws nothing (blending an
+/// integer target, conservative rasterisation or depth bounds the GPU does not have).
+fn mesh_standin_stream(subs: &[(u32, &[u8])], ms: &[u8], ps: &[u8]) -> StreamOut {
+    let mut out = StreamOut::default();
+    // ROOT_SIGNATURE, SAMPLE_MASK, RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT, SAMPLE_DESC, NODE_MASK
+    for ty in [0u32, 9, 15, 16, 17, 18] {
+        let Some((_, payload)) = subs.iter().find(|s| s.0 == ty) else { continue };
+        let Some((psize, palign)) = super::null::subobject_payload(ty) else { continue };
+        if payload.len() < psize {
+            continue;
+        }
+        let mut p = payload[..psize].to_vec();
+        if ty == 15 || ty == 16 {
+            for k in 0..if ty == 15 { 8 } else { 1 } {
+                let f = super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()));
+                p[4 * k..4 * k + 4].copy_from_slice(&f.to_le_bytes());
+            }
+        }
+        out.raw(ty, &p, palign == 8);
+    }
+    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
+    if has_shader(subs, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps);
+    }
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+    out
+}
+
+/// The first `ty` subobject of `subs` holds a shader (pointer and length; a null one is none).
+fn has_shader(subs: &[(u32, &[u8])], ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) -> bool {
+    subs.iter().find(|s| s.0 == ty.0 as u32).is_some_and(|s| s.1.len() >= 16 && s.1[0..8] != [0; 8] && s.1[8..16] != [0; 8])
+}
+
+#[cfg(test)]
+mod mesh_standin;
+
+/// Rewrite a pipeline state stream with stand-in shaders (a mesh pipeline's: `mesh_standin_stream`).
+/// None if not possible.
 unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     let size = *(desc as *const usize);
     let base = *(desc.add(8) as *const usize);
@@ -6179,6 +6223,15 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
         (mesh, rt_count, rt_formats)
     };
     let dm = if mesh { Some(dummy_mesh()?) } else { None };
+    if let Some((ms, ps)) = dm {
+        let subs = stream_subobjects(&buf)?;
+        // (a null MS slot keeps the rewrite below, as before)
+        if has_shader(&subs, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) {
+            let out = mesh_standin_stream(&subs, ms, ps).0;
+            let n = out.len();
+            return Some((out, [n, 0]));
+        }
+    }
     let mut off = 0usize;
     while off + 8 <= size {
         let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
