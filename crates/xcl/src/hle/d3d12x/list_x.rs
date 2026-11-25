@@ -52,7 +52,7 @@ const PC_QUEUE_EXECUTE_COMMAND_LISTS: usize = 10;
 /// written is a GPU / system timestamp
 const BOTTOM_TIMESTAMPS: u32 = 0x3;
 const TOP_TIMESTAMPS: u32 = 0xC;
-/// fills larger than this are not done (one pattern buffer per value, up to this size)
+/// fills larger than this are not done
 const MAX_FILL: u64 = 256 << 20;
 /// Bounded wait timeout for Wait32BitValueX / Wait64BitValueX so an unsatisfied wait never hangs.
 /// Overridable via `XCL_WAIT_TIMEOUT_MS` for diagnostics.
@@ -2324,53 +2324,19 @@ unsafe fn device_of(list: *mut c_void) -> Option<ID3D12Device> {
     dev
 }
 
-/// upload buffers holding a repeated 16-byte pattern: (pattern, buffer, bytes)
-static PATTERNS: Mutex<Vec<([u8; 16], ID3D12Resource, u64)>> = Mutex::new(Vec::new());
+/// bytes of the pattern a fill copies from, in the list's upload memory (half an arena block,
+/// so it comes from the list's arena)
+const FILL_CHUNK: u64 = (crate::gpu::uma::ARENA_BLOCK / 2) as u64;
 
-/// A buffer of at least `n` bytes repeating `pat` (the device's upload heap).
-unsafe fn pattern_buffer(list: *mut c_void, pat: [u8; 16], n: u64) -> Option<usize> {
-    let mut cache = PATTERNS.lock().unwrap();
-    if let Some((_, b, _)) = cache.iter().find(|(p, _, len)| *p == pat && *len >= n) {
-        return Some(b.as_raw() as usize);
-    }
-    // a larger one replaces an older pattern buffer only when nothing may still read it: kept
-    if cache.len() >= 32 {
-        return None;
-    }
-    let dev = device_of(list)?;
-    let len = n.next_power_of_two().max(0x1_0000);
-    let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: len,
-        Height: 1,
-        DepthOrArraySize: 1,
-        MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        ..Default::default()
-    };
-    let mut b: Option<ID3D12Resource> = None;
-    dev.CreateCommittedResource(
-        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
-        D3D12_HEAP_FLAG_NONE,
-        &desc,
-        D3D12_RESOURCE_STATE_GENERIC_READ,
-        None,
-        &mut b,
-    )
-    .ok()?;
-    let b = b?;
-    let mut p: *mut c_void = std::ptr::null_mut();
-    b.Map(0, None, Some(&mut p)).ok()?;
-    for chunk in std::slice::from_raw_parts_mut(p as *mut u8, len as usize).chunks_exact_mut(16) {
-        chunk.copy_from_slice(&pat);
-    }
-    b.Unmap(0, None);
-    let raw = b.as_raw() as usize;
-    cache.push((pat, b, len));
-    Some(raw)
+/// The copies of a fill of `size` bytes from a pattern of `chunk` bytes: (offset, bytes).
+fn fill_copies(size: u64, chunk: u64) -> impl Iterator<Item = (u64, u64)> {
+    (0..size).step_by(chunk.max(1) as usize).map(move |off| (off, chunk.min(size - off)))
 }
 
+/// A fill: the pattern is written by the CPU into the list's own upload memory (kept until the
+/// list's allocator is reset, so until the GPU is done with it) and copied over the destination
+/// a chunk at a time. (A pattern buffer per value and size, kept for good, took up to 256 MiB
+/// of upload memory each, and after 32 of them every fill of a new value was dropped.)
 unsafe fn fill(list: *mut c_void, va: u64, size: u64, pat: [u8; 16], unit: u64, what: &str) {
     static N: AtomicU64 = AtomicU64::new(0);
     if size == 0 || !size.is_multiple_of(unit) || size > MAX_FILL {
@@ -2379,11 +2345,29 @@ unsafe fn fill(list: *mut c_void, va: u64, size: u64, pat: [u8; 16], unit: u64, 
     let Some((d, off)) = real::uma_window_buffer(va as usize, size as usize) else {
         return warn(&N, what, format_args!("{va:#x} ({size:#x} bytes) is not in unified memory"));
     };
-    let Some(src) = pattern_buffer(list, pat, size) else {
-        return warn(&N, what, format_args!("no pattern buffer for {pat:x?}"));
+    let chunk = size.min(FILL_CHUNK);
+    let p = super::bind::allocate_upload_memory(list, chunk as usize, 16);
+    let Some((s, soff)) = (!p.is_null()).then(|| real::uma_window_buffer(p as usize, chunk as usize)).flatten() else {
+        return warn(&N, what, format_args!("no upload memory for the pattern {pat:x?}"));
     };
+    // the chunk is a multiple of the unit, and 16 is one of the pattern's periods
+    for (i, b) in std::slice::from_raw_parts_mut(p, chunk as usize).iter_mut().enumerate() {
+        *b = pat[i % 16];
+    }
     note_write(list as usize, va, size);
-    as_copy_dest(list, d, || copy_buffer_region(list, d, off, src, 0, size));
+    let copies = || {
+        for (o, n) in fill_copies(size, chunk) {
+            copy_buffer_region(list, d, off + o, s, soff, n);
+        }
+    };
+    if d == s {
+        // one window: the buffer is the source and the destination (the ranges do not overlap)
+        as_copy_dest(list, d, copies);
+        return;
+    }
+    transition(list, s, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    as_copy_dest(list, d, copies);
+    transition(list, s, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
 }
 
 fn pattern(bytes: &[u8]) -> [u8; 16] {
@@ -4641,6 +4625,25 @@ mod tests {
     fn fill_patterns_repeat_the_value() {
         assert_eq!(pattern(&0x1122_3344u32.to_le_bytes())[..8], [0x44, 0x33, 0x22, 0x11, 0x44, 0x33, 0x22, 0x11]);
         assert_eq!(pattern(&[7u8; 16]), [7u8; 16]);
+    }
+
+    /// A fill is copied a chunk at a time over exactly its bytes, the last chunk shorter.
+    #[test]
+    fn fill_copies_cover_the_range_once() {
+        assert_eq!(fill_copies(0x10, FILL_CHUNK).collect::<Vec<_>>(), [(0, 0x10)]);
+        assert_eq!(fill_copies(FILL_CHUNK, FILL_CHUNK).collect::<Vec<_>>(), [(0, FILL_CHUNK)]);
+        let size = 2 * FILL_CHUNK + 0x24;
+        assert_eq!(fill_copies(size, FILL_CHUNK).collect::<Vec<_>>(), [(0, FILL_CHUNK), (FILL_CHUNK, FILL_CHUNK), (2 * FILL_CHUNK, 0x24)]);
+        // every fill the title may ask for: whole multiples of the unit, no gaps, no overlaps
+        for size in [4, 8, 0x3C, 0x1_0000, FILL_CHUNK + 4, MAX_FILL] {
+            let mut next = 0;
+            for (o, n) in fill_copies(size, size.min(FILL_CHUNK)) {
+                assert_eq!(o, next);
+                assert!(n > 0 && n <= FILL_CHUNK && n % 4 == 0);
+                next = o + n;
+            }
+            assert_eq!(next, size);
+        }
     }
 
     #[test]
