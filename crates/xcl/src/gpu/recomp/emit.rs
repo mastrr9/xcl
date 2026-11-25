@@ -6539,12 +6539,14 @@ double sqrt_d(double x) {
     return ldexp_d(y, k);
 }
 // 1/x. DXC marks a plain divide fast (no NaN, no infinities), and a driver may then give 0 for
-// 1/NaN (RADV: v_rsq_f64 of a negative number was 0, not NaN). NaN, ±0 and ±inf are taken here.
-// The rest divides the mantissa (x scaled into [0.5, 1)), `precise`, and scales back with
-// ldexp_d, so a result below 2^-1022 is a denormal and not flushed to 0 (RADV: 1/DBL_MAX was 0).
+// 1/NaN (RADV: v_rsq_f64 of a negative number was 0, not NaN). NaN, ±0 and ±inf are taken here:
+// a NaN comes back quiet with its payload, as the hardware's divide returns it (a signalling
+// NaN gets the quiet bit). The rest divides the mantissa (x scaled into [0.5, 1)), `precise`,
+// and scales back with ldexp_d, so a result below 2^-1022 is a denormal and not flushed to 0
+// (RADV: 1/DBL_MAX was 0).
 double rcp_d(double x) {
     uint l, h; asuint(x, l, h);
-    if (isnan_d(x)) return x;
+    if (isnan_d(x)) return asdouble(l, h | 0x00080000u);
     if (x == 0.0) return asdouble(0u, (h & 0x80000000u) | 0x7FF00000u);
     if (isinf_d(x)) return asdouble(0u, h & 0x80000000u);
     int e = frexp_exp_d(x);
@@ -6606,7 +6608,21 @@ uint fclass64(double f) {
 
 #[cfg(test)]
 mod tests {
-    use super::PRELUDE_MEM;
+    use super::{PRELUDE, PRELUDE_MEM};
+
+    /// v_rcp_f64 / v_rsq_f64 (rcp_d) of a signalling NaN: the quiet NaN with the same payload,
+    /// as RDNA2's VALU and the direct DXIL path's divide return it, not the input's bits.
+    #[test]
+    fn rcp_d_quiets_a_nan_and_keeps_its_payload() {
+        assert!(PRELUDE.contains("if (isnan_d(x)) return asdouble(l, h | 0x00080000u);"), "rcp_d");
+        // the expression on the bits of the sNaN 0x7FF00000_00000001
+        let (l, h) = (1u32, 0x7FF0_0000u32);
+        let q = ((h | 0x0008_0000) as u64) << 32 | l as u64;
+        assert_eq!(q, 0x7FF8_0000_0000_0001);
+        assert!(f64::from_bits(q).is_nan());
+        // a quiet NaN is unchanged
+        assert_eq!(0x7FF8_0000u32 | 0x0008_0000, 0x7FF8_0000);
+    }
 
     #[test]
     fn format_helpers_select_uint4_components_without_runtime_indexing() {
