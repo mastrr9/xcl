@@ -344,6 +344,16 @@ struct Bindings {
     rect_list: bool,
 }
 
+/// Set once a list sets the console's rect list topology (`ia_set_topology_x`), never cleared:
+/// until then no draw is of a rect list, and a DrawInstanced does not look (`rect_lists_seen`).
+static RECT_LISTS_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// Whether any list has set the console's rect list topology so far: false, no draw is of a
+/// rect list (`bind::draw_rects` returns at once).
+pub(super) fn rect_lists_seen() -> bool {
+    RECT_LISTS_SEEN.load(Ordering::Acquire)
+}
+
 /// Whether `list` draws rect lists now, and the title's vertex buffers (slot, (address, bytes, stride)).
 pub(super) fn rect_list_state(list: *mut c_void) -> Option<Vec<(u32, (u64, u32, u32), Option<D3D12_VERTEX_BUFFER_VIEW>)>> {
     let g = LISTS.lock().unwrap();
@@ -515,6 +525,9 @@ pub(super) unsafe extern "system" fn ia_set_topology_x(this: *mut c_void, t: u32
         }
     }
     let rect = t == RECT_LIST;
+    if rect {
+        RECT_LISTS_SEEN.store(true, Ordering::Release);
+    }
     let t = if t == RECT_LIST { windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32 } else { t };
     with_bindings(this, |b| {
         b.topology = Some(t);

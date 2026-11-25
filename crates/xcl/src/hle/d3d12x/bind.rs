@@ -411,6 +411,12 @@ unsafe fn argument_order_buffer(list: &ID3D12GraphicsCommandList) -> Option<ID3D
 /// is kept (a packed colour), any other is taken as a float. Vertices a shader makes from the
 /// vertex index alone (no vertex buffer) are not expanded.
 unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) -> bool {
+    // no list has set the rect list topology: none of the lookups below at every DrawInstanced
+    if !super::list_x::rect_lists_seen() {
+        return false;
+    }
+    #[cfg(test)]
+    RECT_CHECKS.with(|n| n.set(n.get() + 1));
     if !cpu_rect_expansion(with(this, |s| s.pso)) {
         return false;
     }
@@ -460,6 +466,12 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
         crate::xlog_info!("D3D12.X: rect lists are drawn as two triangles a rectangle, the fourth corner made on the CPU");
     }
     true
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `draw_rects` calls on this thread that looked for a rect list (a test's own)
+    static RECT_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether a rect list drawn with the bound pipeline `pso` is expanded on the CPU (`draw_rects`):
@@ -1074,6 +1086,49 @@ mod tests {
         assert!(cpu_rect_expansion(without) && cpu_rect_expansion(0));
         real::forget_pso_for_test(with_gs);
         assert!(cpu_rect_expansion(with_gs));
+    }
+
+    /// Until a list sets the console's rect list topology, a DrawInstanced does not look for a
+    /// rect list (before: the list's pipeline, its rect list GS and the table of all lists, each
+    /// under a global lock, at every DrawInstanced); once one has, each does, and finds the rect
+    /// list of a list that draws them.
+    #[test]
+    fn draw_instanced_looks_for_rect_lists_once_a_list_set_them() {
+        unsafe extern "system" fn refs(_this: *mut c_void) -> u32 {
+            1
+        }
+        unsafe extern "system" fn set_topology(_this: *mut c_void, _t: u32) {}
+        // a PC list as `real` adopts one: the original vtable before the one the object points at
+        let mut orig_vt = Box::new([0usize; 64]);
+        orig_vt[1] = refs as usize;
+        orig_vt[2] = refs as usize;
+        orig_vt[20] = set_topology as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt[..]);
+        let object = Box::new(unsafe { ext_vt.as_ptr().add(1) } as usize);
+        let this = &*object as *const usize as *mut c_void;
+        let list = unsafe { ID3D12GraphicsCommandList::from_raw_borrowed(&this) }.expect("list");
+        let checks = || RECT_CHECKS.with(|n| n.get());
+        unsafe {
+            // (this test is the only one that sets the topology: false unless it ran before)
+            if !list_x::rect_lists_seen() {
+                let n = checks();
+                for _ in 0..100 {
+                    assert!(!draw_rects(this, list, 6, 1, 0, 0));
+                }
+                assert_eq!(checks(), n, "no rect list anywhere: no draw looks for one");
+            }
+            list_x::ia_set_topology_x(this, list_x::RECT_LIST);
+            assert!(list_x::rect_lists_seen());
+            assert!(list_x::rect_list_state(this).is_some_and(|v| v.is_empty()), "the list draws rect lists");
+            let n = checks();
+            // no vertex buffer: not expanded, drawn as before
+            assert!(!draw_rects(this, list, 6, 1, 0, 0));
+            assert_eq!(checks(), n + 1);
+        }
+        list_x::on_release(this as usize);
+        forget(this);
     }
 
     /// An ExecuteIndirect whose bound pipeline is still being built is skipped (its stand-in
