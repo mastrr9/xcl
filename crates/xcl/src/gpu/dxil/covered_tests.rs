@@ -9,10 +9,12 @@
 //! backends' compute pass and the pass-through mesh shader.
 //!
 //! Candidates are programs for the next classes to flip (transcendental, valu64, cross-lane,
-//! barrier), each with its RDNA2 reference. The GPU test runs them the same way and prints one
-//! verdict line per class and form, without failing: they are the evidence a flip needs.
+//! barrier, the LDS, buffer and global atomics), each with its RDNA2 reference. The GPU test
+//! runs them the same way and prints one verdict line per program and form, without failing:
+//! they are the evidence a flip needs. Where the lanes' order decides a value (what a returning
+//! atomic gives back), the reference is a property every order has, not one order's words.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::cfg::{Cfg, Term};
 use super::covered;
@@ -242,11 +244,14 @@ fn cases(wave64: bool) -> Vec<Case> {
 
 /// A program for a class outside the covered set, run for evidence only. A `near` word is an
 /// f32 result RDNA2 documents to 1 ulp: it passes within 1 ulp of its exact value (an f64), or
-/// as any NaN where that value is NaN; every other word must match `want` exactly.
+/// as any NaN where that value is NaN; the words of a `Race` pass its own check; every other
+/// word must match `want` exactly. `names` label word ranges (start, end, name) for the verdict.
 struct Candidate {
     class: &'static str,
     case: Case,
     near: Vec<(usize, f64)>,
+    races: Vec<Race>,
+    names: Vec<(usize, usize, String)>,
 }
 
 impl Candidate {
@@ -257,11 +262,14 @@ impl Candidate {
         }
     }
 
-    /// "OK", or how many words differ and the first, as its index from BASE.
+    /// "OK", or how many words differ and the first, as its index from BASE (and its name),
+    /// and each race no order of the lanes explains.
     fn verdict(&self, out: &[u32], hlsl: bool) -> String {
-        let bad: Vec<usize> = (0..self.case.want.len()).filter(|&k| !self.passes(k, out[k])).collect();
-        let Some(&k) = bad.first() else { return "OK".into() };
-        if hlsl && bad.iter().all(|b| self.case.contracted.contains(b)) {
+        let raced: BTreeSet<usize> = self.races.iter().flat_map(Race::words).collect();
+        let mut fails: Vec<String> = self.races.iter().filter_map(|r| r.check(out).err()).collect();
+        let bad: Vec<usize> = (0..self.case.want.len()).filter(|&k| !raced.contains(&k) && !self.passes(k, out[k])).collect();
+        let Some(&k) = bad.first() else { return listed(fails) };
+        if hlsl && fails.is_empty() && bad.iter().all(|b| self.case.contracted.contains(b)) {
             return format!("differs only by a fused mul + add ({} word(s))", bad.len());
         }
         let want = match self.near.iter().find(|n| n.0 == k) {
@@ -269,7 +277,18 @@ impl Candidate {
             Some(&(_, e)) => format!("{e:e} within 1 ulp"),
             None => format!("{:#010x}", self.case.want[k]),
         };
-        format!("differs ({} word(s), first [{}]: got {:#010x}, want {want})", bad.len(), k - word(0), out[k])
+        let name = self.names.iter().find(|n| (n.0..n.1).contains(&k)).map_or(String::new(), |n| format!(" {}[{}]", n.2, k - n.0));
+        fails.insert(0, format!("differs ({} word(s), first [{}]{name}: got {:#010x}, want {want})", bad.len(), k - word(0), out[k]));
+        listed(fails)
+    }
+}
+
+/// "OK", or the first three failures and how many more.
+fn listed(fails: Vec<String>) -> String {
+    match fails.len() {
+        0 => "OK".into(),
+        1..=3 => fails.join("; "),
+        n => format!("{}; and {} more", fails[..3].join("; "), n - 3),
     }
 }
 
@@ -356,7 +375,7 @@ fn transcendental_ops() -> Candidate {
             }
         }
     }
-    Candidate { class: "transcendental", case: Case { name: "transcendental", code, mem, want, contracted: Vec::new() }, near }
+    Candidate { class: "transcendental", case: Case { name: "transcendental", code, mem, want, contracted: Vec::new() }, near, races: Vec::new(), names: Vec::new() }
 }
 
 /// Lane t's 64-bit inputs: k 0..2 are normal f64 values (2^-30 to 2^30, both signs), k = 3 an
@@ -426,7 +445,7 @@ fn valu64() -> Candidate {
             contracted.extend([at(7, t), at(7, t) + 1]);
         }
     }
-    Candidate { class: "valu64", case: Case { name: "valu64", code, mem, want, contracted }, near: Vec::new() }
+    Candidate { class: "valu64", case: Case { name: "valu64", code, mem, want, contracted }, near: Vec::new(), races: Vec::new(), names: Vec::new() }
 }
 
 /// cross-lane, for a wave of 32 or 64 lanes: v_readfirstlane (all lanes, then odd lanes only),
@@ -489,7 +508,7 @@ fn cross_lane(wave64: bool) -> Candidate {
             want[word(64 * (k + 1) + t as usize)] = v;
         }
     }
-    Candidate { class: "cross-lane", case: Case { name: "cross-lane", code, mem, want, contracted: Vec::new() }, near: Vec::new() }
+    Candidate { class: "cross-lane", case: Case { name: "cross-lane", code, mem, want, contracted: Vec::new() }, near: Vec::new(), races: Vec::new(), names: Vec::new() }
 }
 
 /// barrier: each thread writes its word to LDS, s_barrier, reads thread 63 - t's (the other
@@ -526,11 +545,360 @@ fn barrier() -> Candidate {
         want[word(64 + t as usize)] = input(63 - t);
         want[word(128 + t as usize)] = input(63 - u).wrapping_add(u);
     }
-    Candidate { class: "barrier", case: Case { name: "barrier", code, mem, want, contracted: Vec::new() }, near: Vec::new() }
+    Candidate { class: "barrier", case: Case { name: "barrier", code, mem, want, contracted: Vec::new() }, near: Vec::new(), races: Vec::new(), names: Vec::new() }
+}
+
+/// The words of a returning atomic all lanes of a group ran on one word: each lane's (word it
+/// got back, data, compare) and the words that hold the final value (one, or each lane's copy
+/// for LDS). They pass when some order of the lanes explains them all (`serial`).
+struct Race {
+    what: String,
+    op: &'static str,
+    wide: bool,
+    init: u64,
+    lanes: Vec<(usize, u64, u64)>,
+    finals: Vec<usize>,
+}
+
+impl Race {
+    fn words(&self) -> Vec<usize> {
+        self.lanes.iter().map(|l| l.0).chain(self.finals.iter().copied()).flat_map(|k| k..k + 1 + self.wide as usize).collect()
+    }
+
+    fn check(&self, out: &[u32]) -> Result<(), String> {
+        let rd = |k: usize| if self.wide { out[k] as u64 | (out[k + 1] as u64) << 32 } else { out[k] as u64 };
+        let last = rd(self.finals[0]);
+        if let Some(&k) = self.finals.iter().find(|&&k| rd(k) != last) {
+            return Err(format!("{}: lanes read different final words ({last:#x}, {:#x})", self.what, rd(k)));
+        }
+        let edges: Vec<(u64, u64)> = self.lanes.iter().map(|&(k, d, c)| (rd(k), rmw(self.op, self.wide, rd(k), d, c))).collect();
+        serial(self.init, last, &edges).map_err(|e| format!("{}: {e}", self.what))
+    }
+}
+
+/// Whether some order of the lanes explains what each got back and the final word `last`, from
+/// `init`: lane i read `edges[i].0` and wrote `edges[i].1`. Such an order is a path from `init`
+/// to `last` taking each lane once (an Euler path). It exists exactly when every value is read
+/// (got back, or left as the final word) as often as it is written (by a lane, or as `init`),
+/// and every lane's values connect to `init`.
+fn serial(init: u64, last: u64, edges: &[(u64, u64)]) -> Result<(), String> {
+    let all: Vec<(u64, u64)> = edges.iter().copied().chain([(last, init)]).collect();
+    let mut count: BTreeMap<u64, (usize, usize)> = BTreeMap::new();
+    for &(r, w) in &all {
+        count.entry(r).or_default().0 += 1;
+        count.entry(w).or_default().1 += 1;
+    }
+    if let Some((v, (r, w))) = count.iter().find(|c| c.1 .0 != c.1 .1) {
+        return Err(format!("{v:#x} is read {r} time(s) but written {w} time(s)"));
+    }
+    let mut reach = BTreeSet::from([init]);
+    while let Some(&(r, w)) = all.iter().find(|e| reach.contains(&e.0) != reach.contains(&e.1)) {
+        reach.extend([r, w]);
+    }
+    match edges.iter().find(|e| !reach.contains(&e.0)) {
+        Some(&(r, _)) => Err(format!("{r:#x} is read in a loop of lanes no order from {init:#x} reaches")),
+        None => Ok(()),
+    }
+}
+
+/// RDNA2's new value of an atomic `op` on `old`, with the lane's `data` (and `cmp` for
+/// cmpswap), in 32 bits, or 64 with `wide`. inc and dec wrap at `data`.
+fn rmw(op: &str, wide: bool, old: u64, data: u64, cmp: u64) -> u64 {
+    let s = |x: u64| if wide { x as i64 } else { x as u32 as i32 as i64 };
+    let v = match op {
+        "add" => old.wrapping_add(data),
+        "sub" => old.wrapping_sub(data),
+        "and" => old & data,
+        "or" => old | data,
+        "xor" => old ^ data,
+        "umin" => old.min(data),
+        "umax" => old.max(data),
+        "smin" if s(data) < s(old) => data,
+        "smax" if s(data) > s(old) => data,
+        "smin" | "smax" => old,
+        "inc" if old >= data => 0,
+        "inc" => old + 1,
+        "dec" if old == 0 || old > data => data,
+        "dec" => old - 1,
+        "swap" => data,
+        "cmpswap" if old == cmp => data,
+        "cmpswap" => old,
+        _ => unreachable!("{op}"),
+    };
+    if wide { v } else { v & 0xFFFF_FFFF }
+}
+
+/// Where an atomic candidate's atomics go.
+#[derive(Clone, Copy, PartialEq)]
+enum Where {
+    Lds,
+    Buffer,
+    Global,
+}
+
+/// `Shared`: every lane of a group (the 64 threads, or each 32-lane half in LDS) on one word,
+/// from `init`. `Own`: lane t on its own word, which holds `init` on every third lane and 0
+/// elsewhere. `Oob` (buffers): every lane past num_records, the odd ones just past it, the even
+/// ones by an offset whose sum with the instruction's wraps past 2^32 to the trap word.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Shared,
+    Own,
+    Oob,
+}
+
+/// One atomic of an atomic candidate: `op` as in buffer / global names, `ds` its DS name
+/// without DS_ and _RTN, whether it returns the old value (GLC / _RTN), and lane t's operands.
+#[derive(Clone, Copy)]
+struct Slot {
+    op: &'static str,
+    ds: &'static str,
+    kind: Kind,
+    rtn: bool,
+    init: u64,
+    data: fn(u32) -> u64,
+    cmp: fn(u32) -> u64,
+}
+
+/// The 32-bit atomics: each commutative op once with its result read back as the final word
+/// (exact), the returning ones as races; inc / dec share one wrap value so lane order cannot
+/// change them; swap and the cmpswap contest (one winner) are races too. The 64-bit ones: a
+/// +1 counter across the carry into the high word, and umax deciding on both halves.
+fn slots(wide: bool) -> Vec<Slot> {
+    use Kind::*;
+    let s = |op, ds, kind, rtn, init, data: fn(u32) -> u64, cmp: fn(u32) -> u64| Slot { op, ds, kind, rtn, init, data, cmp };
+    let n: fn(u32) -> u64 = |_| 0;
+    if wide {
+        return vec![
+            s("add", "ADD_U64", Shared, true, (1 << 32) - 20, |_| 1, n),
+            s("umax", "MAX_U64", Shared, false, 0, |t| (input(t) as u64) << 32 | input(t + 64) as u64, n),
+        ];
+    }
+    vec![
+        s("add", "ADD_U32", Shared, true, 0xFFFF_FFF0, |_| 1, n),
+        s("add", "ADD_U32", Shared, false, 0x1000, |t| input(t) as u64, n),
+        s("sub", "SUB_U32", Shared, true, 0, |t| (input(t) >> 4) as u64, n),
+        s("and", "AND_B32", Shared, false, 0xFFFF_FFFF, |t| !(1u32 << (t % 29)) as u64, n),
+        s("or", "OR_B32", Shared, true, 0, |t| 1 << (t % 32), n),
+        s("xor", "XOR_B32", Shared, false, 0x5A5A_5A5A, |t| input(t) as u64, n),
+        s("umin", "MIN_U32", Shared, true, 0xFFFF_FFFF, |t| input(t) as u64, n),
+        s("umax", "MAX_U32", Shared, false, 0, |t| input(t) as u64, n),
+        s("smin", "MIN_I32", Shared, false, 0x7FFF_FFFF, |t| input(t) as u64, n),
+        s("smax", "MAX_I32", Shared, true, 0x8000_0000, |t| input(t) as u64, n),
+        s("inc", "INC_U32", Shared, true, 7, |_| 20, n),
+        s("dec", "DEC_U32", Shared, false, 3, |_| 20, n),
+        s("swap", "WRXCHG_B32", Shared, true, 0xFFFF_0000, |t| 0x100 + t as u64, n),
+        s("cmpswap", "CMPST_B32", Shared, true, 5, |t| 0x200 + t as u64, |_| 5),
+        s("cmpswap", "CMPST_B32", Own, true, 0x55, |t| t as u64 + 1, n),
+        s("add", "ADD_U32", Oob, true, 0, |_| 1, n),
+    ]
+}
+
+/// Words per slot from BASE: lane t's data at DATA + t (2 t for 64-bit), its compare at CMP + t
+/// (an Oob slot's: its buffer offset), what it got back at RET, the final word it read (LDS) at
+/// FIN. Then the shared words (4 apart), the own words, the trap word and the word past the end.
+const BLOCK: usize = 448;
+const DATA: usize = 0;
+const CMP: usize = 128;
+const RET: usize = 192;
+const FIN: usize = 320;
+const LDS_OWN: u64 = 512;
+
+impl Asm {
+    /// v12:v13 = BASE + 4 k + lane t's 4 t (or 8 t with `wide`, v9).
+    fn lane_at(&mut self, k: usize, wide: bool) -> &mut Self {
+        self.op("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 12), ("SRC0", 255), ("VSRC1", if wide { 9 } else { 1 })], Some(BASE + 4 * k as u32))
+            .op("V_MOV_B32", "ENC_VOP1", &[("VDST", 13), ("SRC0", 128)], None)
+    }
+
+    fn global(&mut self, name: &str, v: u64, k: usize, wide: bool) -> &mut Self {
+        let reg = if name.contains("LOAD") { "VDST" } else { "DATA" };
+        self.lane_at(k, wide).op(name, "ENC_FLAT_GLBL", &[(reg, v), ("ADDR", 12), ("SADDR", 0x7D)], None)
+    }
+}
+
+/// An atomic candidate: the 32-bit (or 64-bit, `wide`) slots on LDS, a raw buffer or global
+/// memory, each lane's operands loaded from memory, what it got back stored. LDS words are set
+/// first by the wave that uses them (a group per 32-lane half, so no barrier is needed in
+/// wave32), and read back at the end. The reference applies the lanes in `order`; the races and
+/// the exact words hold for every order.
+fn atomics(at: Where, wide: bool, order: &[u32]) -> Candidate {
+    let slots: Vec<Slot> = slots(wide).into_iter().filter(|s| s.kind != Kind::Oob || at == Where::Buffer).collect();
+    let (w, n) = (1 + wide as usize, slots.len());
+    let (cells, own, trap, end) = (BLOCK * n, BLOCK * n + 64, BLOCK * n + 128, BLOCK * n + 132);
+    let wait = ("S_WAITCNT", "ENC_SOPP", [("SIMM16", 0u64)]);
+    let (load, store) = if wide { ("GLOBAL_LOAD_DWORDX2", "GLOBAL_STORE_DWORDX2") } else { ("GLOBAL_LOAD_DWORD", "GLOBAL_STORE_DWORD") };
+    let mut a = Asm(Vec::new());
+    a.lane_address().op("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 131), ("VSRC1", 0)], None);
+    if at == Where::Lds {
+        // v28 = 8 (t >> 5): each half's words, 16 bytes per slot
+        a.op("V_LSHRREV_B32", "ENC_VOP2", &[("VDST", 28), ("SRC0", 133), ("VSRC1", 0)], None)
+            .op("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 28), ("SRC0", 131), ("VSRC1", 28)], None);
+        for (j, s) in slots.iter().enumerate() {
+            if s.kind == Kind::Own {
+                a.global("GLOBAL_LOAD_DWORD", 26, own, false).op(wait.0, wait.1, &wait.2, None);
+                a.op("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 26), ("OFFSET0", LDS_OWN & 0xFF), ("OFFSET1", LDS_OWN >> 8)], None);
+                continue;
+            }
+            a.op("V_MOV_B32", "ENC_VOP1", &[("VDST", 26), ("SRC0", 255)], Some(s.init as u32));
+            if wide {
+                a.op("V_MOV_B32", "ENC_VOP1", &[("VDST", 27), ("SRC0", 255)], Some((s.init >> 32) as u32));
+            }
+            a.op(if wide { "DS_WRITE_B64" } else { "DS_WRITE_B32" }, "ENC_DS", &[("ADDR", 28), ("DATA0", 26), ("OFFSET0", 16 * j as u64)], None);
+        }
+        a.op(wait.0, wait.1, &wait.2, None);
+    }
+    // a buffer's offsets: from the shared words (a raw V# there, OOB_SELECT 3, num_records up
+    // to the word past the end); global addresses: from 0
+    let byte = |k: usize| if at == Where::Buffer { 4 * (k - cells) as u32 } else { BASE + 4 * k as u32 };
+    let oob = byte(trap) as u64 + 8;
+    if at == Where::Buffer {
+        a.op("S_ADD_U32", "ENC_SOP2", &[("SDST", 12), ("SSRC0", 0), ("SSRC1", 255)], Some(4 * cells as u32))
+            .op("S_MOV_B32", "ENC_SOP1", &[("SDST", 13), ("SSRC0", 128)], None)
+            .op("S_MOV_B32", "ENC_SOP1", &[("SDST", 14), ("SSRC0", 255)], Some(byte(end)))
+            .op("S_MOV_B32", "ENC_SOP1", &[("SDST", 15), ("SSRC0", 255)], Some(3 << 28));
+    }
+    for (j, s) in slots.iter().enumerate() {
+        let b = BLOCK * j;
+        a.global(load, 20, b + DATA, wide);
+        // the compare value, or an Oob slot's offset
+        for (on, v) in [(s.op == "cmpswap", 21), (s.kind == Kind::Oob, 24)] {
+            if on {
+                a.global("GLOBAL_LOAD_DWORD", v, b + CMP, false);
+            }
+        }
+        a.op(wait.0, wait.1, &wait.2, None);
+        let x2 = if wide { "_X2" } else { "" };
+        let up = s.op.to_uppercase();
+        match (at, s.kind) {
+            (Where::Lds, _) => {
+                let (name, ty) = s.ds.rsplit_once('_').unwrap();
+                let name = format!("DS_{name}{}_{ty}", if s.rtn { "_RTN" } else { "" });
+                let (addr, off) = if s.kind == Kind::Own { (1, LDS_OWN) } else { (28, 16 * j as u64) };
+                let (d0, d1) = if s.op == "cmpswap" { (21, 20) } else { (20, 0) };
+                a.op(&name, "ENC_DS", &[("ADDR", addr), ("DATA0", d0), ("DATA1", d1), ("VDST", 22), ("OFFSET0", off & 0xFF), ("OFFSET1", off >> 8)], None);
+            }
+            (_, Kind::Oob) => {}
+            (_, Kind::Shared) => {
+                a.op("V_MOV_B32", "ENC_VOP1", &[("VDST", 24), ("SRC0", 255)], Some(byte(cells + 4 * j)));
+            }
+            (_, Kind::Own) => {
+                a.op("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 24), ("SRC0", 255), ("VSRC1", 1)], Some(byte(own)));
+            }
+        }
+        if at == Where::Global {
+            a.op("V_MOV_B32", "ENC_VOP1", &[("VDST", 25), ("SRC0", 128)], None)
+                .op(&format!("GLOBAL_ATOMIC_{up}{x2}"), "ENC_FLAT_GLBL", &[("ADDR", 24), ("DATA", 20), ("VDST", 22), ("SADDR", 0x7D), ("GLC", s.rtn as u64)], None);
+        }
+        if at == Where::Buffer {
+            let off = if s.kind == Kind::Oob { oob } else { 0 };
+            a.op(&format!("BUFFER_ATOMIC_{up}{x2}"), "ENC_MUBUF", &[("VDATA", 20), ("VADDR", 24), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1), ("OFFSET", off), ("GLC", s.rtn as u64)], None);
+        }
+        if s.rtn {
+            // a buffer atomic returns into its data registers
+            a.op(wait.0, wait.1, &wait.2, None).global(store, if at == Where::Buffer { 20 } else { 22 }, b + RET, wide);
+        }
+    }
+    if at == Where::Lds {
+        a.op(wait.0, wait.1, &wait.2, None);
+        for (j, s) in slots.iter().enumerate() {
+            let (addr, off, read) = match s.kind {
+                Kind::Own => (1, LDS_OWN, "DS_READ_B32"),
+                _ => (28, 16 * j as u64, if wide { "DS_READ_B64" } else { "DS_READ_B32" }),
+            };
+            a.op(read, "ENC_DS", &[("VDST", 22), ("ADDR", addr), ("OFFSET0", off & 0xFF), ("OFFSET1", off >> 8)], None)
+                .op(wait.0, wait.1, &wait.2, None)
+                .global(store, 22, BLOCK * j + FIN, wide);
+        }
+    }
+    let code = a.end();
+
+    let mut mem = vec![0u32; word(end + 1)];
+    let put = |m: &mut [u32], k: usize, v: u64| {
+        m[word(k)] = v as u32;
+        if wide {
+            m[word(k) + 1] = (v >> 32) as u32;
+        }
+    };
+    let own_init = |s: &Slot, t: u32| if t.is_multiple_of(3) { s.init } else { 0 };
+    for (j, s) in slots.iter().enumerate() {
+        for t in 0..THREADS {
+            put(&mut mem, BLOCK * j + DATA + w * t as usize, (s.data)(t));
+            mem[word(BLOCK * j + CMP + t as usize)] = match s.kind {
+                Kind::Oob if t.is_multiple_of(2) => byte(trap).wrapping_sub(oob as u32),
+                Kind::Oob => byte(end) - oob as u32,
+                _ => (s.cmp)(t) as u32,
+            };
+            if s.kind == Kind::Own {
+                mem[word(own + t as usize)] = own_init(s, t) as u32;
+            }
+        }
+        if s.kind == Kind::Shared && at != Where::Lds {
+            put(&mut mem, cells + 4 * j, s.init);
+        }
+    }
+    let mut want = mem.clone();
+    let (mut races, mut names) = (Vec::new(), Vec::new());
+    let groups: Vec<Vec<u32>> = match at {
+        Where::Lds => vec![order.iter().copied().filter(|&t| t < 32).collect(), order.iter().copied().filter(|&t| t >= 32).collect()],
+        _ => vec![order.to_vec()],
+    };
+    for (j, s) in slots.iter().enumerate() {
+        let b = BLOCK * j;
+        let label = format!("{j}:{}{}{}", s.op, if wide { "64" } else { "" }, match s.kind {
+            Kind::Shared if s.rtn => " rtn",
+            Kind::Shared => "",
+            Kind::Own => " own",
+            Kind::Oob => " oob",
+        });
+        names.push((word(b + RET), word(b + RET + 64 * w), format!("{label} ret")));
+        names.push((word(b + FIN), word(b + FIN + 64 * w), format!("{label} fin")));
+        names.push((word(cells + 4 * j), word(cells + 4 * j + w), format!("{label} word")));
+        match s.kind {
+            Kind::Shared => {
+                for g in &groups {
+                    let mut v = s.init;
+                    for &t in g {
+                        if s.rtn {
+                            put(&mut want, b + RET + w * t as usize, v);
+                        }
+                        v = rmw(s.op, wide, v, (s.data)(t), (s.cmp)(t));
+                    }
+                    let finals: Vec<usize> = if at == Where::Lds { g.iter().map(|&t| b + FIN + w * t as usize).collect() } else { vec![cells + 4 * j] };
+                    finals.iter().for_each(|&k| put(&mut want, k, v));
+                    if s.rtn {
+                        let half = if at == Where::Lds { format!(" (lanes {}-{})", g.iter().min().unwrap(), g.iter().max().unwrap()) } else { String::new() };
+                        let lanes = g.iter().map(|&t| (word(b + RET + w * t as usize), (s.data)(t), (s.cmp)(t))).collect();
+                        let finals = finals.into_iter().map(word).collect();
+                        races.push(Race { what: format!("{label} returns{half}"), op: s.op, wide, init: s.init, lanes, finals });
+                    }
+                }
+            }
+            Kind::Own => {
+                for t in 0..THREADS {
+                    let old = own_init(s, t);
+                    let new = rmw(s.op, false, old, (s.data)(t), (s.cmp)(t)) as u32;
+                    want[word(b + RET + t as usize)] = old as u32;
+                    want[word(if at == Where::Lds { b + FIN } else { own } + t as usize)] = new;
+                }
+            }
+            // out of range: nothing written, 0 back
+            Kind::Oob => {}
+        }
+    }
+    names.extend([(word(own), word(own + 64), "own words".into()), (word(trap), word(trap + 1), "oob trap".into()), (word(end), word(end + 1), "oob past end".into())]);
+    let class = ["lds-atomic", "buffer-atomic", "global-atomic"][at as usize];
+    let name = ["lds-atomic", "buffer-atomic", "global-atomic", "lds-atomic64", "buffer-atomic64", "global-atomic64"][at as usize + 3 * w - 3];
+    Candidate { class, case: Case { name, code, mem, want, contracted: Vec::new() }, near: Vec::new(), races, names }
 }
 
 fn candidates(wave64: bool) -> Vec<Candidate> {
-    vec![transcendental_ops(), valu64(), cross_lane(wave64), barrier()]
+    let mut all = vec![transcendental_ops(), valu64(), cross_lane(wave64), barrier()];
+    let order: Vec<u32> = (0..THREADS).collect();
+    for at in [Where::Lds, Where::Buffer, Where::Global] {
+        all.extend([atomics(at, false, &order), atomics(at, true, &order)]);
+    }
+    all
 }
 
 /// The classes `covered::check` looks at in `code`.
@@ -725,6 +1093,48 @@ fn candidate_references_have_their_cases() {
     assert!((0..THREADS).all(|t| b.case.want[word(64 + t as usize)] == input(63 - t) && (63 - t) / 32 != t / 32));
 }
 
+/// The atomic candidates' references hold for any lane order: what another order leaves passes
+/// the verdict of the one built in lane order (other returns, the same verdict), and a broken
+/// atomic fails with the property it breaks.
+#[test]
+fn atomic_references_hold_in_any_lane_order() {
+    let id: Vec<u32> = (0..THREADS).collect();
+    let orders: [Vec<u32>; 2] = [(0..THREADS).rev().collect(), (0..THREADS).map(|t| t * 37 % THREADS).collect()];
+    for at in [Where::Lds, Where::Buffer, Where::Global] {
+        for wide in [false, true] {
+            let c = atomics(at, wide, &id);
+            assert_eq!(c.verdict(&c.case.want, false), "OK", "{}", c.case.name);
+            assert!(!c.races.is_empty() && c.case.want != c.case.mem, "{}", c.case.name);
+            for o in &orders {
+                let other = atomics(at, wide, o);
+                assert_ne!(other.case.want, c.case.want, "{}: no word depends on the order", c.case.name);
+                assert_eq!(c.verdict(&other.case.want, false), "OK", "{} in another order", c.case.name);
+            }
+        }
+    }
+    let c = atomics(Where::Buffer, false, &id);
+    let cells = BLOCK * 16;
+    let ret = |j: usize, t: usize| word(BLOCK * j + RET + t);
+    let fail = |edit: &dyn Fn(&mut Vec<u32>)| {
+        let mut out = c.case.want.clone();
+        edit(&mut out);
+        c.verdict(&out, false)
+    };
+    // the +1 counter gives one value back twice (a lost update)
+    assert_eq!(fail(&|o| o[ret(0, 1)] = o[ret(0, 0)]), "0:add rtn returns: 0xfffffff0 is read 2 time(s) but written 1 time(s)");
+    // two lanes win the cmpswap contest
+    let two = fail(&|o| o[ret(13, 1)] = 5);
+    assert!(two.starts_with("13:cmpswap rtn returns: 0x5 is read 2 time(s) but written 1 time(s)"), "{two}");
+    // lane 3 gets its own swap value back, lane 4 the one lane 3 got: balanced, but a loop
+    let swap = fail(&|o| (o[ret(12, 3)], o[ret(12, 4)]) = (0x103, 0x102));
+    assert_eq!(swap, "12:swap rtn returns: 0x103 is read in a loop of lanes no order from 0xffff0000 reaches");
+    // a final word one off, and the trap word a wrapped offset reaches
+    let off = fail(&|o| o[word(cells + 4)] += 1);
+    assert!(off.starts_with("differs (1 word(s), first [") && off.contains(" 1:add word[0]: got "), "{off}");
+    let trap = fail(&|o| o[word(cells + 128)] = 32);
+    assert!(trap.contains(" oob trap[0]: got 0x00000020, want 0x00000000"), "{trap}");
+}
+
 #[test]
 fn every_program_translates_directly() {
     for (wave64, split) in [(false, false), (true, false), (true, true)] {
@@ -907,7 +1317,7 @@ fn gpu_covered_programs_match_rdna2_on_both_backends() {
                 Ok(out) => c.verdict(&out, hlsl),
                 Err(e) => e,
             };
-            println!("candidate {} ({form}): direct {} ; hlsl {}", c.class, run(direct, false), run(hlsl, true));
+            println!("candidate {} ({form}): direct {} ; hlsl {}", c.case.name, run(direct, false), run(hlsl, true));
         }
     }
     assert!(wrong.is_empty(), "outside RDNA2's results:\n{}", wrong.join("\n"));
