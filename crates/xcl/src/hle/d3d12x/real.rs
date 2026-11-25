@@ -4275,7 +4275,8 @@ fn pso_trace() -> bool {
 fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
     let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let _slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
+    // (a cold one of a title thread is in flight for the others too, without a turn)
+    let admitted = (gate && bytes >= huge_pso_bytes()).then(|| big_compile_admission(bytes, huge));
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -4284,10 +4285,15 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
         let record = record.map_or_else(String::new, |(hash, cached)| {
             format!(", record {hash:016x}, driver blob {}", if cached { "supplied" } else { "absent" })
         });
-        crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{record}");
+        let in_flight = admitted.as_ref().map_or_else(String::new, |_| {
+            let (headroom, compiles) = COMMIT_IN_FLIGHT.in_flight();
+            format!(", {compiles} huge in flight with {} MB of headroom", headroom >> 20)
+        });
+        crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{record}{in_flight}");
     }
     let started = std::time::Instant::now();
     let r = build();
+    drop(admitted);
     let took = started.elapsed();
     if log {
         crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_pso_bytes(), huge, waited));
@@ -4337,15 +4343,154 @@ fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wante
 /// (#1269), and programs of ~1 MB took several GB each on an 8 GB card (same issue). The floor
 /// leaves every program up to 6 MiB of DXIL waiting for exactly what it waited for before.
 fn big_compile_headroom(dxil_len: usize) -> u64 {
-    (3u64 << 30).max(dxil_len as u64 * 512)
+    (3u64 << 30).max((dxil_len as u64).saturating_mul(512))
 }
 
-/// That much commit is free (true when that is not known).
-fn big_compile_commit_free(need: u64) -> bool {
+/// The commit free now (None when that is not known: a compile then goes on, as before).
+fn big_compile_commit_available() -> Option<u64> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPageFile >= need }
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPageFile)
+}
+
+/// The headroom (`big_compile_headroom`) of the huge cold driver compiles in flight on any
+/// thread: gated ones, wanted ones (a wanted slot, no commit check), and a title thread's. The
+/// commit free is read before the driver has taken anything for a compile, so the compiles that
+/// look at about the same time each see all of it: one in each lane (`compile_slots`), more with
+/// `XCL_HUGE_PSO_CONCURRENCY`, and any next to a title thread's (no turn) or a wanted one (no
+/// commit check). In the model of the tests, four 2 MB programs taking 2.5 GB each all start on 8 GB
+/// free with `XCL_HUGE_PSO_CONCURRENCY=4`, and a 16 MB program in the giant lane starts on 10 GB
+/// beside a 1 MB one and a title thread's: 10 – 10.5 GB taken. A gated compile now goes when the
+/// commit free beyond the others' headroom is its own (`commit_admits`); with none in flight
+/// that is the check as it was.
+static COMMIT_IN_FLIGHT: CommitBudget = CommitBudget::new();
+
+/// Whether a compile asking for `need` of commit may start with `free` now, `reserved` by the
+/// compiles in flight and `claimed` set aside for an older waiter (`CommitBudget`).
+fn commit_admits(need: u64, free: u64, reserved: u64, claimed: u64) -> bool {
+    free.saturating_sub(reserved).saturating_sub(claimed) >= need
+}
+
+/// The commit huge driver compiles in flight asked for (`COMMIT_IN_FLIGHT`).
+struct CommitBudget(Mutex<Budget>);
+
+struct Budget {
+    /// headroom of the compiles in flight, summed
+    reserved: u64,
+    compiles: usize,
+    /// a waiting compile that would go once the ones in flight are done (its ticket, its
+    /// headroom): compiles that come after it leave it that room – a stream of 1 MB programs in
+    /// the big lane does not keep a giant one waiting until the last of them is built
+    claim: Option<(u64, u64)>,
+    tickets: u64,
+}
+
+/// A compile's headroom in flight (`CommitBudget`), until it is dropped (also in a panic).
+struct CommitReservation<'a>(&'a CommitBudget, u64);
+
+/// A compile waiting for its commit (`CommitBudget::try_reserve`); its claim goes when it is dropped.
+struct CommitWaiter<'a>(&'a CommitBudget, u64);
+
+impl CommitBudget {
+    const fn new() -> CommitBudget {
+        CommitBudget(Mutex::new(Budget { reserved: 0, compiles: 0, claim: None, tickets: 0 }))
+    }
+
+    fn budget(&self) -> std::sync::MutexGuard<'_, Budget> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn waiting(&self) -> CommitWaiter<'_> {
+        let mut b = self.budget();
+        b.tickets += 1;
+        CommitWaiter(self, b.tickets)
+    }
+
+    /// `need` of headroom in flight now, without waiting (a title thread's, or a wanted one).
+    fn reserve(&self, need: u64) -> CommitReservation<'_> {
+        let mut b = self.budget();
+        b.reserved = b.reserved.saturating_add(need);
+        b.compiles += 1;
+        CommitReservation(self, need)
+    }
+
+    /// `need` in flight if `free` (None: not known) lets it in beside the others (`commit_admits`).
+    /// Otherwise the waiter claims the room it needs when it would go once the ones in flight
+    /// are done, and gives its claim back when not even that.
+    fn try_reserve(&self, waiter: &CommitWaiter<'_>, need: u64, free: Option<u64>) -> Option<CommitReservation<'_>> {
+        let mut b = self.budget();
+        let mine = b.claim.is_some_and(|(ticket, _)| ticket == waiter.1);
+        let claimed = if mine { 0 } else { b.claim.map_or(0, |(_, n)| n) };
+        if free.is_none_or(|free| commit_admits(need, free, b.reserved, claimed)) {
+            if mine {
+                b.claim = None;
+            }
+            b.reserved = b.reserved.saturating_add(need);
+            b.compiles += 1;
+            return Some(CommitReservation(self, need));
+        }
+        let after_them = free.is_some_and(|free| free.saturating_add(b.reserved) >= need);
+        if after_them && b.claim.is_none() {
+            b.claim = Some((waiter.1, need));
+        } else if !after_them && mine {
+            b.claim = None;
+        }
+        None
+    }
+
+    /// (headroom in flight, compiles in flight)
+    fn in_flight(&self) -> (u64, usize) {
+        let b = self.budget();
+        (b.reserved, b.compiles)
+    }
+}
+
+impl Drop for CommitReservation<'_> {
+    fn drop(&mut self) {
+        let mut b = self.0.budget();
+        b.reserved = b.reserved.saturating_sub(self.1);
+        b.compiles = b.compiles.saturating_sub(1);
+    }
+}
+
+impl Drop for CommitWaiter<'_> {
+    fn drop(&mut self) {
+        let mut b = self.0.budget();
+        if b.claim.is_some_and(|(ticket, _)| ticket == self.1) {
+            b.claim = None;
+        }
+    }
+}
+
+/// A huge cold driver compile of `bytes`: a worker's waits for its turn (`wait`,
+/// `big_compile_turn`) with the commit for it beyond what the ones in flight asked for; one that
+/// does not wait (a title thread's, or a wanted one) is in flight all the same.
+fn big_compile_admission(bytes: usize, wait: bool) -> (Option<SlotGuard>, CommitReservation<'static>) {
+    let need = big_compile_headroom(bytes);
+    if !wait {
+        return (None, COMMIT_IN_FLIGHT.reserve(need));
+    }
+    big_compile_admitted(compile_slots(bytes), &COMMIT_IN_FLIGHT, need, big_compile_commit_available, super::pso_async::build_is_wanted)
+}
+
+/// `big_compile_admission` with the slots, the budget, the commit reading and `wanted` given.
+fn big_compile_admitted<'a>(slots: &'static Slots, budget: &'a CommitBudget, need: u64, free: impl Fn() -> Option<u64>, wanted: impl Fn() -> bool) -> (Option<SlotGuard>, CommitReservation<'a>) {
+    let waiter = budget.waiting();
+    let reserved = std::cell::RefCell::new(None);
+    let commit_free = || {
+        let r = budget.try_reserve(&waiter, need, free());
+        let admitted = r.is_some();
+        if admitted {
+            *reserved.borrow_mut() = r;
+        }
+        admitted
+    };
+    let slot = Some(big_compile_turn(slots, commit_free, wanted));
+    drop(waiter);
+    // (wanted: in a wanted slot without the commit check, and in flight for the others all the same)
+    let reservation = reserved.into_inner().unwrap_or_else(|| budget.reserve(need));
+    (slot, reservation)
 }
 
 #[cfg(test)]
@@ -4534,6 +4679,239 @@ mod big_compile_tests {
         drop(first);
         t.join().unwrap();
         assert_eq!(*S.n.lock().unwrap(), 0);
+    }
+
+    const GB: u64 = 1 << 30;
+
+    #[test]
+    fn with_none_in_flight_a_compile_goes_on_the_commit_free_as_before() {
+        for free in [0, 2 * GB, 3 * GB, 16 * GB] {
+            for need in [3 * GB, 8 * GB] {
+                assert_eq!(commit_admits(need, free, 0, 0), free >= need);
+                let b = CommitBudget::new();
+                assert_eq!(b.try_reserve(&b.waiting(), need, Some(free)).is_some(), free >= need);
+            }
+        }
+        // the others' headroom and an older waiter's claim come off what is free
+        assert!(!commit_admits(3 * GB, 10 * GB, 8 * GB, 0));
+        assert!(!commit_admits(3 * GB, 10 * GB, 0, 8 * GB));
+        assert!(commit_admits(3 * GB, 14 * GB, 3 * GB, 8 * GB));
+        assert!(!commit_admits(1, 0, u64::MAX, u64::MAX));
+        assert_eq!(big_compile_headroom(usize::MAX), u64::MAX, "(no overflow)");
+        // not known: on, as before – and in flight
+        let b = CommitBudget::new();
+        let r = b.try_reserve(&b.waiting(), 3 * GB, None).expect("on without a reading");
+        assert_eq!(b.in_flight(), (3 * GB, 1));
+        drop(r);
+        assert_eq!(b.in_flight(), (0, 0));
+    }
+
+    #[test]
+    fn compiles_in_both_lanes_that_read_the_same_free_commit_do_not_both_start() {
+        static BIG: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 2 };
+        static GIANT: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 2 };
+        static B: CommitBudget = CommitBudget::new();
+        // 10 GB free throughout (the driver has taken nothing yet): each fits, both do not
+        let free = || Some(10 * GB);
+        let (giant_need, big_need) = (big_compile_headroom(16 << 20), big_compile_headroom(1 << 20));
+        assert!(giant_need <= 10 * GB && big_need <= 10 * GB && giant_need + big_need > 10 * GB);
+        let giant = big_compile_admitted(&GIANT, &B, giant_need, free, || false);
+        assert!(giant.0.is_some());
+        let t = std::thread::spawn(move || big_compile_admitted(&BIG, &B, big_need, free, || false).0.is_some());
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!t.is_finished(), "the big lane's compile waits for the giant one's headroom");
+        assert_eq!(*BIG.n.lock().unwrap(), 1, "(its turn held, as before)");
+        drop(giant);
+        assert!(t.join().unwrap());
+        assert_eq!((B.in_flight(), *BIG.n.lock().unwrap(), *GIANT.n.lock().unwrap()), ((0, 0), 0, 0));
+    }
+
+    #[test]
+    fn a_wanted_or_title_thread_compile_never_waits_but_counts_for_the_others() {
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 2, wanted_most: 3 };
+        static B: CommitBudget = CommitBudget::new();
+        let t0 = Instant::now();
+        let wanted = big_compile_admitted(&S, &B, 3 * GB, || Some(0), || true);
+        assert!(t0.elapsed() < Duration::from_secs(1), "a wanted slot, no commit wait");
+        assert_eq!(B.in_flight(), (3 * GB, 1), "in flight all the same");
+        // a background compile beside it: 5 GB free leaves it 2 GB
+        let t = std::thread::spawn(|| big_compile_admitted(&S, &B, 3 * GB, || Some(5 * GB), || false).0.is_some());
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!t.is_finished(), "the wanted one's headroom is in flight");
+        drop(wanted);
+        assert!(t.join().unwrap(), "its turn once the wanted one is done");
+        assert_eq!(B.in_flight(), (0, 0));
+        // a title thread's huge cold compile is in flight while the driver has it
+        let seen = std::thread::spawn(|| driver_compile("test", huge_pso_bytes(), true, || COMMIT_IN_FLIGHT.in_flight().1)).join().unwrap();
+        assert!(seen >= 1);
+    }
+
+    #[test]
+    fn a_giant_compile_is_not_kept_waiting_by_later_smaller_ones() {
+        let (b, free) = (CommitBudget::new(), 10 * GB);
+        let first = b.try_reserve(&b.waiting(), 3 * GB, Some(free)).expect("a 1 MB program");
+        let giant = b.waiting();
+        assert!(b.try_reserve(&giant, 8 * GB, Some(free)).is_none(), "the first one's headroom is in flight");
+        // the next 1 MB program would fit beside the first (10 - 3 >= 3), but not before the giant one
+        let next = b.waiting();
+        assert!(b.try_reserve(&next, 3 * GB, Some(free)).is_none());
+        drop(first);
+        assert!(b.try_reserve(&next, 3 * GB, Some(free)).is_none(), "not even when it looks first");
+        let built = b.try_reserve(&giant, 8 * GB, Some(free)).expect("the giant one's turn");
+        drop(giant);
+        assert!(b.try_reserve(&next, 3 * GB, Some(free)).is_none());
+        drop(built);
+        assert!(b.try_reserve(&next, 3 * GB, Some(free)).is_some());
+    }
+
+    #[test]
+    fn a_claim_holds_back_nothing_its_compile_cannot_use_and_goes_with_it() {
+        let b = CommitBudget::new();
+        let _first = b.reserve(3 * GB);
+        // 15 GB asked for, 7 GB free and 3 GB in flight: not even once that is done – no claim
+        assert!(b.try_reserve(&b.waiting(), 15 * GB, Some(7 * GB)).is_none());
+        let w = b.waiting();
+        assert!(b.try_reserve(&w, 3 * GB, Some(7 * GB)).is_some());
+        // a claim goes when the commit falls short of it
+        let b = CommitBudget::new();
+        let _first = b.reserve(3 * GB);
+        let giant = b.waiting();
+        assert!(b.try_reserve(&giant, 8 * GB, Some(6 * GB)).is_none(), "6 + 3 >= 8: it claims");
+        let small = b.waiting();
+        assert!(b.try_reserve(&small, GB, Some(6 * GB)).is_none());
+        assert!(b.try_reserve(&giant, 8 * GB, Some(4 * GB)).is_none(), "4 + 3 < 8: the claim goes");
+        assert!(b.try_reserve(&small, GB, Some(4 * GB)).is_some());
+        // … and with its waiter, a turn and a reservation with their compile, also in a panic
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 2 };
+        static B: CommitBudget = CommitBudget::new();
+        let held = B.reserve(3 * GB);
+        let failed = std::thread::spawn(|| {
+            let w = B.waiting();
+            assert!(B.try_reserve(&w, 8 * GB, Some(6 * GB)).is_none());
+            panic!("a build that fails while it waits");
+        });
+        assert!(failed.join().is_err());
+        assert!(B.try_reserve(&B.waiting(), GB, Some(6 * GB)).is_some(), "the claim went with its waiter");
+        let failed = std::thread::spawn(|| {
+            let _turn = big_compile_admitted(&S, &B, 3 * GB, || Some(6 * GB), || false);
+            panic!("a driver compile that panics");
+        });
+        assert!(failed.join().is_err());
+        drop(held);
+        assert_eq!((B.in_flight(), *S.n.lock().unwrap()), ((0, 0), 0));
+    }
+
+    #[test]
+    fn more_slots_still_keep_the_headroom_in_flight_within_the_commit_free() {
+        use std::sync::atomic::AtomicUsize;
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 8, wanted_most: 9 };
+        static B: CommitBudget = CommitBudget::new();
+        static IN: AtomicUsize = AtomicUsize::new(0);
+        static PEAK: AtomicUsize = AtomicUsize::new(0);
+        static PEAK_HEADROOM: AtomicU64 = AtomicU64::new(0);
+        let t: Vec<_> = (0..12)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let _turn = big_compile_admitted(&S, &B, 3 * GB, || Some(10 * GB), || false);
+                    PEAK.fetch_max(IN.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                    PEAK_HEADROOM.fetch_max(B.in_flight().0, Ordering::SeqCst);
+                    // three at once fit in 10 GB: the first ones wait (a while at most) for the third
+                    let t0 = Instant::now();
+                    while PEAK.load(Ordering::SeqCst) < 3 && t0.elapsed() < Duration::from_secs(2) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                    IN.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        let t0 = Instant::now();
+        t.into_iter().for_each(|t| t.join().unwrap());
+        assert!(t0.elapsed() < Duration::from_secs(30), "no deadlock");
+        assert_eq!(PEAK.load(Ordering::SeqCst), 3, "8 slots, 10 GB: three of 3 GB at once");
+        assert!(PEAK_HEADROOM.load(Ordering::SeqCst) <= 10 * GB);
+        assert_eq!((B.in_flight(), *S.n.lock().unwrap()), ((0, 0), 0));
+    }
+
+    /// A huge compile in `commit_model`: asked for at tick `at`, `bytes` of DXIL (its headroom and
+    /// its lane), `takes` of commit in the driver – reached over the first quarter of the `ticks`
+    /// it runs, none yet when it starts – and a worker's (`gated`), or one that takes no turn (a
+    /// title thread's, or wanted).
+    struct Compile { at: u32, bytes: usize, takes: u64, ticks: u32, gated: bool }
+
+    /// `compiles` on `free` commit (what the title leaves), `most` at once in the big lane and one
+    /// in the giant one, each waiting for its commit in its turn: as before (`reserve` false: the
+    /// commit free alone) or with a `CommitBudget`. Every compile that looks in a tick reads the
+    /// same commit free. Returns the most commit the compiles took at once, the ticks until all
+    /// were built, and the tick each started.
+    fn commit_model(compiles: &[Compile], free: u64, most: usize, reserve: bool) -> (u64, u32, Vec<u32>) {
+        let budget = CommitBudget::new();
+        let n = compiles.len();
+        let (mut started, mut turn) = (vec![None::<u32>; n], vec![false; n]);
+        let mut held: Vec<Option<CommitReservation<'_>>> = (0..n).map(|_| None).collect();
+        let mut waiting: Vec<Option<CommitWaiter<'_>>> = (0..n).map(|_| None).collect();
+        let taken = |t: u32, started: &[Option<u32>]| -> u64 {
+            let ramp = |c: &Compile| (c.ticks / 4).max(1);
+            compiles.iter().zip(started).filter_map(|(c, s)| s.filter(|&s| t < s + c.ticks).map(|s| c.takes / ramp(c) as u64 * (t - s).min(ramp(c)) as u64)).sum()
+        };
+        let (mut peak, mut t) = (0, 0);
+        while started.iter().zip(compiles).any(|(s, c)| s.is_none_or(|s| t < s + c.ticks)) {
+            for (i, c) in compiles.iter().enumerate() {
+                if started[i].is_some_and(|s| t >= s + c.ticks) {
+                    (held[i], turn[i]) = (None, false);
+                }
+            }
+            let now = free.saturating_sub(taken(t, &started));
+            for (i, c) in compiles.iter().enumerate() {
+                if started[i].is_some() || c.at > t {
+                    continue;
+                }
+                let need = big_compile_headroom(c.bytes);
+                if !c.gated {
+                    (started[i], held[i]) = (Some(t), reserve.then(|| budget.reserve(need)));
+                    continue;
+                }
+                let giant = c.bytes >= GIANT_DRIVER_COMPILE;
+                let lane = (0..n).filter(|&j| turn[j] && (compiles[j].bytes >= GIANT_DRIVER_COMPILE) == giant).count();
+                if !turn[i] && lane >= if giant { 1 } else { most } {
+                    continue;
+                }
+                turn[i] = true;
+                held[i] = if reserve { budget.try_reserve(waiting[i].get_or_insert_with(|| budget.waiting()), need, Some(now)) } else { None };
+                if held[i].is_some() || (!reserve && now >= need) {
+                    (started[i], waiting[i]) = (Some(t), None);
+                }
+            }
+            peak = peak.max(taken(t, &started));
+            t += 1;
+        }
+        (peak, t, started.into_iter().map(Option::unwrap).collect())
+    }
+
+    /// A CPU-only model of the commit huge driver compiles take, before and with the budget
+    /// (`cargo test -p xcl --lib commit_model -- --nocapture` prints both).
+    #[test]
+    fn the_commit_model_stays_within_the_commit_free_with_the_budget() {
+        const MB: usize = 1 << 20;
+        // 1 MB programs (3 GB of headroom) taking 1.5 GB in the driver, a title thread's among them,
+        // and a 16 MB one (8 GB) taking 7.5 GB asked for just after the first started
+        let big = |gated| Compile { at: 0, bytes: MB, takes: 3 * GB / 2, ticks: 40, gated };
+        let lanes = [big(true), big(true), big(true), big(false), Compile { at: 5, bytes: 16 * MB, takes: 15 * GB / 2, ticks: 120, gated: true }];
+        // XCL_HUGE_PSO_CONCURRENCY=4: eight 2 MB programs (3 GB) taking 2.5 GB each
+        let burst: Vec<_> = (0..8).map(|_| Compile { at: 0, bytes: 2 * MB, takes: 5 * GB / 2, ticks: 40, gated: true }).collect();
+        for (name, compiles, free, most) in [("both lanes, 10 GB", &lanes[..], 10 * GB, 1), ("4 at once, 8 GB", &burst[..], 8 * GB, 4)] {
+            let (before, before_ticks, _) = commit_model(compiles, free, most, false);
+            let (with, with_ticks, starts) = commit_model(compiles, free, most, true);
+            println!("commit model, {name}: before {} MB at most in {before_ticks} ticks, with the budget {} MB in {with_ticks} ticks", before >> 20, with >> 20);
+            assert!(before > free, "{name}: compiles that read the same commit together took more than was free");
+            assert!(with <= free, "{name}: {} MB of {} MB", with >> 20, free >> 20);
+            if name.starts_with("both") {
+                assert!(starts[4] < starts[1] && starts[4] < starts[2], "the giant one goes before the 1 MB programs asked for after it: {starts:?}");
+            }
+        }
+        // commit enough for all of them: as before, tick for tick
+        assert_eq!(commit_model(&lanes, 32 * GB, 1, false).1, commit_model(&lanes, 32 * GB, 1, true).1);
+        assert_eq!(commit_model(&burst, 32 * GB, 4, false).1, commit_model(&burst, 32 * GB, 4, true).1);
     }
 }
 
@@ -6203,9 +6581,9 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let bytes = stream.shader_bytes() + tp.cs.len();
     let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
+    let _slot = (bytes >= huge_pso_bytes()).then(|| big_compile_admission(bytes, gate));
     if gate {
-        crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated, waited {} ms", waited.elapsed().as_millis());
+        crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated: {}, waited {} ms", _slot.as_ref().is_some_and(|(slot, _)| slot.is_some()), waited.elapsed().as_millis());
     }
     let hr = driver_compile(kind, stream.shader_bytes(), false, || finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv));
     if hr < 0 || ppv.is_null() || (*ppv).is_null() {
