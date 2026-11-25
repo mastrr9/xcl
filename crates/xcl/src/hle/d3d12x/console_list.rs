@@ -342,27 +342,29 @@ unsafe fn field(obj: usize, at: usize) -> *mut usize {
 }
 
 /// start a fresh record chunk (the previous one keeps what was written)
-unsafe fn new_chunk(obj: usize, st: &mut ListState) {
+unsafe fn new_chunk(obj: usize, st: &mut ListState, need: usize) {
     if let Some(last) = st.chunks.last_mut() {
         last.1 = *field(obj, F_WRITE) - last.0.as_ptr() as usize;
     }
-    let c = vec![0u8; CHUNK].into_boxed_slice();
+    let size = CHUNK.max(need.saturating_add(SLACK));
+    let c = vec![0u8; size].into_boxed_slice();
     let start = c.as_ptr() as usize;
     st.chunks.push((c, 0));
     *field(obj, F_WRITE) = start;
-    *field(obj, F_END) = start + CHUNK - SLACK;
-    *field(obj, F_DISPATCH_END) = start + CHUNK - SLACK;
+    *field(obj, F_END) = start + size - SLACK;
+    *field(obj, F_DISPATCH_END) = start + size - SLACK;
 }
 
 /// append a record (methods: the same encodings the inline code writes)
 unsafe fn push(obj: usize, words: &[u32]) {
+    let bytes = 4 * words.len();
     let w = *field(obj, F_WRITE);
-    if w + 4 * words.len() > *field(obj, F_END) + SLACK / 2 {
-        with_list(obj, |st| new_chunk(obj, st));
+    if w.saturating_add(bytes) > (*field(obj, F_END)).saturating_add(SLACK / 2) {
+        with_list(obj, |st| new_chunk(obj, st, bytes));
     }
     let w = *field(obj, F_WRITE);
     std::ptr::copy_nonoverlapping(words.as_ptr(), w as *mut u32, words.len());
-    *field(obj, F_WRITE) = w + 4 * words.len();
+    *field(obj, F_WRITE) = w + bytes;
 }
 
 fn header(i: usize) -> u32 {
@@ -433,7 +435,7 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, ps
     if !blocks.is_empty() {
         PENDING.lock().unwrap().get_or_insert_with(HashMap::new).entry(old_alloc).or_default().extend(blocks);
     }
-    with_list(obj, |st| new_chunk(obj, st));
+    with_list(obj, |st| new_chunk(obj, st, 0));
     let f: unsafe extern "system" fn(usize, *mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(pc_vtable_call(pc, 10));
     f(pc, allocator, pc_pso(pso))
 }
@@ -607,7 +609,7 @@ pub unsafe fn create_with_allocator(pc: *mut c_void, allocator: *mut c_void) -> 
     let obj = Box::into_raw(vec![0u8; OBJECT_BYTES].into_boxed_slice()) as *mut u8 as usize;
     *field(obj, 0) = list_vtable();
     let mut st = ListState { pc: pc as usize, allocator: allocator as usize, refs: 1, chunks: Vec::new(), uma: Vec::new(), arena: Default::default() };
-    new_chunk(obj, &mut st);
+    new_chunk(obj, &mut st, 0);
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(obj, st);
     obj as *mut c_void
 }
@@ -1138,6 +1140,32 @@ mod tests {
             assert_eq!((bound.len(), has_sampler), (2, true));
 
             list.Close().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_record_larger_than_a_chunk_gets_a_chunk_of_its_own() {
+        unsafe {
+            let obj = create_with_allocator(std::ptr::null_mut(), std::ptr::null_mut()) as usize;
+            let words = vec![0xA5A5_5A5Au32; CHUNK / 4 + 1024];
+            push(obj, &words);
+            let (chunks, last_len, last_start, last_end, write) = with_list(obj, |st| {
+                let last = st.chunks.last().unwrap();
+                (st.chunks.len(), last.0.len(), last.0.as_ptr() as usize, *field(obj, F_END), *field(obj, F_WRITE))
+            })
+            .unwrap();
+            let bytes = 4 * words.len();
+            assert_eq!(chunks, 2, "oversized record must allocate a dedicated chunk");
+            assert!(last_len >= bytes + SLACK, "chunk len {last_len} must hold {bytes} + SLACK");
+            assert_eq!(write - last_start, bytes);
+            assert_eq!(last_end, last_start + last_len - SLACK);
+            assert!(write <= last_end);
+            let written = std::slice::from_raw_parts(last_start as *const u32, words.len());
+            assert_eq!(written[0], 0xA5A5_5A5A);
+            assert_eq!(written[words.len() - 1], 0xA5A5_5A5A);
+            // Clean up without calling cl_release (st.pc is null).
+            LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&obj));
+            drop(Box::from_raw(std::slice::from_raw_parts_mut(obj as *mut u8, OBJECT_BYTES)));
         }
     }
 }
