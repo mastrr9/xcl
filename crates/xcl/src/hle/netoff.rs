@@ -13,6 +13,12 @@
 //! (`install_system_hooks`): whatever finds those functions – an import, GetProcAddress, a DLL
 //! of the title's – gets no network. What goes through (loopback, local names) calls the
 //! original through the hook's trampoline.
+//!
+//! `ConnectEx` (overlapped connect, Winsock's extension function) has no export: a caller gets
+//! its address from `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)`. So `WSAIoctl` is hooked too,
+//! and hands out a `ConnectEx` that refuses as `connect` does (the gap VIctory's offline module
+//! closes, github.com/Marvisak/VIctory `victory-hle/src/modules/net.rs`; written for XCL, no code
+//! taken).
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -43,7 +49,14 @@ extern "system" {
     fn real_getaddrinfo_ex(n: *const u16, s: *const u16, ns: u32, id: *const c_void, hints: *const c_void, out: *mut *mut c_void, t: *const c_void, ov: *mut c_void, cb: *const c_void, h: *mut c_void) -> i32;
     #[link_name = "gethostname"]
     fn real_gethostname(name: *mut u8, len: i32) -> i32;
+    #[link_name = "WSAIoctl"]
+    fn real_wsa_ioctl(s: usize, code: u32, inb: *const c_void, inlen: u32, outb: *mut c_void, outlen: u32, ret: *mut u32, ov: *mut c_void, cb: *const c_void) -> i32;
 }
+
+/// `WSAIoctl` code that asks for an extension function's address by its GUID.
+const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0006;
+/// `WSAID_CONNECTEX` {25a207b9-ddf3-4660-8ee9-76e58c74063e} as it lies in memory.
+const WSAID_CONNECTEX: [u8; 16] = [0xb9, 0x07, 0xa2, 0x25, 0xf3, 0xdd, 0x60, 0x46, 0x8e, 0xe9, 0x76, 0xe5, 0x8c, 0x74, 0x06, 0x3e];
 
 /// A name that resolves without a network: none (the local addresses), this machine's own
 /// name, localhost – a console without a network still answers these (a retail game asks for
@@ -77,6 +90,7 @@ fn table() -> Vec<(&'static str, usize, u16)> {
         ("GetAddrInfoW", getaddrinfo_w as *const () as usize, 0),
         ("GetAddrInfoExW", getaddrinfo_ex as *const () as usize, 0),
         ("WSAConnectByList", wsa_connect_by_list as *const () as usize, 0),
+        ("WSAIoctl", wsa_ioctl as *const () as usize, 0),
     ]
 }
 
@@ -124,6 +138,9 @@ static O_WSA_SEND_TO: AtomicUsize = AtomicUsize::new(0);
 static O_GETADDRINFO: AtomicUsize = AtomicUsize::new(0);
 static O_GETADDRINFO_W: AtomicUsize = AtomicUsize::new(0);
 static O_GETADDRINFO_EX: AtomicUsize = AtomicUsize::new(0);
+static O_WSAIOCTL: AtomicUsize = AtomicUsize::new(0);
+/// the system's `ConnectEx` (from the first `WSAIoctl` that asked for it; 0: none yet)
+static REAL_CONNECTEX: AtomicUsize = AtomicUsize::new(0);
 /// trampolines of hooks whose original is never called
 static O_UNUSED: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
 
@@ -178,7 +195,7 @@ pub fn install_system_hooks() {
     ONCE.call_once(|| unsafe {
         let mut unused = O_UNUSED.iter();
         let mut spare = || unused.next().expect("enough spare trampolines");
-        let hooks: [(&str, &str, usize, &AtomicUsize); 18] = [
+        let hooks: [(&str, &str, usize, &AtomicUsize); 19] = [
             ("winhttp.dll", "WinHttpSendRequest", send_request as usize, spare()),
             ("winhttp.dll", "WinHttpConnect", null_handle_winhttp as usize, spare()),
             ("wininet.dll", "InternetConnectA", null_handle_inet8 as usize, spare()),
@@ -197,6 +214,7 @@ pub fn install_system_hooks() {
             ("ws2_32.dll", "getaddrinfo", getaddrinfo as usize, &O_GETADDRINFO),
             ("ws2_32.dll", "GetAddrInfoW", getaddrinfo_w as usize, &O_GETADDRINFO_W),
             ("ws2_32.dll", "GetAddrInfoExW", getaddrinfo_ex as usize, &O_GETADDRINFO_EX),
+            ("ws2_32.dll", "WSAIoctl", wsa_ioctl as usize, &O_WSAIOCTL),
         ];
         let mut failed = Vec::new();
         for (dll, name, detour, orig) in hooks {
@@ -273,6 +291,51 @@ unsafe extern "system" fn wsa_send_to(s: usize, bufs: *const c_void, n: u32, sen
         return orig_wsa_send_to(s, bufs, n, sent, flags, to, tolen, ov, cb);
     }
     unreachable_net("WSASendTo")
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn orig_wsa_ioctl(s: usize, code: u32, inb: *const c_void, inlen: u32, outb: *mut c_void, outlen: u32, ret: *mut u32, ov: *mut c_void, cb: *const c_void) -> i32 {
+    match O_WSAIOCTL.load(Ordering::Acquire) {
+        0 => real_wsa_ioctl(s, code, inb, inlen, outb, outlen, ret, ov, cb),
+        f => std::mem::transmute::<usize, unsafe extern "system" fn(usize, u32, *const c_void, u32, *mut c_void, u32, *mut u32, *mut c_void, *const c_void) -> i32>(f)(s, code, inb, inlen, outb, outlen, ret, ov, cb),
+    }
+}
+
+/// `WSAIoctl`: everything as the system answers it, but a caller that asks for `ConnectEx` gets
+/// `connect_ex` in its place.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn wsa_ioctl(s: usize, code: u32, inb: *const c_void, inlen: u32, outb: *mut c_void, outlen: u32, ret: *mut u32, ov: *mut c_void, cb: *const c_void) -> i32 {
+    let r = orig_wsa_ioctl(s, code, inb, inlen, outb, outlen, ret, ov, cb);
+    let asks_connect_ex = code == SIO_GET_EXTENSION_FUNCTION_POINTER
+        && !inb.is_null()
+        && inlen as usize >= WSAID_CONNECTEX.len()
+        && std::slice::from_raw_parts(inb as *const u8, WSAID_CONNECTEX.len()) == WSAID_CONNECTEX;
+    if r == 0 && asks_connect_ex && !outb.is_null() && outlen as usize >= std::mem::size_of::<usize>() {
+        let real = (outb as *const usize).read_unaligned();
+        if real != 0 && real != connect_ex as usize {
+            if let Err(first) = REAL_CONNECTEX.compare_exchange(0, real, Ordering::AcqRel, Ordering::Acquire) {
+                if first != real {
+                    crate::xlog_warn!("XCL_NETWORK=0: a second ConnectEx ({real:#x}, first {first:#x}): loopback connects go to the first");
+                }
+            }
+            (outb as *mut usize).write_unaligned(connect_ex as usize);
+        }
+    }
+    r
+}
+
+/// `ConnectEx` handed out by `wsa_ioctl`: loopback goes to the system's, the rest fails at once
+/// (FALSE, `WSAENETUNREACH`; nothing is queued, so no completion is posted).
+unsafe extern "system" fn connect_ex(s: usize, name: *const u8, len: i32, send: *const c_void, send_len: u32, sent: *mut u32, ov: *mut c_void) -> i32 {
+    match REAL_CONNECTEX.load(Ordering::Acquire) {
+        f if f != 0 && loopback(name, len) => {
+            std::mem::transmute::<usize, unsafe extern "system" fn(usize, *const u8, i32, *const c_void, u32, *mut u32, *mut c_void) -> i32>(f)(s, name, len, send, send_len, sent, ov)
+        }
+        _ => {
+            unreachable_net("ConnectEx");
+            0
+        }
+    }
 }
 
 unsafe extern "system" fn gethostbyname(_name: *const u8) -> *mut c_void {
@@ -442,6 +505,42 @@ mod tests {
                 assert_ne!(call(f, &mixed), WSAENETUNREACH, "the loopback entry of a mixed list");
                 assert_ne!(call(f, &only), WSAENETUNREACH, "a loopback list");
             }
+        }
+    }
+
+    /// `ConnectEx` found through `WSAIoctl` – the only way to find it – refuses what `connect`
+    /// refuses, and the rest of `WSAIoctl` is the system's.
+    #[test]
+    fn connect_ex_from_wsa_ioctl_refuses_the_network() {
+        #[link(name = "ws2_32", kind = "raw-dylib")]
+        extern "system" {
+            fn WSAStartup(version: u16, data: *mut u8) -> i32;
+            fn WSAGetLastError() -> i32;
+            fn socket(af: i32, ty: i32, proto: i32) -> usize;
+            fn closesocket(s: usize) -> i32;
+        }
+        unsafe {
+            let mut data = [0u8; 512];
+            assert_eq!(WSAStartup(0x0202, data.as_mut_ptr()), 0);
+            let s = socket(2, 1, 6); // AF_INET, SOCK_STREAM, IPPROTO_TCP
+            assert_ne!(s, usize::MAX);
+            let mut f = 0usize;
+            let mut got = 0u32;
+            let r = wsa_ioctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER, WSAID_CONNECTEX.as_ptr() as *const c_void, 16, &mut f as *mut usize as *mut c_void, 8, &mut got, std::ptr::null_mut(), std::ptr::null());
+            assert_eq!(r, 0);
+            assert_eq!(f, connect_ex as usize);
+            assert_ne!(REAL_CONNECTEX.load(Ordering::Acquire), 0);
+            let ce: unsafe extern "system" fn(usize, *const u8, i32, *const c_void, u32, *mut u32, *mut c_void) -> i32 = std::mem::transmute(f);
+            let to = [2u8, 0, 0, 80, 192, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0]; // 192.0.2.1:80 (TEST-NET-1)
+            let mut ov = [0u8; 32];
+            assert_eq!(ce(s, to.as_ptr(), 16, std::ptr::null(), 0, std::ptr::null_mut(), ov.as_mut_ptr() as *mut c_void), 0);
+            assert_eq!(WSAGetLastError(), WSAENETUNREACH);
+            // another extension function's address is the system's, untouched
+            let wsaid_acceptex: [u8; 16] = [0xf1, 0x7d, 0x36, 0xb5, 0xac, 0xcb, 0xcf, 0x11, 0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92];
+            let mut g = 0usize;
+            assert_eq!(wsa_ioctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER, wsaid_acceptex.as_ptr() as *const c_void, 16, &mut g as *mut usize as *mut c_void, 8, &mut got, std::ptr::null_mut(), std::ptr::null()), 0);
+            assert!(g != 0 && g != connect_ex as usize);
+            closesocket(s);
         }
     }
 
