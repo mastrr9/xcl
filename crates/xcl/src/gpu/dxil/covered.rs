@@ -47,9 +47,23 @@ pub const TABLE: &[(&str, bool, &str)] = &[
     ("export", false, "exp: graphics stages only"),
 ];
 
+/// The classes of the compute pass of a console MS only (`check_mesh`): what it writes into
+/// its record, which both paths lower to the same stores (`lower_mem.rs` `mesh_export` /
+/// `mesh_sendmsg`, `emit.rs` `export_graphics` / `s_sendmsg`). Elsewhere these are `export` and
+/// `system`.
+pub const MESH_TABLE: &[(&str, bool, &str)] = &[
+    ("mesh-export", true, "exp of position 0, params and the primitive into the record (pos 1-3 and null write nothing)"),
+    ("mesh-alloc", true, "s_sendmsg GS_ALLOC_REQ: the vertex and primitive counts into the record header"),
+];
+
 /// Whether `class` is in the covered set (a class missing from `TABLE` is not).
 pub fn covered(class: &str) -> bool {
     TABLE.iter().any(|&(c, on, _)| c == class && on)
+}
+
+/// `covered` in the compute pass of a console MS: `MESH_TABLE`'s classes too.
+pub fn covered_mesh(class: &str) -> bool {
+    covered(class) || MESH_TABLE.iter().any(|&(c, on, _)| c == class && on)
 }
 
 /// The class of an instruction: its spec name (`Inst::name`), its encoding (`Encoding::name`)
@@ -169,11 +183,31 @@ pub fn class(d: &rdna2::Decoded) -> &'static str {
     class_of(d.inst.name, d.enc.name, d.variant)
 }
 
+/// The class of a decoded instruction in the compute pass of a console MS: an export to a
+/// target that pass writes is `mesh-export`, GS_ALLOC_REQ is `mesh-alloc`, the rest as `class`.
+pub fn mesh_class(d: &rdna2::Decoded) -> &'static str {
+    let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
+    match (d.inst.name, d.enc.name) {
+        ("EXP", "ENC_EXP") if matches!(f("TGT"), 9 | 12..=15 | 20 | 32..=63) => "mesh-export",
+        ("S_SENDMSG", "ENC_SOPP") if f("SIMM16") & 0xF == 9 => "mesh-alloc",
+        _ => class(d),
+    }
+}
+
 /// `Ok` when every instruction the direct translator would lower (those of the blocks reachable
 /// from the entry, as `kernel` builds its CFG) is in the covered set; else the first one that is
 /// not, as `"<mnemonic>: outside the covered set (class <class>)"` (`coverage::reason_key` keeps
 /// the mnemonic and the class), or the CFG's own error.
 pub fn check(code: &[u8]) -> Result<(), String> {
+    check_with(code, class, covered)
+}
+
+/// `check` for the compute pass of a console MS (`mesh_class`, `covered_mesh`).
+pub fn check_mesh(code: &[u8]) -> Result<(), String> {
+    check_with(code, mesh_class, covered_mesh)
+}
+
+fn check_with(code: &[u8], classify: fn(&rdna2::Decoded) -> &'static str, in_set: fn(&str) -> bool) -> Result<(), String> {
     let cfg = Cfg::build(code)?;
     for &b in &cfg.rpo {
         let block = &cfg.blocks[b];
@@ -183,8 +217,8 @@ pub fn check(code: &[u8]) -> Result<(), String> {
         };
         for &i in block.insts.iter().chain(branch.iter()) {
             let d = &cfg.insts[i];
-            let c = class(d);
-            if !covered(c) {
+            let c = classify(d);
+            if !in_set(c) {
                 return Err(format!("{}: outside the covered set (class {})", rdna2::mnemonic(d), c));
             }
         }
@@ -292,5 +326,38 @@ mod tests {
         let d = rdna2::decode(&dpp, 0).unwrap();
         assert_eq!(d.variant, Variant::Dpp16);
         assert_eq!(class(&d), "dpp");
+    }
+
+    /// The compute pass of a console MS: the exports into its record and GS_ALLOC_REQ are its
+    /// own classes, covered there only; another target, message or class keeps its class.
+    #[test]
+    fn mesh_pass_classes() {
+        let exp = |tgt: u64| i("EXP", "ENC_EXP", &[("TGT", tgt), ("EN", 0xF), ("VSRC0", 1), ("VSRC1", 2), ("VSRC2", 3), ("VSRC3", 4)]);
+        let msg = |id: u64| i("S_SENDMSG", "ENC_SOPP", &[("SIMM16", id)]);
+        let d = |b: &[u8]| rdna2::decode(b, 0).unwrap();
+        for t in [9, 12, 13, 15, 20, 32, 63] {
+            assert_eq!(mesh_class(&d(&exp(t))), "mesh-export", "target {t}");
+            assert_eq!(class(&d(&exp(t))), "export", "target {t} outside the mesh pass");
+        }
+        for t in [0, 7, 8, 16, 21, 31] {
+            assert_eq!(mesh_class(&d(&exp(t))), "export", "target {t}");
+        }
+        assert_eq!(mesh_class(&d(&msg(9))), "mesh-alloc");
+        assert_eq!(class(&d(&msg(9))), "system");
+        assert_eq!(mesh_class(&d(&msg(0x22))), "system", "a GS emit is no record write");
+        assert!(MESH_TABLE.iter().all(|&(c, _, _)| !TABLE.iter().any(|r| r.0 == c)), "the mesh classes are their own");
+        assert!(covered_mesh("mesh-export") && covered_mesh("valu") && !covered("mesh-export") && !covered_mesh("barrier"));
+
+        let end = i("S_ENDPGM", "ENC_SOPP", &[]);
+        // M0 = 1 primitive << 12 | 3 vertices
+        let m0 = encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 255)], Some(1 << 12 | 3)).unwrap();
+        let ms: Vec<u8> = [&m0, &msg(9), &exp(12), &exp(32), &exp(20), &end].into_iter().flatten().copied().collect();
+        assert_eq!(check_mesh(&ms), Ok(()));
+        assert_eq!(check(&ms).unwrap_err(), "s_sendmsg: outside the covered set (class system)", "not a compute program");
+        let bar = i("S_BARRIER", "ENC_SOPP", &[]);
+        let waits: Vec<u8> = [&m0, &msg(9), &bar, &exp(12), &end].into_iter().flatten().copied().collect();
+        assert_eq!(check_mesh(&waits).unwrap_err(), "s_barrier: outside the covered set (class barrier)");
+        let mrt: Vec<u8> = [&m0, &exp(0), &end].into_iter().flatten().copied().collect();
+        assert_eq!(check_mesh(&mrt).unwrap_err(), "exp: outside the covered set (class export)");
     }
 }

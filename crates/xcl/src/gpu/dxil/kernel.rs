@@ -48,8 +48,9 @@ pub fn enabled() -> bool {
 }
 
 /// `XCL_DIRECT_DXIL=covered`: only console compute programs whose every instruction is in the
-/// covered set (`covered::check`) go through this translator; the others, the mesh and geometry
-/// passes and the kernel tests stay on the HLSL path.
+/// covered set (`covered::check`), and the compute passes of console MS programs in it with
+/// their record writes (`covered::check_mesh`), go through this translator; the others, the
+/// geometry pass and the kernel tests stay on the HLSL path.
 pub fn covered_only() -> bool {
     std::env::var("XCL_DIRECT_DXIL").is_ok_and(|v| v == "covered")
 }

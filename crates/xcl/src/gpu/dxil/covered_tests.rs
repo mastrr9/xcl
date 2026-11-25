@@ -4,7 +4,9 @@
 //! (a class marked covered needs a program here) and translate them directly. The GPU test
 //! runs each through both backends, wave32 and wave64 (split where the adapter needs it),
 //! compares the memory with the reference and prints the translation times; with
-//! `XCL_COVERED_BENCH=1` it also times 4096 groups of each on the GPU.
+//! `XCL_COVERED_BENCH=1` it also times 4096 groups of each on the GPU. A console MS program
+//! does the same for the mesh pass's own classes (`covered::MESH_TABLE`), through both
+//! backends' compute pass and the pass-through mesh shader.
 //!
 //! Candidates are programs for the next classes to flip (transcendental, valu64, cross-lane,
 //! barrier), each with its RDNA2 reference. The GPU test runs them the same way and prints one
@@ -14,9 +16,9 @@ use std::collections::BTreeSet;
 
 use super::cfg::{Cfg, Term};
 use super::covered;
-use super::kernel::{translate_compute, KernelOptions};
+use super::kernel::{translate_compute, translate_mesh, KernelOptions};
 use crate::gpu::rdna2::{self, encode};
-use crate::gpu::recomp::{CsInterface, Mode, Options};
+use crate::gpu::recomp::{CsInterface, Mode, MsInterface, Options};
 
 const V: u64 = 256; // VALU source code of v0
 const BASE: u32 = 0x400; // s0: where a program's memory starts
@@ -531,14 +533,83 @@ fn candidates(wave64: bool) -> Vec<Candidate> {
     vec![transcendental_ops(), valu64(), cross_lane(wave64), barrier()]
 }
 
-/// The classes `covered::check` looks at in `code`.
-fn classes(code: &[u8]) -> BTreeSet<&'static str> {
+/// A console MS of one group of 64 threads with a position and one param.
+fn mesh_interface() -> MsInterface {
+    let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index: 0,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: THREADS, max_vertices: THREADS, max_primitives: THREADS, ..Default::default() }
+}
+
+/// Primitive 0: vertices 0, 1, 2.
+const PRIM: u32 = 1 << 10 | 2 << 20;
+
+/// mesh-alloc and mesh-export in the console's style: the thread in the group from the wave
+/// index (s3[27:24]) and v_mbcnt, the group from v5; GS_ALLOC_REQ of 3 vertices and 1
+/// primitive, every thread's position (t / 2 - 1 + group, 2 (t & 1) - 1, 0, 1) and param
+/// (group, t, 0.5, 1), and thread 0's primitive. Every f32 is exact, so no contraction changes
+/// one; the groups' triangles do not overlap.
+fn mesh_program(wave64: bool) -> Vec<u8> {
+    let exp = |tgt: u64, en: u64, v: [u64; 4]| [("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3])];
+    let mut a = Asm(Vec::new());
+    a.op("S_BFE_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 3), ("SSRC1", 255)], Some(0x40018))
+        .op("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None);
+    if wave64 {
+        a.op("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 0), ("SRC0", 193), ("SRC1", V)], None);
+    }
+    a.op("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 0), ("SRC0", 0), ("SRC1", if wave64 { 134 } else { 133 }), ("SRC2", V)], None)
+        .op("V_LSHRREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 134), ("VSRC1", 5)], None) // group = v5 >> 6
+        .op("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 3), ("SRC0", V + 2)], None)
+        .op("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)], None)
+        .op("V_MUL_F32", "ENC_VOP2", &[("VDST", 10), ("SRC0", 240), ("VSRC1", 1)], None) // 0.5 *
+        .op("V_ADD_F32", "ENC_VOP2", &[("VDST", 10), ("SRC0", 243), ("VSRC1", 10)], None) // -1.0 +
+        .op("V_ADD_F32", "ENC_VOP2", &[("VDST", 10), ("SRC0", V + 3), ("VSRC1", 10)], None) // group +
+        .op("V_AND_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 129), ("VSRC1", 0)], None)
+        .op("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 6)], None)
+        .op("V_MUL_F32", "ENC_VOP2", &[("VDST", 11), ("SRC0", 244), ("VSRC1", 11)], None) // 2.0 *
+        .op("V_ADD_F32", "ENC_VOP2", &[("VDST", 11), ("SRC0", 243), ("VSRC1", 11)], None)
+        .op("V_MOV_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", 128)], None)
+        .op("V_MOV_B32", "ENC_VOP1", &[("VDST", 13), ("SRC0", 242)], None)
+        .op("V_MOV_B32", "ENC_VOP1", &[("VDST", 14), ("SRC0", 240)], None)
+        .op("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 255)], Some(1 << 12 | 3))
+        .op("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 9)], None)
+        .op("EXP", "ENC_EXP", &exp(12, 0xF, [10, 11, 12, 13]), None)
+        .op("EXP", "ENC_EXP", &exp(32, 0xF, [3, 1, 14, 13]), None)
+        .op("V_CMPX_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 0)], None) // thread 0
+        .op("V_MOV_B32", "ENC_VOP1", &[("VDST", 15), ("SRC0", 255)], Some(PRIM))
+        .op("EXP", "ENC_EXP", &exp(20, 1, [15, 0, 0, 0]), None);
+    a.end()
+}
+
+/// The words of group `g`'s record that `mesh_program` writes on RDNA2: (dword, value).
+fn mesh_record(ms: &MsInterface, g: u32) -> Vec<(usize, u32)> {
+    let header = crate::gpu::recomp::MESH_HEADER;
+    let vd = ms.vert_dwords();
+    let mut w = vec![(0, 3), (1, 1), (header + THREADS as usize * vd, PRIM)];
+    for t in 0..THREADS {
+        let v = header + t as usize * vd;
+        let pos = [t as f32 * 0.5 - 1.0 + g as f32, (t & 1) as f32 * 2.0 - 1.0, 0.0, 1.0];
+        let param = [g as f32, t as f32, 0.5, 1.0];
+        w.extend(pos.iter().chain(&param).enumerate().map(|(c, x)| (v + c, x.to_bits())));
+    }
+    w
+}
+
+/// The classes `classify` gives the instructions `covered::check` looks at in `code`.
+fn classes(code: &[u8], classify: fn(&rdna2::Decoded) -> &'static str) -> BTreeSet<&'static str> {
     let cfg = Cfg::build(code).unwrap_or_else(|e| panic!("{e}"));
     let mut out = BTreeSet::new();
     for &b in &cfg.rpo {
         let block = &cfg.blocks[b];
         let branch = if let Term::Cond(i, _, _) = block.term { Some(i) } else { None };
-        out.extend(block.insts.iter().chain(branch.iter()).map(|&i| covered::class(&cfg.insts[i])));
+        out.extend(block.insts.iter().chain(branch.iter()).map(|&i| classify(&cfg.insts[i])));
     }
     out
 }
@@ -579,7 +650,7 @@ fn every_covered_class_has_a_program() {
     let mut seen = BTreeSet::new();
     for wave64 in [false, true] {
         for c in cases(wave64) {
-            seen.extend(classes(&c.code));
+            seen.extend(classes(&c.code, covered::class));
         }
     }
     let missing: Vec<&str> = covered::TABLE.iter().filter(|r| r.1 && !seen.contains(r.0)).map(|r| r.0).collect();
@@ -601,7 +672,7 @@ fn the_reference_has_the_cases_it_tests() {
 fn every_candidate_is_its_class_and_covered_ones() {
     for wave64 in [false, true] {
         for c in candidates(wave64) {
-            let seen = classes(&c.case.code);
+            let seen = classes(&c.case.code, covered::class);
             let other: Vec<_> = seen.iter().filter(|&&k| k != c.class && !covered::covered(k)).collect();
             assert!(seen.contains(c.class) && other.is_empty(), "{} (wave64 {wave64}): {seen:?}", c.class);
             assert!(!covered::covered(c.class), "{} is covered: move its program to `cases`", c.class);
@@ -661,6 +732,94 @@ fn every_program_translates_directly() {
             translate_compute(&c.code, o, &interface()).unwrap_or_else(|e| panic!("{} (wave64 {wave64}, split {split}): {e}", c.name));
         }
     }
+}
+
+/// The MS program is in the mesh pass's covered set, uses each of its own classes, and is no
+/// compute program of the covered set (its record writes are the mesh pass's only).
+#[test]
+fn the_mesh_program_is_in_the_covered_mesh_set() {
+    for wave64 in [false, true] {
+        let code = mesh_program(wave64);
+        assert_eq!(covered::check_mesh(&code), Ok(()), "wave64 {wave64}");
+        assert_eq!(covered::check(&code), Err("s_sendmsg: outside the covered set (class system)".into()));
+        let seen = classes(&code, covered::mesh_class);
+        let missing: Vec<&str> = covered::MESH_TABLE.iter().filter(|r| r.1 && !seen.contains(r.0)).map(|r| r.0).collect();
+        assert!(missing.is_empty(), "mesh classes without a program: {missing:?}");
+    }
+    let ms = mesh_interface();
+    assert_eq!(ms.vert_dwords(), 8);
+    assert_eq!(mesh_record(&ms, 1)[3..7], [(4, 0), (5, (-1f32).to_bits()), (6, 0), (7, 1f32.to_bits())]);
+}
+
+#[test]
+fn the_mesh_program_translates_directly() {
+    for (wave64, split) in [(false, false), (true, false), (true, true)] {
+        let o = KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+        translate_mesh(&mesh_program(wave64), o, &mesh_interface()).unwrap_or_else(|e| panic!("wave64 {wave64}, split {split}: {e}"));
+    }
+}
+
+/// The compute pass of the MS program through HLSL + DXC and through the direct path, each
+/// drawn by the HLSL pass-through mesh shader: the records RDNA2 leaves and the same pixels.
+#[test]
+fn gpu_covered_mesh_pass_matches_on_both_backends() {
+    use crate::gpu::recomp::{dxc, mesh_passthrough, runner, translate};
+    match (runner::adapter(), runner::wave64_programs_supported(), dxc::location(), runner::mesh_shaders_supported()) {
+        (Ok(_), Ok(true), Ok(_), Ok(true)) => {}
+        (a, w, d, m) => {
+            println!("GPU/DXC/mesh shaders unavailable, skipping ({:?} / {:?} / {:?} / {:?})", a.as_ref().err(), w.as_ref().ok(), d.as_ref().err(), m);
+            runner::skip_test(if a.is_err() || w.is_err() || m.is_err() {
+                "no GPU"
+            } else if d.is_err() {
+                "no DXC"
+            } else if w != Ok(true) {
+                "no wave64"
+            } else {
+                "no mesh shaders"
+            });
+            return;
+        }
+    }
+    println!("GPU: {}", runner::adapter().unwrap());
+    let ms = mesh_interface();
+    let mode = Mode::Mesh(ms.clone());
+    let pass = dxc::compile(&mesh_passthrough(&ms), "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+    let ps_src = "struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return v.p0; }\n";
+    let ps = dxc::compile(ps_src, "main", "ps_6_6", &[]).unwrap();
+    let (groups, rd) = (2u32, ms.record_dwords());
+    let mut wrong = Vec::new();
+    for wave64 in [false, true] {
+        let split = wave64 && runner::split_for(&mode);
+        let form = if !wave64 { "wave32" } else if split { "wave64 split" } else { "wave64" };
+        let code = mesh_program(wave64);
+        let t = translate(&code, &Options { mode: mode.clone(), wave64, split_wave64: split, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{form}: {:?}", t.unsupported_why);
+        let hlsl = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let o = KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+        let direct = translate_mesh(&code, o, &ms).unwrap_or_else(|e| panic!("{form}: {e}")).dxil;
+        let mut drawn = Vec::new();
+        for (backend, cs) in [("HLSL", &hlsl), ("direct", &direct)] {
+            let (px, rec) = runner::mesh_draw(cs, &pass, &ps, groups, rd, &[0; 128], &[0; 256], 32, [-1.0; 4]).unwrap_or_else(|e| panic!("{backend} ({form}): {e}"));
+            for g in 0..groups {
+                let bad: Vec<(usize, u32, u32)> = mesh_record(&ms, g).into_iter().filter(|&(k, v)| rec[g as usize * rd + k] != v).map(|(k, v)| (k, rec[g as usize * rd + k], v)).collect();
+                if !bad.is_empty() {
+                    wrong.push(format!("{backend} ({form}) group {g}: {} word(s), first (word, got, want) {:x?}", bad.len(), &bad[..bad.len().min(4)]));
+                }
+            }
+            // group 0's triangle on the left, group 1's on the right (param.x = group)
+            for (x, y, want) in [(8, 29, [0.0, 0.0, 0.5, 1.0]), (24, 29, [1.0, 0.0, 0.5, 1.0]), (16, 2, [-1.0; 4])] {
+                let got = px[y * 32 + x];
+                if got[0] != want[0] || got[3] != want[3] {
+                    wrong.push(format!("{backend} ({form}) pixel ({x}, {y}): {got:?}, want x and w of {want:?}"));
+                }
+            }
+            drawn.push((px, rec));
+        }
+        if drawn[0] != drawn[1] {
+            wrong.push(format!("{form}: the two backends leave other records or pixels"));
+        }
+    }
+    assert!(wrong.is_empty(), "outside RDNA2's results:\n{}", wrong.join("\n"));
 }
 
 #[test]

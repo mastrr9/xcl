@@ -223,9 +223,10 @@ mod translated {
 
     /// `XCL_DIRECT_DXIL=covered`: the programs outside the covered set stay on the HLSL path,
     /// so its entries are another output than `=1`'s (the set itself is in the direct sources'
-    /// hash, `direct_version`).
+    /// hash, `direct_version`). The tag names the passes it routes (compute, the mesh compute
+    /// pass): this file is not in that hash, so a pass that moves needs a new tag.
     pub(super) fn with_covered(id: u64, covered: bool) -> u64 {
-        if covered { identity_for(&id.to_string(), "xcl-direct-covered") } else { id }
+        if covered { identity_for(&id.to_string(), "xcl-direct-covered-cs-ms") } else { id }
     }
 
     /// `identity_for` of `backend`: unchanged for the HLSL path (its entries stay valid),
@@ -1097,6 +1098,16 @@ fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option
     finish_two_pass_compiled(Compiled { dispatch_chain: None, dxil: cs, samplers: t.static_samplers }, record, ps)
 }
 
+/// `XCL_DIRECT_DXIL=covered` (`covered`): a console MS program with an instruction outside the
+/// covered set of its compute pass (`covered::check_mesh`) stays on the HLSL path, the refusal
+/// being its fallback reason. Any program otherwise (`=1`).
+fn covered_mesh(code: &[u8], covered: bool) -> Result<(), String> {
+    if covered {
+        crate::gpu::dxil::covered::check_mesh(code)?;
+    }
+    Ok(())
+}
+
 fn compile_console_mesh(
     blob: &[u8],
     code: &[u8],
@@ -1105,8 +1116,9 @@ fn compile_console_mesh(
     windows: u32,
     split_wave64: bool,
 ) -> Result<Compiled, String> {
-    // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
-    if crate::gpu::dxil::kernel::enabled() && !crate::gpu::dxil::kernel::covered_only() {
+    // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback);
+    // `=covered`: only a program in the covered set (the pass-through stays HLSL)
+    if crate::gpu::dxil::kernel::enabled() {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
         }
@@ -1116,7 +1128,7 @@ fn compile_console_mesh(
             mem_windows: windows,
             sampler_base: 0,
         };
-        match crate::gpu::dxil::kernel::translate_mesh(code, o, ms) {
+        match covered_mesh(code, crate::gpu::dxil::kernel::covered_only()).and_then(|()| crate::gpu::dxil::kernel::translate_mesh(code, o, ms)) {
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("MS");
                 dump_direct(blob, &k.dxil);
@@ -1548,6 +1560,52 @@ pub(crate) mod shader_cache_tests {
         let others = [identity_with("s", "t", Backend::Hlsl, 1), compute, identity_with("s", "t", Backend::DirectAll, 1)];
         assert!(covered != 0 && !others.contains(&covered));
         assert_ne!(covered, with_covered(identity_with("s", "t", Backend::DirectCompute, 2), true), "a direct version change re-keys it");
+    }
+
+    /// With the mesh compute pass in `=covered`, its entries are not those `=covered` made while
+    /// that pass stayed on HLSL (a covered MS program was an HLSL blob there, direct DXIL here);
+    /// the HLSL path's identity is still the plain one.
+    #[test]
+    fn covered_mesh_routing_has_its_own_identity() {
+        use translated::{identity_for, identity_with, with_covered, Backend};
+        let compute = identity_with("s", "t", Backend::DirectCompute, 1);
+        let covered = with_covered(compute, true);
+        assert_ne!(covered, identity_for(&compute.to_string(), "xcl-direct-covered"), "the compute-only routing's identity");
+        let hlsl = identity_with("s", "t", Backend::Hlsl, 1);
+        assert_eq!(hlsl, identity_for("s", "t"));
+        assert_eq!(with_covered(hlsl, false), hlsl);
+        assert!(covered != hlsl && covered != compute && covered != identity_with("s", "t", Backend::DirectAll, 1));
+    }
+
+    /// `=covered` sends the compute pass of a console MS to the direct translator only when
+    /// every reachable instruction is in the covered set or the mesh pass's own record writes;
+    /// `=1` sends every program, as before.
+    #[test]
+    fn covered_mesh_routes_only_covered_programs() {
+        use crate::gpu::rdna2::encode;
+        let e = |n: &str, enc: &str, f: &[(&str, u64)], l: Option<u32>| encode(n, enc, f, l).unwrap_or_else(|x| panic!("{n}: {x}"));
+        let exp = |tgt: u64, en: u64, v: u64| e("EXP", "ENC_EXP", &[("TGT", tgt), ("EN", en), ("VSRC0", v), ("VSRC1", v), ("VSRC2", v), ("VSRC3", v)], None);
+        let program = |middle: &[Vec<u8>]| -> Vec<u8> {
+            let mut p = e("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 255)], Some(1 << 12 | 3));
+            p.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 9)], None));
+            p.extend(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None));
+            p.extend(e("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 256)], None));
+            middle.iter().for_each(|m| p.extend(m));
+            p.extend(exp(12, 0xF, 1));
+            p.extend(exp(32, 0xF, 0));
+            p.extend(e("V_CMPX_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 0)], None));
+            p.extend(exp(20, 1, 0));
+            p.extend(e("S_ENDPGM", "ENC_SOPP", &[], None));
+            p
+        };
+        let covered = program(&[]);
+        assert_eq!(covered_mesh(&covered, true), Ok(()));
+        assert_eq!(covered_mesh(&covered, false), Ok(()));
+        let barrier = program(&[e("S_BARRIER", "ENC_SOPP", &[], None)]);
+        assert_eq!(covered_mesh(&barrier, true), Err("s_barrier: outside the covered set (class barrier)".into()));
+        assert_eq!(covered_mesh(&barrier, false), Ok(()), "=1 takes it");
+        let rcp = program(&[e("V_RCP_F32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 257)], None)]);
+        assert_eq!(covered_mesh(&rcp, true), Err("v_rcp_f32: outside the covered set (class transcendental)".into()));
     }
 
     /// Hit / miss through a temp cache dir: a direct entry is reused by the same identity and
