@@ -96,6 +96,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         GetModuleHandleExA,
         GetModuleFileNameW,
         GetModuleFileNameA,
+        K32GetModuleInformation,
+        GetModuleInformation,
         FreeLibrary,
         FreeLibraryWhenCallbackReturns,
         DisableThreadLibraryCalls,
@@ -2056,6 +2058,41 @@ pub unsafe extern "system" fn GetModuleFileNameA(h: usize, buf: *mut u8, size: u
     }
 }
 
+/// psapi's GetModuleInformation for the images XCL mapped (the title's executable and DLLs).
+/// Windows' looks the module up in the PEB's loader list, which has none of them: it failed
+/// with ERROR_INVALID_HANDLE and left `info` as it was – a title asking for its own image's
+/// range got garbage. A NULL module is the title's executable, as Windows reads it from the PEB.
+pub unsafe extern "system" fn K32GetModuleInformation(process: HANDLE, h: usize, info: *mut c_void, cb: u32) -> BOOL {
+    use windows_sys::Win32::System::ProcessStatus::MODULEINFO;
+    let own = process == thr::GetCurrentProcess() || thr::GetProcessId(process) == thr::GetCurrentProcessId();
+    let mapped = if !own {
+        None
+    } else if h == 0 {
+        modules::main_module()
+    } else {
+        modules::find_mapped_by_base(h)
+    };
+    let Some(m) = mapped else {
+        return windows_sys::Win32::System::ProcessStatus::K32GetModuleInformation(process, h as _, info as *mut MODULEINFO, cb);
+    };
+    if info.is_null() || (cb as usize) < std::mem::size_of::<MODULEINFO>() {
+        fnd::SetLastError(fnd::ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    let entry = if m.entry_rva != 0 { (m.base + m.entry_rva as usize) as *mut c_void } else { std::ptr::null_mut() };
+    (info as *mut MODULEINFO).write_unaligned(MODULEINFO {
+        lpBaseOfDll: m.base as *mut c_void,
+        SizeOfImage: m.size as u32,
+        EntryPoint: entry,
+    });
+    1
+}
+
+/// psapi.h maps GetModuleInformation to K32GetModuleInformation (PSAPI_VERSION 2).
+pub unsafe extern "system" fn GetModuleInformation(process: HANDLE, h: usize, info: *mut c_void, cb: u32) -> BOOL {
+    K32GetModuleInformation(process, h, info, cb)
+}
+
 pub unsafe extern "system" fn FreeLibrary(h: usize) -> BOOL {
     if modules::find_mapped_by_base(h).is_some() || modules::hle_name_by_handle(h).is_some() {
         return 1;
@@ -2167,6 +2204,47 @@ mod tests {
         assert_eq!(sleep_hold_min(Some("0")), None);
         assert_eq!(sleep_hold_min(Some(" 250 ")), Some(250));
         assert_eq!(sleep_hold_min(Some("on")), Some(SLEEP_HOLD_MIN_MS));
+    }
+
+    /// GetModuleInformation on an image XCL mapped: its base, size and entry point (before:
+    /// Windows' answer, FALSE with ERROR_INVALID_HANDLE, the image not being in the PEB's list).
+    /// Another process's handle and too small a buffer are not answered from the mapping.
+    #[test]
+    fn get_module_information_answers_for_mapped_images() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+        use windows_sys::Win32::System::ProcessStatus::MODULEINFO;
+        let base = unsafe { mem::VirtualAlloc(std::ptr::null(), 0x10000, mem::MEM_RESERVE, mem::PAGE_NOACCESS) } as usize;
+        assert_ne!(base, 0);
+        modules::register_mapped(Arc::new(modules::MappedModule {
+            name: "xcl_modinfo_test.dll".into(), path: "xcl_modinfo_test.dll".into(), base, size: 0x10000, entry_rva: 0x1230, is_dll: true,
+            exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true), stack_reserve: 0,
+        }));
+        unsafe {
+            let mut mi = MODULEINFO::default();
+            let cb = std::mem::size_of::<MODULEINFO>() as u32;
+            let me = thr::GetCurrentProcess();
+            assert_eq!(K32GetModuleInformation(me, base, &mut mi as *mut _ as *mut c_void, cb), 1);
+            assert_eq!((mi.lpBaseOfDll as usize, mi.SizeOfImage, mi.EntryPoint as usize), (base, 0x10000, base + 0x1230));
+            // a real handle to this process, as OpenProcess gives it
+            let h = thr::OpenProcess(thr::PROCESS_QUERY_INFORMATION | thr::PROCESS_VM_READ, 0, thr::GetCurrentProcessId());
+            assert!(!h.is_null());
+            let mut mi = MODULEINFO::default();
+            assert_eq!(GetModuleInformation(h, base, &mut mi as *mut _ as *mut c_void, cb), 1);
+            assert_eq!(mi.lpBaseOfDll as usize, base);
+            fnd::CloseHandle(h);
+            // too small a buffer
+            assert_eq!(K32GetModuleInformation(me, base, &mut mi as *mut _ as *mut c_void, cb - 1), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INSUFFICIENT_BUFFER);
+            // a module Windows loaded is still Windows' answer
+            let k32 = ll::GetModuleHandleW(crate::util::wide("kernel32.dll").as_ptr()) as usize;
+            let mut mi = MODULEINFO::default();
+            assert_eq!(K32GetModuleInformation(me, k32, &mut mi as *mut _ as *mut c_void, cb), 1);
+            assert_eq!(mi.lpBaseOfDll as usize, k32);
+        }
+        modules::unregister_mapped(base);
+        unsafe { mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE) };
     }
 
     #[test]
