@@ -99,6 +99,12 @@ pub fn next_deadline(base: i64, interval: i64, offset: i64, after: i64) -> i64 {
     first + ((after - first) / interval + 1) * interval
 }
 
+/// What the clock plans the next deadlines after: `now`, or a deadline it reached while the
+/// schedule changed (`missed`) – planned from `now`, that point of the frame would be skipped.
+fn replan_after(missed: Option<i64>, now: i64) -> i64 {
+    missed.map_or(now, |d| d.min(now)) - 1
+}
+
 /// The title's ancillary handles of a frame event, duplicated. Closed when neither the schedule
 /// nor the clock thread holds them any more: the thread signals them outside the clock's lock,
 /// and a handle closed under it meanwhile could be another object's by then (#103).
@@ -520,6 +526,8 @@ fn clock_thread() {
             timer = CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), 0, TIMER_ALL_ACCESS);
         }
         let mut last = [i64::MIN / 2; TYPES];
+        // a deadline the clock reached while the schedule changed: planned again from there
+        let mut missed: Option<i64> = None;
         loop {
             // the next events of the current schedule: every type due at the earliest deadline
             // (types at the same point of the frame fire together – a retail game schedules the
@@ -528,7 +536,7 @@ fn clock_thread() {
             let plan = with(|c| {
                 let effective_us = if c.active { effective_clock_interval_us(c.interval_us, interval_override()) } else { None }?;
                 let interval = ticks(effective_us as i64);
-                let now = qpc();
+                let after = replan_after(missed.take(), qpc());
                 let due: Vec<(i64, usize, usize, Arc<Handles>)> = c
                     .kinds
                     .iter()
@@ -536,7 +544,7 @@ fn clock_thread() {
                     .filter(|(_, k)| k.scheduled)
                     .map(|(i, k)| {
                         let offset_us = k.offset_us % effective_us.max(1);
-                        let mut d = next_deadline(c.base_qpc, interval, ticks(offset_us as i64), now - 1);
+                        let mut d = next_deadline(c.base_qpc, interval, ticks(offset_us as i64), after);
                         if d - last[i] < interval / 2 {
                             d += interval; // this point of the frame already fired
                         }
@@ -550,7 +558,13 @@ fn clock_thread() {
                 WaitForMultipleObjects(1, &wake(), 0, INFINITE);
                 continue;
             };
-            if !sleep_until(timer, deadline, allow_spin) || !with(|c| c.generation == generation) {
+            if !sleep_until(timer, deadline, allow_spin) {
+                continue;
+            }
+            if !with(|c| c.generation == generation) {
+                // changed in the last moments before the deadline (the spin, unwatched): what
+                // the new schedule has due there still fires, late, not a frame later
+                missed = Some(deadline);
                 continue;
             }
             for (_, ty, internal, extra) in due {
@@ -631,6 +645,22 @@ mod tests {
         assert_eq!(next_deadline(100, 10, 3, 50), 103);
         assert_eq!(next_deadline(100, 10, 3, 103), 113);
         assert_eq!(next_deadline(100, 10, 3, 120), 123);
+    }
+
+    /// A schedule that changed as the clock reached a deadline: planned again, the deadline is
+    /// still the one due (planned from the time it noticed, a frame of events went missing).
+    #[test]
+    fn a_schedule_change_at_a_deadline_does_not_skip_it() {
+        let (base, interval) = (0, 166_670);
+        let deadline = next_deadline(base, interval, 0, replan_after(None, 1_666_000));
+        assert_eq!(deadline, 1_666_700);
+        // the change seen 3 ticks after the deadline
+        assert_eq!(next_deadline(base, interval, 0, replan_after(Some(deadline), deadline + 3)), deadline);
+        assert_eq!(next_deadline(base, interval, 0, replan_after(None, deadline + 3)), deadline + interval, "the old way: a frame later");
+        // a type moved to another offset meanwhile: its deadline after the missed one
+        assert_eq!(next_deadline(base, interval, 1_000, replan_after(Some(deadline), deadline + 3)), deadline + 1_000);
+        // a missed deadline later than now (clock skew) does not plan into the future
+        assert_eq!(replan_after(Some(500), 400), 399);
     }
 
     /// The origin event of a 60 Hz clock: waits return about one interval apart with fresh
