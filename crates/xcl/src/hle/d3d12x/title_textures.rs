@@ -1100,8 +1100,12 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         let mut picked = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
-        while let Some((_, (dev, _, tex, _))) = todo.peek() {
-            if !batch_fits(picked.len(), bytes, device, *dev, tex.size() as usize) {
+        // the memory of the textures picked: one batch's copies are not ordered among
+        // themselves (`texture::upload_batch`), so a texture over memory one of them covers
+        // (the same texture again, or one sharing its pages) goes in the next batch
+        let mut spans = BTreeMap::new();
+        while let Some((_, (dev, va, tex, _))) = todo.peek() {
+            if !batch_fits(picked.len(), bytes, device, *dev, tex.size() as usize) || overlaps(&spans, *va, tex.size() as usize) {
                 break;
             }
             let (r, (dev, va, tex, states)) = todo.next().unwrap();
@@ -1121,6 +1125,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             }
             device = dev;
             bytes += tex.size() as usize;
+            spans.insert(va, va + tex.size() as usize);
             picked.push((r, va, tex, states));
         }
         if picked.is_empty() {
@@ -1181,6 +1186,13 @@ unsafe fn map_levels_with_texels(r: &ID3D12Resource, subs: &[Subresource]) {
 fn all_zero(b: &[u8]) -> bool {
     let mut words = b.chunks_exact(8);
     words.all(|w| u64::from_ne_bytes(w.try_into().unwrap()) == 0) && words.remainder().iter().all(|&x| x == 0)
+}
+
+/// Whether `[va, va + n)` meets one of `spans` (start → end, none overlapping another); an
+/// empty range meets one that holds its address.
+fn overlaps(spans: &BTreeMap<usize, usize>, va: usize, n: usize) -> bool {
+    let end = va + n.max(1);
+    spans.range(..end).next_back().is_some_and(|(_, &e)| e > va)
 }
 
 /// `XCL_TRACE_FRAME`: how much of a title texture's top level is not zero, each time it is
@@ -1515,6 +1527,27 @@ mod tests {
         assert!(!same_as_last_upload(a, h2), "forgotten: its next upload is a first one");
         forget(a);
         forget(b);
+    }
+
+    /// One upload batch takes no two textures over the same memory (its copies are not ordered
+    /// among themselves): a span that meets a picked one, the same one or one sharing a byte,
+    /// ends the batch; spans that only touch do not.
+    #[test]
+    fn a_batch_takes_no_two_textures_over_the_same_memory() {
+        let mut spans = BTreeMap::new();
+        assert!(!overlaps(&spans, 0x1000, 0x1000), "nothing picked yet");
+        spans.insert(0x1000, 0x2000);
+        spans.insert(0x4000, 0x8000);
+        assert!(overlaps(&spans, 0x1000, 0x1000), "the same texture again");
+        assert!(overlaps(&spans, 0x1fff, 0x10), "the last byte of the first");
+        assert!(overlaps(&spans, 0x0800, 0x1000), "the start of the first");
+        assert!(overlaps(&spans, 0x5000, 0x100), "inside the second");
+        assert!(overlaps(&spans, 0x0000, 0x10000), "around both");
+        assert!(!overlaps(&spans, 0x2000, 0x2000), "between them, touching both");
+        assert!(!overlaps(&spans, 0x0000, 0x1000), "before the first, touching it");
+        assert!(!overlaps(&spans, 0x8000, 0x1000), "after the second");
+        assert!(overlaps(&spans, 0x4000, 0), "an empty texture at the second's start");
+        assert!(!overlaps(&spans, 0x3000, 0), "an empty texture between them");
     }
 
     /// Real uploads, dirty-page detection and a source changing after registration:

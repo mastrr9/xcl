@@ -298,10 +298,7 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     let (staging, mapped) = up.staging(dev, total)?;
     up.alloc.Reset().map_err(err)?;
     up.list.Reset(&up.alloc, None).map_err(err)?;
-    for (k, l, base) in &planned {
-        let (res, subs, states) = &items[*k];
-        record_into(&up.list, res, subs, l, states, states, &staging, mapped, *base);
-    }
+    record_batch(&up.list, items, &planned, &staging, mapped);
     up.list.Close().map_err(err)?;
     queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&up.list).map_err(err)?)]);
     up.value += 1;
@@ -388,6 +385,70 @@ unsafe fn layout(dev: &ID3D12Device, res: &ID3D12Resource, subs: &[Subresource],
 #[allow(clippy::too_many_arguments)]
 unsafe fn record_into(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, subs: &[Subresource], l: &Layout, before: &[D3D12_RESOURCE_STATES], after: &[D3D12_RESOURCE_STATES], up: &ID3D12Resource, mapped: *mut u8, base: u64) {
     let n = subs.len();
+    write_texels(subs, l, mapped, base);
+    let to_copy = transitions(res, before, &[D3D12_RESOURCE_STATE_COPY_DEST], n);
+    if !to_copy.is_empty() {
+        list.ResourceBarrier(&to_copy);
+    }
+    record_copies(list, res, l, up, base);
+    let back = transitions(res, &[D3D12_RESOURCE_STATE_COPY_DEST], after, n);
+    if !back.is_empty() {
+        list.ResourceBarrier(&back);
+    }
+}
+
+/// Record a batch's planned uploads (index into `items`, layout, base in `up`) on `list`. The
+/// textures of a run that names no texture twice go to COPY_DEST in one ResourceBarrier, are
+/// all copied, and go back in one more: two barrier calls a run, where one texture after
+/// another took two each and the GPU drained between the copies of every texture
+/// (`barrier_groups`).
+unsafe fn record_batch(list: &ID3D12GraphicsCommandList, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)], planned: &[(usize, Layout, u64)], up: &ID3D12Resource, mapped: *mut u8) {
+    let keys: Vec<usize> = planned.iter().map(|(k, _, _)| windows::core::Interface::as_raw(&items[*k].0) as usize).collect();
+    for run in barrier_groups(&keys) {
+        let run = &planned[run];
+        let mut to_copy = Vec::new();
+        for (k, l, base) in run {
+            let (res, subs, states) = &items[*k];
+            write_texels(subs, l, mapped, *base);
+            to_copy.extend(transitions(res, states, &[D3D12_RESOURCE_STATE_COPY_DEST], subs.len()));
+        }
+        if !to_copy.is_empty() {
+            list.ResourceBarrier(&to_copy);
+        }
+        for (k, l, base) in run {
+            record_copies(list, &items[*k].0, l, up, *base);
+        }
+        let back: Vec<D3D12_RESOURCE_BARRIER> = run.iter().flat_map(|(k, _, _)| transitions(&items[*k].0, &[D3D12_RESOURCE_STATE_COPY_DEST], &items[*k].2, items[*k].1.len())).collect();
+        if !back.is_empty() {
+            list.ResourceBarrier(&back);
+        }
+    }
+}
+
+/// `keys` (one resource each, in order) cut into the fewest consecutive runs in which no
+/// resource comes twice: the transitions of one run go in one ResourceBarrier (a resource
+/// may not be moved from the same state twice in one), and a texture uploaded twice in a
+/// batch still gets its second contents after its first.
+fn barrier_groups(keys: &[usize]) -> Vec<std::ops::Range<usize>> {
+    let mut runs = Vec::new();
+    let mut start = 0;
+    let mut seen = std::collections::HashSet::new();
+    for (i, &k) in keys.iter().enumerate() {
+        if !seen.insert(k) {
+            runs.push(start..i);
+            start = i;
+            seen.clear();
+            seen.insert(k);
+        }
+    }
+    if start < keys.len() {
+        runs.push(start..keys.len());
+    }
+    runs
+}
+
+/// Write `subs` into the mapped upload buffer (`mapped`) from `base` as `l` places them.
+unsafe fn write_texels(subs: &[Subresource], l: &Layout, mapped: *mut u8, base: u64) {
     for ((s, fp), &nrows) in subs.iter().zip(&l.fps).zip(&l.rows) {
         let pitch = fp.Footprint.RowPitch as usize;
         let row = s.row_bytes.min(pitch);
@@ -400,10 +461,10 @@ unsafe fn record_into(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, su
             }
         }
     }
-    let to_copy = transitions(res, before, &[D3D12_RESOURCE_STATE_COPY_DEST], n);
-    if !to_copy.is_empty() {
-        list.ResourceBarrier(&to_copy);
-    }
+}
+
+/// Record the copies of every subresource `l` places in `up` (from `base`) into `res`.
+unsafe fn record_copies(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, l: &Layout, up: &ID3D12Resource, base: u64) {
     for (k, fp) in l.fps.iter().enumerate() {
         let dst = D3D12_TEXTURE_COPY_LOCATION {
             pResource: std::mem::transmute_copy(res),
@@ -413,10 +474,6 @@ unsafe fn record_into(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, su
         let placed = D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: base + fp.Offset, Footprint: fp.Footprint };
         let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: placed } };
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
-    }
-    let back = transitions(res, &[D3D12_RESOURCE_STATE_COPY_DEST], after, n);
-    if !back.is_empty() {
-        list.ResourceBarrier(&back);
     }
 }
 
@@ -968,6 +1025,62 @@ mod tests {
             assert_eq!(first.1, 128 << 20);
             assert_eq!(grown, reused, "the repeated batch must reuse the staging buffer");
             assert_eq!(grown.1, 144 << 20, "staging for 132 MiB must fit the next large size class");
+        }
+    }
+
+    /// A batch's transitions go in one ResourceBarrier per run of distinct textures (two calls
+    /// for a batch of different textures, where each texture took two); a texture that comes
+    /// again starts a new run, so it is never moved from the same state twice in one call and
+    /// its later upload lands after its earlier one.
+    #[test]
+    fn upload_barriers_are_batched_per_run_of_distinct_textures() {
+        assert_eq!(barrier_groups(&[]), vec![]);
+        assert_eq!(barrier_groups(&[7]), vec![0..1]);
+        assert_eq!(barrier_groups(&[1, 2, 3, 4, 5]), vec![0..5]);
+        assert_eq!(barrier_groups(&[1, 2, 1, 3]), vec![0..2, 2..4]);
+        assert_eq!(barrier_groups(&[5, 5, 5]), vec![0..1, 1..2, 2..3]);
+        assert_eq!(barrier_groups(&[1, 2, 3, 2, 4, 1]), vec![0..3, 3..6]);
+        // every key once, in order, and no key twice within a run
+        let keys = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5];
+        let runs = barrier_groups(&keys);
+        assert_eq!(runs.iter().flat_map(|r| r.clone()).collect::<Vec<_>>(), (0..keys.len()).collect::<Vec<_>>());
+        for r in &runs {
+            let run = &keys[r.clone()];
+            assert_eq!(run.iter().collect::<std::collections::HashSet<_>>().len(), run.len(), "{run:?} names a texture twice");
+        }
+    }
+
+    /// One batch that uploads a texture twice (with another texture between) leaves it with its
+    /// second contents, and the other texture with its own.
+    #[test]
+    fn gpu_upload_batch_with_a_texture_twice_keeps_the_later_contents() {
+        let Some((dev, queue)) = device() else {
+            println!("no D3D12 device – skipping");
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+        unsafe {
+            let make = || -> ID3D12Resource {
+                let rd = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: 64,
+                    Height: 16,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    ..Default::default()
+                };
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &rd, SHADER_READ, None, &mut r).unwrap();
+                r.unwrap()
+            };
+            let fill = |seed: u8| vec![Subresource { rows: 16, row_bytes: 256, depth: 1, data: (0..16 * 256).map(|i| (i as u8).wrapping_mul(13) ^ seed).collect() }];
+            let (a, b) = (make(), make());
+            let items = vec![(a.clone(), fill(1), vec![SHADER_READ]), (b.clone(), fill(2), vec![SHADER_READ]), (a.clone(), fill(3), vec![SHADER_READ])];
+            assert!(upload_batch(&dev, &queue, &items).unwrap().is_empty(), "an upload failed");
+            assert!(read_back(&dev, &queue, &a, &items[2].1) == items[2].1, "the texture uploaded twice does not hold its second contents");
+            assert!(read_back(&dev, &queue, &b, &items[1].1) == items[1].1, "the texture between differs");
         }
     }
 
