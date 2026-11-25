@@ -219,6 +219,13 @@ mod translated {
         identity_for(source, &version.to_string())
     }
 
+    /// `XCL_DIRECT_DXIL=covered`: the programs outside the covered set stay on the HLSL path,
+    /// so its entries are another output than `=1`'s (the set itself is in the direct sources'
+    /// hash, `direct_version`).
+    pub(super) fn with_covered(id: u64, covered: bool) -> u64 {
+        if covered { identity_for(&id.to_string(), "xcl-direct-covered") } else { id }
+    }
+
     /// `identity_for` of `backend`: unchanged for the HLSL path (its entries stay valid),
     /// tagged with the direct translator's version and routing mode otherwise.
     pub(super) fn identity_with(source: &str, toolchain: &str, backend: Backend, direct_version: u64) -> u64 {
@@ -252,6 +259,7 @@ mod translated {
                 Backend::current(),
                 direct_version(crate::gpu::dxil::kernel::TRANSLATOR_VERSION, env!("XCL_DIRECT_DXIL_SOURCE_ID")),
             );
+            let id = with_covered(id, crate::gpu::dxil::kernel::covered_only());
             // `XCL_DIRECT_COMPACT=0` or `1`: the compact form forced off or on is another output
             let id = match crate::gpu::dxil::kernel::compact_mode() {
                 Some(on) if Backend::current() != Backend::Hlsl => identity_for(&id.to_string(), if on { "xcl-direct-compact-1" } else { "xcl-direct-compact-0" }),
@@ -855,6 +863,11 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
     let code = &f.data[p.offset..p.offset + p.len];
     let wave64 = super::detect_wave64(code);
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
+    // `XCL_DIRECT_DXIL=covered`: a program with an instruction outside the covered set stays on
+    // the HLSL path (the refusal is its fallback reason)
+    if crate::gpu::dxil::kernel::covered_only() {
+        crate::gpu::dxil::covered::check(code)?;
+    }
     // `XCL_PER_LANE=1`: the per-lane form first, #1426's per-instruction form where it refuses
     if super::lower_dxil::enabled() {
         match super::lower_dxil::compute_with(code, &cs, o) {
@@ -993,7 +1006,7 @@ fn compile_console_mesh(
     split_wave64: bool,
 ) -> Result<Compiled, String> {
     // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
-    if crate::gpu::dxil::kernel::enabled() {
+    if crate::gpu::dxil::kernel::enabled() && !crate::gpu::dxil::kernel::covered_only() {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
         }
@@ -1118,7 +1131,7 @@ pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: b
     let (code, g) = super::geometry_program(vs, gs)?;
     let record = g.record();
     // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
-    if crate::gpu::dxil::kernel::enabled() {
+    if crate::gpu::dxil::kernel::enabled() && !crate::gpu::dxil::kernel::covered_only() {
         let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: split_wave64, mem_windows: mem_windows(), sampler_base: 0 };
         match crate::gpu::dxil::kernel::translate_geometry(&code, o, &g) {
             Ok(k) => {
@@ -1422,6 +1435,19 @@ pub(crate) mod shader_cache_tests {
             assert_ne!(id(backend, 7, built), id(backend, 8, built), "{backend:?}: a version bump");
         }
         assert_eq!(id(Backend::Hlsl, 7, built), id(Backend::Hlsl, 8, "edited"));
+    }
+
+    /// `XCL_DIRECT_DXIL=covered` keeps its entries apart from `=1`'s (an uncovered program is
+    /// HLSL there, direct DXIL here) and from the HLSL path's; off, the identity is unchanged.
+    #[test]
+    fn covered_routing_has_its_own_identity() {
+        use translated::{identity_with, with_covered, Backend};
+        let compute = identity_with("s", "t", Backend::DirectCompute, 1);
+        assert_eq!(with_covered(compute, false), compute);
+        let covered = with_covered(compute, true);
+        let others = [identity_with("s", "t", Backend::Hlsl, 1), compute, identity_with("s", "t", Backend::DirectAll, 1)];
+        assert!(covered != 0 && !others.contains(&covered));
+        assert_ne!(covered, with_covered(identity_with("s", "t", Backend::DirectCompute, 2), true), "a direct version change re-keys it");
     }
 
     /// Hit / miss through a temp cache dir: a direct entry is reused by the same identity and

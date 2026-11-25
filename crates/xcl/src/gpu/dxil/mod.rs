@@ -16,6 +16,7 @@ pub mod cfg;
 mod compact;
 pub mod container;
 pub mod coverage;
+pub mod covered;
 pub mod graphics;
 pub mod kernel;
 mod lanes;

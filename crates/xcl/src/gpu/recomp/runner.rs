@@ -790,9 +790,10 @@ pub fn run_program(code: &[u8], state: &KernelState, extra: &[u32]) -> Result<(K
 }
 
 /// `XCL_DIRECT_DXIL=1`: kernels are translated by the direct DXIL backend (`gpu::dxil::kernel`)
-/// instead of HLSL + DXC; an unsupported instruction is an error (no fallback).
+/// instead of HLSL + DXC; an unsupported instruction is an error (no fallback). Not with
+/// `=covered`, whose routing is per program and has the HLSL path as its fallback.
 pub fn direct_dxil() -> bool {
-    crate::gpu::dxil::kernel::enabled()
+    crate::gpu::dxil::kernel::enabled() && !crate::gpu::dxil::kernel::covered_only()
 }
 
 /// A kernel through the direct DXIL backend: a wave64 program in the split form where this
