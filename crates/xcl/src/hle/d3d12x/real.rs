@@ -133,6 +133,10 @@ pub struct D3d12Stats {
     /// pipelines built in the background behind a stand-in: built, failed, still building
     #[serde(default)]
     pub background_pipelines: (usize, usize, usize),
+    /// binds that waited for a pipeline still being built, graphics then compute: waits, total
+    /// µs, longest µs, built in the call (`pso_async::blocked`)
+    #[serde(default)]
+    pub pipeline_waits: [[u64; 4]; 2],
     /// DXIL cache and compiler statistics.
     #[serde(default)]
     pub dxil_cache: crate::gpu::recomp::dxc::CacheStats,
@@ -418,6 +422,7 @@ pub fn stats() -> D3d12Stats {
         pipelines_without_translation: refusals.0,
         without_translation_by_reason: refusals.1,
         background_pipelines: super::pso_async::counts(),
+        pipeline_waits: super::pso_async::blocked(),
         dxil_cache: crate::gpu::recomp::dxc::cache_stats(),
     }
 }

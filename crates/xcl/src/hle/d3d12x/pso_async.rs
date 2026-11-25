@@ -8,7 +8,7 @@
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 
 struct Pending {
@@ -1035,12 +1035,23 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     if p.spared.load(Ordering::Acquire) {
         return resolve_spared(&p, pso);
     }
+    let already = *p.done.lock().unwrap();
+    let started = std::time::Instant::now();
     // (the title's thread is held from here until the pipeline is built or the budget is over)
-    let _held = (!*p.done.lock().unwrap()).then(Held::new);
+    let _held = (!already).then(Held::new);
     if let Some(budget) = budget {
-        return resolve_within(&p, pso, budget);
+        // a late pipeline is not waited for again: only a wait that ran is counted
+        let late = p.late.load(Ordering::Acquire);
+        let _open = (!already && !late).then(|| OpenWait::new(pso, p.compute, false, started));
+        let r = resolve_within(&p, pso, budget);
+        if !already && !late {
+            note_blocked(p.compute, false, started.elapsed());
+        }
+        return r;
     }
     let job = p.job.lock().unwrap().take();
+    let built_here = job.is_some();
+    let _open = (!already).then(|| OpenWait::new(pso, p.compute, built_here, started));
     if let Some(job) = job {
         complete(&p, job());
     }
@@ -1048,6 +1059,10 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();
+    }
+    drop(done);
+    if !already {
+        note_blocked(p.compute, built_here, started.elapsed());
     }
     match p.real.load(Ordering::Acquire) {
         0 => p.stand(pso),
@@ -1139,6 +1154,139 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
     }
 }
 
+/// What `resolve_wait` cost the threads that called it – a title's, as a rule: for graphics
+/// [0] and compute [1] pipelines, the waits, their total and longest µs, and those that built
+/// the pipeline themselves. A retail title's render thread spent most of its frames in the
+/// driver's compiler this way (on an NVIDIA GPU; its hang watchdog then ended it).
+static BLOCKED: [[AtomicU64; 4]; 2] = [const { [const { AtomicU64::new(0) }; 4] }; 2];
+const WAITS: usize = 0;
+const TOTAL_US: usize = 1;
+const LONGEST_US: usize = 2;
+const BUILT_HERE: usize = 3;
+
+/// (waits, total µs, longest µs, built by the caller) of `resolve_wait`, graphics then compute
+pub fn blocked() -> [[u64; 4]; 2] {
+    BLOCKED.each_ref().map(|k| k.each_ref().map(|c| c.load(Ordering::Relaxed)))
+}
+
+/// A `resolve_wait` that found its pipeline not built yet: counted; every power of two of them
+/// and each wait of a second or more (the first 32) is logged.
+fn note_blocked(compute: bool, built_here: bool, took: std::time::Duration) {
+    let us = took.as_micros() as u64;
+    let k = &BLOCKED[compute as usize];
+    let n = k[WAITS].fetch_add(1, Ordering::Relaxed) + 1;
+    k[TOTAL_US].fetch_add(us, Ordering::Relaxed);
+    k[LONGEST_US].fetch_max(us, Ordering::Relaxed);
+    if built_here {
+        k[BUILT_HERE].fetch_add(1, Ordering::Relaxed);
+    }
+    let kind = if compute { "compute" } else { "graphics" };
+    static LONG: AtomicUsize = AtomicUsize::new(0);
+    if us >= 1_000_000 && LONG.fetch_add(1, Ordering::Relaxed) < 32 {
+        crate::xlog_warn!(
+            "D3D12.X: a {kind} pipeline held up its caller for {} ms ({})",
+            us / 1000,
+            if built_here { "built in the call" } else { "waited for a worker" }
+        );
+    }
+    if n.is_power_of_two() {
+        let b = blocked();
+        crate::xlog_info!(
+            "D3D12.X: pipelines waited for at a bind so far: {} graphics ({} ms, longest {} ms, {} built in the call), {} compute ({} ms, longest {} ms, {} built in the call)",
+            b[0][WAITS], b[0][TOTAL_US] / 1000, b[0][LONGEST_US] / 1000, b[0][BUILT_HERE],
+            b[1][WAITS], b[1][TOTAL_US] / 1000, b[1][LONGEST_US] / 1000, b[1][BUILT_HERE],
+        );
+    }
+}
+
+/// The `resolve_wait`s still going, by stand-in and serial number (two threads can wait for one
+/// pipeline): `note_blocked` sees a wait only when it ends, and the one a title's hang watchdog
+/// ends it in never does. `xcl-pso-waits` logs each once when it passes a second.
+static OPEN: Mutex<std::collections::BTreeMap<(usize, u64), Open>> = Mutex::new(std::collections::BTreeMap::new());
+/// a wait was opened (`xcl-pso-waits` sleeps while there is none)
+static OPEN_CV: Condvar = Condvar::new();
+
+/// A wait in `OPEN`: when it started, its kind, whether the caller builds the pipeline itself,
+/// and whether it was logged.
+#[derive(Clone, Copy)]
+struct Open {
+    started: std::time::Instant,
+    compute: bool,
+    built_here: bool,
+    logged: bool,
+}
+
+/// A `resolve_wait` for a pipeline not built yet, in `OPEN` until it ends.
+struct OpenWait((usize, u64));
+
+impl OpenWait {
+    fn new(pso: usize, compute: bool, built_here: bool, started: std::time::Instant) -> OpenWait {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        static WATCH: std::sync::Once = std::sync::Once::new();
+        WATCH.call_once(|| {
+            let _ = std::thread::Builder::new().name("xcl-pso-waits".into()).spawn(watch_open_waits);
+        });
+        let key = (pso, NEXT.fetch_add(1, Ordering::Relaxed));
+        OPEN.lock().unwrap().insert(key, Open { started, compute, built_here, logged: false });
+        OPEN_CV.notify_one();
+        OpenWait(key)
+    }
+}
+
+impl Drop for OpenWait {
+    fn drop(&mut self) {
+        OPEN.lock().unwrap().remove(&self.0);
+    }
+}
+
+/// `xcl-pso-waits`: every 250 ms while a wait is open, logs the waits that passed a second
+/// (the first 32).
+fn watch_open_waits() {
+    let mut logged = 0usize;
+    loop {
+        let mut open = OPEN.lock().unwrap();
+        while open.is_empty() {
+            open = OPEN_CV.wait(open).unwrap();
+        }
+        drop(open);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let due = overdue(&mut OPEN.lock().unwrap(), std::time::Instant::now());
+        for w in due {
+            if logged >= 32 {
+                return;
+            }
+            logged += 1;
+            crate::xlog_warn!(
+                "D3D12.X: a {} pipeline has held up its caller for {} ms so far ({})",
+                if w.compute { "compute" } else { "graphics" },
+                w.ms,
+                if w.built_here { "being built in the call" } else { "waiting for a worker" }
+            );
+        }
+    }
+}
+
+/// An open wait that passed a second: its kind, how it waits, and for how long so far.
+struct Overdue {
+    compute: bool,
+    built_here: bool,
+    ms: u128,
+}
+
+/// The waits in `open` that have run a second or more at `now` and were not logged yet (they
+/// are marked logged).
+fn overdue(open: &mut std::collections::BTreeMap<(usize, u64), Open>, now: std::time::Instant) -> Vec<Overdue> {
+    let mut due = Vec::new();
+    for w in open.values_mut() {
+        let took = now.saturating_duration_since(w.started);
+        if !w.logged && took >= std::time::Duration::from_secs(1) {
+            w.logged = true;
+            due.push(Overdue { compute: w.compute, built_here: w.built_here, ms: took.as_millis() });
+        }
+    }
+    due
+}
+
 /// For binding: compute pipelines are waited for, graphics ones are not.
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
@@ -1174,4 +1322,91 @@ pub fn is_pending(pso: usize) -> bool {
 pub fn counts() -> (usize, usize, usize) {
     let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bind that waits for a lazy pipeline nobody has started builds it itself, and the time
+    /// it was held up is counted under its kind (other tests wait too: increases are checked).
+    #[test]
+    fn a_wait_that_builds_the_pipeline_is_counted_with_its_time() {
+        let standin = 0x7E57_8001usize;
+        let before = blocked();
+        submit_lazy(standin, false, Box::new(|| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            0x4401
+        }), 0);
+        assert_eq!(resolve_wait(standin), 0x4401);
+        let after = blocked();
+        let (b, a) = (before[0], after[0]);
+        assert!(a[WAITS] > b[WAITS], "the graphics wait is counted");
+        assert!(a[BUILT_HERE] > b[BUILT_HERE], "built by the caller: nobody had started it");
+        assert!(a[TOTAL_US] - b[TOTAL_US] >= 50_000, "its 50 ms are in the total");
+        assert!(a[LONGEST_US] >= 50_000);
+        released(standin);
+    }
+
+    /// A bind with a wait budget (`XCL_PSO_WAIT_MS`) is counted with the time it waited, not
+    /// as built in the call: the build goes to the workers (other tests wait too: increases
+    /// are checked).
+    #[test]
+    fn a_bounded_wait_is_counted_with_the_time_it_waited() {
+        let standin = 0x7E57_8002usize;
+        submit(standin, true, Box::new(|| {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            0x4402
+        }));
+        let before = blocked();
+        let budget = Some(std::time::Duration::from_millis(30));
+        assert_eq!(resolve_wait_for(standin, budget), standin, "not built within the budget: the stand-in");
+        let after = blocked();
+        let (b, a) = (before[1], after[1]);
+        assert!(a[WAITS] > b[WAITS], "the compute wait is counted");
+        assert!(a[TOTAL_US] - b[TOTAL_US] >= 30_000, "with the budget it waited");
+        let start = std::time::Instant::now();
+        while is_pending(standin) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = released(standin);
+    }
+
+    /// A wait is in the table of open waits while it runs (here: while the caller builds the
+    /// pipeline), and not after it.
+    #[test]
+    fn a_wait_is_open_while_it_runs() {
+        let standin = 0x7E57_8003usize;
+        let is_open = move || OPEN.lock().unwrap().iter().any(|(&(s, _), w)| s == standin && w.built_here && w.compute);
+        let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen_in_job = seen.clone();
+        submit_lazy(standin, true, Box::new(move || {
+            seen_in_job.store(is_open(), Ordering::Relaxed);
+            0x4403
+        }), 0);
+        assert_eq!(resolve_wait_for(standin, None), 0x4403);
+        assert!(seen.load(Ordering::Relaxed), "open while the pipeline was being built");
+        assert!(!is_open(), "closed when the wait ended");
+        released(standin);
+    }
+
+    /// An open wait is picked out once when it passes a second, not before and not again.
+    #[test]
+    fn an_open_wait_is_logged_once_when_it_passes_a_second() {
+        let t0 = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        let mut open = std::collections::BTreeMap::new();
+        open.insert((1, 0), Open { started: t0, compute: true, built_here: true, logged: false });
+        open.insert((2, 1), Open { started: t0 + ms(600), compute: false, built_here: false, logged: false });
+        assert!(overdue(&mut open, t0 + ms(999)).is_empty(), "under a second: nothing");
+        let due = overdue(&mut open, t0 + ms(1500));
+        assert_eq!(due.len(), 1);
+        assert!(due[0].compute && due[0].built_here);
+        assert_eq!(due[0].ms, 1500);
+        assert!(overdue(&mut open, t0 + ms(1500)).is_empty(), "logged once");
+        let due = overdue(&mut open, t0 + ms(1700));
+        assert_eq!(due.len(), 1, "the other one when it passes a second");
+        assert!(!due[0].compute && !due[0].built_here);
+        assert_eq!(due[0].ms, 1100);
+    }
 }
