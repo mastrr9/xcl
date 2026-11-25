@@ -156,12 +156,14 @@ unsafe fn as_copy_dest(list: *mut c_void, res: usize, op: impl FnOnce()) {
 }
 
 // ---------------------------------------------------------------------------------------
-// buffers left out of COMMON until the list's next barrier (labels' window buffers)
+// buffers left out of COMMON until the list's next barrier (labels' window buffers, the
+// argument-order buffer of ExecuteIndirect)
 // ---------------------------------------------------------------------------------------
 
 /// `(list, buffer, state)`: a buffer the open recording `list` left in `state` instead of moving
 /// it back to COMMON (`in_state_left`): a window buffer in COPY_DEST after a bottom-of-pipe label
-/// or a timestamp written into it. Back to COMMON at the list's next barrier of any kind (the
+/// or a timestamp written into it, the argument-order buffer in INDIRECT_ARGUMENT after an
+/// ExecuteIndirect (`bind::fresh_indirect_arguments`). Back to COMMON at the list's next barrier of any kind (the
 /// title's, XCL's own), at a wait on memory the list wrote, and before the list closes (Close,
 /// KickoffX, a mid-list split) – not at draws and dispatches.
 static LEFT_IN_STATE: Mutex<Vec<(usize, usize, D3D12_RESOURCE_STATES)>> = Mutex::new(Vec::new());
@@ -217,7 +219,7 @@ unsafe fn flush_left(list: *mut c_void) {
 /// `op` with the buffer `res` in `state`, left there for the list's next one that needs no other
 /// state of it (back to COMMON at the list's next barrier, wait on memory it wrote or close:
 /// `LEFT_IN_STATE`). True: `res` was already there, no barrier was recorded.
-unsafe fn in_state_left(list: *mut c_void, res: usize, state: D3D12_RESOURCE_STATES, op: impl FnOnce()) -> bool {
+pub(super) unsafe fn in_state_left(list: *mut c_void, res: usize, state: D3D12_RESOURCE_STATES, op: impl FnOnce()) -> bool {
     let already = left_in(list, res, state);
     if !already {
         // (the others left out of COMMON stay there)
@@ -5595,6 +5597,8 @@ mod tests {
         Write(Vec<(u64, u32)>, D3D12_WRITEBUFFERIMMEDIATE_MODE),
         Resolve(usize, u64),
         Copy(usize, usize),
+        /// a command the test records itself (an ExecuteIndirect)
+        Op(u32),
     }
 
     /// A PC list (an adopted one's layout: its PC table at vtable[-1]) recording its barrier calls,
@@ -5780,10 +5784,60 @@ mod tests {
                     assert_eq!(state.get(d).copied().unwrap_or(C), CD, "a timestamp into a window not in COPY_DEST");
                 }
                 Ev::Copy(d, _) => assert_eq!(state.get(d).copied().unwrap_or(C), CD, "a copy into a window not in COPY_DEST"),
+                Ev::Op(_) => {}
             }
         }
         assert!(state.iter().all(|(&r, &s)| s == C || r == title), "a buffer left out of COMMON at Close: {state:x?}");
         assert_eq!((labels, calls), (13, 23), "labels and timestamps, ResourceBarrier calls");
+    }
+
+    /// ExecuteIndirects in a row between two barriers move the argument-order buffer to
+    /// INDIRECT_ARGUMENT once (`bind::fresh_indirect_arguments`): a bottom-of-pipe label among them
+    /// leaves it there; the title's barrier, XCL's next transition (here a top-of-pipe label's)
+    /// and Close take it back to COMMON, and the next ExecuteIndirect moves it (and waits) again.
+    #[test]
+    fn execute_indirects_in_a_row_move_the_argument_order_buffer_once() {
+        let fake = FakeBarrierList::new();
+        let list = fake.ptr();
+        let (args, w0, a0) = (0x5_0000usize, 0x1_0000usize, 1u64 << 40);
+        const C: i32 = D3D12_RESOURCE_STATE_COMMON.0;
+        const IA: i32 = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT.0;
+        const CD: i32 = D3D12_RESOURCE_STATE_COPY_DEST.0;
+        let ei = |k: u32| unsafe { in_state_left(list, args, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, || fake.events.lock().unwrap().push(Ev::Op(k))) };
+        let (out, into) = (D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN);
+        unsafe {
+            on_create(list, 0x100, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            assert!(!ei(1) && ei(2));
+            write_window(list, w0, a0, &[1], out);
+            assert!(ei(3));
+            let label = [Ev::Barriers(vec![B::T(w0, C, CD)]), Ev::Write(vec![(a0, 1)], out)];
+            let mut want = vec![Ev::Barriers(vec![B::T(args, C, IA)]), Ev::Op(1), Ev::Op(2)];
+            want.extend(label);
+            want.push(Ev::Op(3));
+            assert_eq!(fake.take(), want);
+
+            // the title's barrier between a dispatch that writes arguments and the ExecuteIndirect
+            let uav: [u32; 8] = [2, 0, 0, 0, 0, 0, 0, 0];
+            resource_barrier_x(list, 1, &uav);
+            assert!(!ei(4));
+            assert_eq!(fake.take(), vec![Ev::Barriers(vec![B::Uav, B::T(args, IA, C), B::T(w0, CD, C)]), Ev::Barriers(vec![B::T(args, C, IA)]), Ev::Op(4)]);
+
+            // a top-of-pipe label (a value the next ExecuteIndirect may read)
+            write_window(list, w0, a0, &[2], into);
+            assert!(!ei(5));
+            before_close(list);
+            let want = vec![
+                Ev::Barriers(vec![B::T(args, IA, C), B::T(w0, C, CD)]),
+                Ev::Write(vec![(a0, 2)], into),
+                Ev::Barriers(vec![B::T(w0, CD, C)]),
+                Ev::Barriers(vec![B::T(args, C, IA)]),
+                Ev::Op(5),
+                Ev::Barriers(vec![B::T(args, IA, C)]),
+            ];
+            assert_eq!(fake.take(), want);
+            assert!(!left_in(list, args, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT));
+            on_release(list as usize);
+        }
     }
 
     /// GPU time of a list of dispatches with a bottom-of-pipe label after each, the label's window
@@ -5792,7 +5846,9 @@ mod tests {
     /// `cargo test --release -p xcl --lib -- --ignored --exact
     /// hle::d3d12x::list_x::tests::bench_label_barriers --nocapture` (`XCL_BENCH_LABELS=n` labels
     /// per list, `XCL_BENCH_GROUPS=n` groups of 64 threads per dispatch; with
-    /// `XCL_DEFER_LABEL_BARRIERS=0` both forms are the old one).
+    /// `XCL_DEFER_LABEL_BARRIERS=0` both forms are the old one). `XCL_BENCH_KIND=indirect`: the
+    /// dispatches are ExecuteIndirects with the argument-order buffer moved to INDIRECT_ARGUMENT
+    /// and back around each (as before) and left there until Close (`bind::fresh_indirect_arguments`).
     #[test]
     #[ignore]
     fn bench_label_barriers() {
@@ -5800,6 +5856,7 @@ mod tests {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         let arg = |name: &str, default: u32| std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(default);
         let (labels, groups) = (arg("XCL_BENCH_LABELS", 512).clamp(1, 16384), arg("XCL_BENCH_GROUPS", 64).max(1));
+        let indirect = std::env::var("XCL_BENCH_KIND").is_ok_and(|v| v == "indirect");
         let src = r#"
 #define RS "UAV(u0)"
 RWByteAddressBuffer w : register(u0);
@@ -5843,6 +5900,19 @@ void main(uint t : SV_DispatchThreadID) {
             let freq = queue.GetTimestampFrequency().unwrap() as f64;
             let w = window.as_raw() as usize;
             let at = window.GetGPUVirtualAddress();
+            // ExecuteIndirect: (groups, 1, 1) in an upload buffer, the argument-order buffer
+            let ei_args = buffer(D3D12_HEAP_TYPE_UPLOAD, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let mut p = std::ptr::null_mut();
+            ei_args.Map(0, None, Some(&mut p)).unwrap();
+            std::ptr::copy_nonoverlapping([groups, 1, 1].as_ptr(), p as *mut u32, 3);
+            let order_buffer = buffer(D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
+            let order = order_buffer.as_raw() as usize;
+            let arg_desc = D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() };
+            let mut sig: Option<ID3D12CommandSignature> = None;
+            dev.CreateCommandSignature(&D3D12_COMMAND_SIGNATURE_DESC { ByteStride: 12, NumArgumentDescs: 1, pArgumentDescs: &arg_desc, NodeMask: 0 }, None, &mut sig).unwrap();
+            let sig = sig.unwrap();
+            let sig = sig.as_raw() as usize;
+            type Ei = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
             let run = |deferred: bool| -> f64 {
                 let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
                 let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, &pso).unwrap();
@@ -5854,6 +5924,17 @@ void main(uint t : SV_DispatchThreadID) {
                 real::adopt(raw, real::Kind::CommandList);
                 type W = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
                 for k in 0..labels {
+                    if indirect {
+                        let op = || pc::<Ei>(raw, 59)(raw, sig, 1, ei_args.as_raw() as usize, 0, 0, 0);
+                        if deferred {
+                            in_state_left(raw, order, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, op);
+                        } else {
+                            transition(raw, order, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+                            op();
+                            transition(raw, order, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
+                        }
+                        continue;
+                    }
                     pc::<unsafe extern "system" fn(*mut c_void, u32, u32, u32)>(raw, 14)(raw, groups, 1, 1);
                     let p = D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * k as u64, Value: k + 1 };
                     let m = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
@@ -5880,7 +5961,7 @@ void main(uint t : SV_DispatchThreadID) {
                 labels_rb.Map(0, None, Some(&mut p)).unwrap();
                 let got = std::slice::from_raw_parts(p as *const u32, labels as usize).to_vec();
                 labels_rb.Unmap(0, None);
-                assert!(got.iter().enumerate().all(|(k, &v)| v == k as u32 + 1), "a label did not land (deferred: {deferred}): {:?}", &got[..got.len().min(8)]);
+                assert!(indirect || got.iter().enumerate().all(|(k, &v)| v == k as u32 + 1), "a label did not land (deferred: {deferred}): {:?}", &got[..got.len().min(8)]);
                 ticks_rb.Map(0, None, Some(&mut p)).unwrap();
                 let t = std::slice::from_raw_parts(p as *const u64, 2).to_vec();
                 ticks_rb.Unmap(0, None);
@@ -5898,8 +5979,9 @@ void main(uint t : SV_DispatchThreadID) {
                 v[v.len() / 2]
             };
             let (e, d) = (median(&mut eager), median(&mut deferred));
+            let what = if indirect { "ExecuteIndirects" } else { "labels after dispatches" };
             println!(
-                "bench_label_barriers: {labels} labels after dispatches of {groups} groups: barriers around each label {e:.3} ms, window left in COPY_DEST {d:.3} ms ({:.2} us a label saved)",
+                "bench_label_barriers: {labels} {what} of {groups} groups: barriers around each {e:.3} ms, buffer left in its state {d:.3} ms ({:.2} us each saved)",
                 (e - d) * 1e3 / labels as f64
             );
         }
