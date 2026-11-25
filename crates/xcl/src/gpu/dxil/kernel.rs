@@ -42,8 +42,16 @@ pub const TRANSLATOR_VERSION: u32 = 9;
 
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
+/// `=covered` too, for the compute programs of the covered set only ([`covered_only`]).
 pub fn enabled() -> bool {
-    std::env::var("XCL_DIRECT_DXIL").is_ok_and(|v| v == "1" || v == "all")
+    std::env::var("XCL_DIRECT_DXIL").is_ok_and(|v| v == "1" || v == "all" || v == "covered")
+}
+
+/// `XCL_DIRECT_DXIL=covered`: only console compute programs whose every instruction is in the
+/// covered set (`covered::check`) go through this translator; the others, the mesh and geometry
+/// passes and the kernel tests stay on the HLSL path.
+pub fn covered_only() -> bool {
+    std::env::var("XCL_DIRECT_DXIL").is_ok_and(|v| v == "covered")
 }
 
 /// `XCL_DIRECT_DXIL=all`: console vertex and pixel shaders too (each stage falls back to
