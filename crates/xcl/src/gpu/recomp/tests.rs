@@ -1981,6 +1981,55 @@ fn rect_list_gs_outputs() {
     }
 }
 
+/// A clip distance at .x and a cull distance at .y of one output register: each element is
+/// declared with the components of its own mask and takes its own channel, in the VS and in the
+/// mesh pass-through. Counting components up to the mask's highest bit declared the cull
+/// distance as float2 holding (clip, cull).
+#[test]
+fn clip_and_cull_sharing_a_register_keep_their_channels() {
+    use super::emit::mesh_passthrough;
+    use super::{MsInterface, VsInterface};
+    let outputs = vec![el("SV_Position", 0, 1, 3, 0, 0xF), el("SV_ClipDistance", 0, 2, 3, 1, 0x1), el("SV_CullDistance", 0, 3, 3, 1, 0x2)];
+    let vs_code = prog(&[
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0x3), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 0), ("VSRC3", 0)], None),
+    ]);
+    let vsi = VsInterface { inputs: vec![], outputs: outputs.clone(), attr_base: 4, params: None };
+    let vs = translate(&vs_code, &Options { mode: Mode::Vertex(vsi), wave64: true, ..Default::default() }).unwrap().hlsl;
+    assert!(vs.contains("float p0 : SV_ClipDistance0;") && vs.contains("float p1 : SV_CullDistance0;"), "{vs}");
+    assert!(vs.contains("xo.p0 = asfloat(v8);") && vs.contains("xo.p1 = asfloat(v9);"), "{vs}");
+    let ms = MsInterface { outputs, threads: 32, max_vertices: 64, max_primitives: 64 };
+    let pass = mesh_passthrough(&ms);
+    assert!(pass.contains("float p0 : SV_ClipDistance0;") && pass.contains("float p1 : SV_CullDistance0;"), "{pass}");
+    assert!(pass.contains("o.p0 = asfloat(res.Load4(b + 16u).x);") && pass.contains("o.p1 = asfloat(res.Load4(b + 32u).y);"), "{pass}");
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&vs, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{vs}"));
+        super::dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+    }
+}
+
+/// Five clip distances and two cull distances, the cull pair in .zw after two clip distances
+/// in .xy: 4 + 2 + 2 components, the D3D12 limit of 8. Counting up to each mask's highest bit
+/// gave the cull pair 4 (10 in all), which DXC refuses.
+#[test]
+fn clip_and_cull_count_only_their_mask() {
+    use super::emit::mesh_passthrough;
+    use super::MsInterface;
+    let outputs = vec![
+        el("SV_Position", 0, 1, 3, 0, 0xF),
+        el("SV_ClipDistance", 0, 2, 3, 1, 0xF),
+        el("SV_ClipDistance", 1, 2, 3, 2, 0x3),
+        el("SV_CullDistance", 0, 3, 3, 2, 0xC),
+    ];
+    let ms = MsInterface { outputs, threads: 32, max_vertices: 64, max_primitives: 64 };
+    let pass = mesh_passthrough(&ms);
+    assert!(pass.contains("float4 p0 : SV_ClipDistance0;") && pass.contains("float2 p1 : SV_ClipDistance1;") && pass.contains("float2 p2 : SV_CullDistance0;"), "{pass}");
+    assert!(pass.contains("o.p1 = asfloat(res.Load4(b + 32u).xy);") && pass.contains("o.p2 = asfloat(res.Load4(b + 48u).zw);"), "{pass}");
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+    }
+}
+
 /// `emit::rect_list_gs` on the full-screen pass a downstream build (theaustinayers/xcl, build 5,
 /// via #189) reports from a retail title: positions (−1,1) (−1,−1) (1,−1), texture coordinates
 /// (0,0) (0,1) (1,1), the shared corner v1 and the implied one (1,1) with (1,0). Plain HLSL
