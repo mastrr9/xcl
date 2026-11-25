@@ -313,6 +313,16 @@ static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
 static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen)`
 static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
+/// With deferred looks (`looks`), the same key's ranges split: the textures' (looked at by the
+/// submitting thread) and the rest of the sparse tiles' (by the look worker)
+type Split = (Arc<Vec<(usize, usize)>>, Arc<Vec<(usize, usize)>>);
+static SPLIT_CACHE: Mutex<Option<((u64, u64, u64), Split)>> = Mutex::new(None);
+/// With deferred looks: the pages the look worker found written, for the next texture look on a
+/// submitting thread. Held by either while it looks (the worker a slice at a time), so a page a
+/// look of one took the write mark of is here before the other's next look begins.
+static FOUND: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// bytes the look worker looks at under `FOUND` at once (a submitting thread waits for that)
+const LOOK_SLICE: usize = 128 << 20;
 /// the queue uploads go to, per device
 static QUEUES: Mutex<BTreeMap<usize, ID3D12CommandQueue>> = Mutex::new(BTreeMap::new());
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
@@ -696,6 +706,73 @@ pub(super) fn looks_on_this_thread() -> u64 {
     LOOKS.with(|n| n.get())
 }
 
+/// `cached_watch_ranges` split for deferred looks: the textures' ranges and the sparse tiles'
+/// ranges outside them (each clipped to the write-watched regions, merged as there).
+fn cached_split_ranges(u: &crate::gpu::uma::Uma) -> Split {
+    let key = (
+        super::sparse::mapped_gen(),
+        TEXTURES_GEN.load(Ordering::Acquire),
+        crate::hle::kernelx::graphics_reservations_gen(),
+    );
+    if let Some((k, ref split)) = *SPLIT_CACHE.lock().unwrap() {
+        if k == key {
+            return split.clone();
+        }
+    }
+    let mut regions = u.watch_regions();
+    regions.extend(crate::hle::kernelx::graphics_reservations());
+    let wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
+    let (textures, rest) = split_watch_ranges(&regions, wanted, super::sparse::mapped_ranges());
+    let split = (Arc::new(textures), Arc::new(rest));
+    *SPLIT_CACHE.lock().unwrap() = Some((key, split.clone()));
+    split
+}
+
+/// `watch_ranges` of `textures` and of the sparse `tiles` outside those: each watched page of
+/// either is in one of the two, none in both.
+fn split_watch_ranges(regions: &[(usize, usize)], textures: Vec<(usize, usize)>, tiles: Vec<(usize, usize)>) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    let textures = watch_ranges(regions, textures);
+    let rest = super::looks::subtract(&watch_ranges(regions, tiles), &textures);
+    (textures, rest)
+}
+
+/// Deferred look `n` on the look worker (`looks`): the sparse tiles outside the textures, then
+/// the copies of what was written there and in `pages` (found by the submitting threads), then
+/// the look fence's signal for `n`.
+fn deferred_look(n: u64, pages: Vec<usize>) {
+    unsafe {
+        let mut dirty = pages;
+        let mut page = 0x1000u32;
+        if let Some(u) = crate::gpu::uma::get() {
+            let t0 = std::time::Instant::now();
+            let (_, rest) = cached_split_ranges(u);
+            WATCH_BUF.with(|wcell| {
+                let mut buf = wcell.borrow_mut();
+                if buf.len() < 16384 {
+                    buf.resize(16384, std::ptr::null_mut());
+                }
+                for &(base, size) in rest.iter() {
+                    let mut at = base;
+                    while at < base + size {
+                        let len = (base + size - at).min(LOOK_SLICE);
+                        let mut found = FOUND.lock().unwrap();
+                        let from = dirty.len();
+                        take_written(at, len, &mut buf, &mut dirty, &mut page);
+                        // a texture over these pages now, or one the split above did not know yet
+                        found.extend_from_slice(&dirty[from..]);
+                        drop(found);
+                        at += len;
+                    }
+                }
+            });
+            dirty.sort_unstable();
+            dirty.dedup();
+            super::sparse::note_watch(t0.elapsed(), dirty.len());
+        }
+        super::sparse::look_done(&dirty, page as usize, n);
+    }
+}
+
 /// Run `f` as XCL's own GPU work: ExecuteCommandLists inside it does not refresh.
 pub(super) fn own_work<R>(f: impl FnOnce() -> R) -> R {
     let was = BUSY.with(|b| b.replace(true));
@@ -751,7 +828,14 @@ unsafe fn refresh_once(queue: *mut c_void) {
     recheck_gpu_view_sources();
     let watch_t0 = std::time::Instant::now();
     let mut page = 0x1000u32;
-    let ranges = cached_watch_ranges(u);
+    // deferred looks: this thread looks at the textures, the look worker at the sparse tiles
+    let look_fence = (sparse && super::looks::enabled()).then(super::sparse::look_fence).flatten().filter(|_| super::looks::start(deferred_look));
+    let ranges = match look_fence {
+        Some(_) => cached_split_ranges(u).0,
+        None => cached_watch_ranges(u),
+    };
+    // (deferred) the pages found here in the sparse windows, for the look this submit waits for
+    let mut to_look: Vec<usize> = Vec::new();
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
         dirty.clear();
@@ -760,11 +844,19 @@ unsafe fn refresh_once(queue: *mut c_void) {
             if buf.len() < 16384 {
                 buf.resize(16384, std::ptr::null_mut());
             }
+            let found = look_fence.is_some().then(|| FOUND.lock().unwrap());
             for &(base, size) in ranges.iter() {
                 take_written(base, size, &mut buf, &mut dirty, &mut page);
             }
+            if let Some(mut found) = found {
+                to_look.extend(dirty.iter().copied().filter(|&p| u.is_sparse(p)));
+                dirty.append(&mut found);
+            }
         });
         dirty.sort_unstable();
+        if look_fence.is_some() {
+            dirty.dedup();
+        }
         dirty.len()
     });
     super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
@@ -798,12 +890,24 @@ unsafe fn refresh_once(queue: *mut c_void) {
         }
     }
     // the title's own memory: what the CPU wrote goes to its video memory first
+    let look = look_fence.as_ref().map(|fence| {
+        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
+            super::sparse::note_look_queue(q);
+        }
+        (fence, super::looks::LOOKS.request(&to_look))
+    });
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
-        DIRTY_BUF.with(|dcell| {
-            let dirty = dcell.borrow();
-            super::sparse::before_execute(q, &dirty, page as usize);
-            super::vram::before_execute(q);
-        });
+        match look {
+            Some((fence, n)) => {
+                super::sparse::wait_for_look(q, fence, n);
+                super::vram::before_execute(q);
+            }
+            None => DIRTY_BUF.with(|dcell| {
+                let dirty = dcell.borrow();
+                super::sparse::before_execute(q, &dirty, page as usize);
+                super::vram::before_execute(q);
+            }),
+        }
     }
     let recheck_frame = {
         let (p, b) = super::present::counters();
@@ -1748,6 +1852,102 @@ mod tests {
                 assert!(dirty.is_empty(), "the look reset what it reported");
             }
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// Deferred looks split the one look into the textures' and the rest of the sparse tiles':
+    /// every page the one look watched for either is in exactly one of them.
+    #[test]
+    fn split_looks_watch_every_page_of_the_one_look_once() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = |m: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % m as u64) as usize
+        };
+        const P: usize = 0x1000;
+        for _ in 0..100 {
+            let regions: Vec<(usize, usize)> = (0..1 + next(3)).map(|k| (0x1000_0000 * (k + 1) + next(64) * P, (1 + next(4096)) * P)).collect();
+            let (n_textures, n_tiles) = (next(6), next(12));
+            let mut spans = |n: usize, tile: usize| -> Vec<(usize, usize)> {
+                (0..n).map(|_| {
+                    let a = (0x1000_0000 * (1 + next(4)) + next(5000) * P) & !(tile - 1);
+                    (a, a + (1 + next(40)) * tile)
+                }).collect()
+            };
+            let textures = spans(n_textures, P);
+            let tiles = spans(n_tiles, 0x1_0000);
+            let one = watch_ranges(&regions, textures.iter().chain(&tiles).copied().collect());
+            let (tex, rest) = split_watch_ranges(&regions, textures.clone(), tiles.clone());
+            let has = |r: &[(usize, usize)], p: usize| r.iter().any(|&(b, n)| p >= b && p < b + n);
+            for &(a, b) in textures.iter().chain(&tiles) {
+                for p in (a..b).step_by(P) {
+                    if has(&one, p) {
+                        assert!(has(&tex, p) != has(&rest, p), "page {p:#x}: in the textures' look {}, in the rest's {}", has(&tex, p), has(&rest, p));
+                    }
+                }
+            }
+            for &(b, n) in tex.iter().chain(&rest) {
+                for p in (b..b + n).step_by(P) {
+                    assert!(has(&regions, p), "page {p:#x} is watched outside the regions");
+                }
+            }
+            assert!(rest.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0), "the rest's ranges overlap or are out of order");
+        }
+    }
+
+    /// What a submit's look costs the submitting thread without and with deferred looks: a
+    /// write-watch look of a written and reset region (`XCL_LOOK_BENCH_MB`, 512 by default; the
+    /// sparse tiles of a retail title's menu were ~2 GB), against asking for a look.
+    /// `cargo test -p xcl --lib --release -- --ignored --exact
+    /// hle::d3d12x::title_textures::tests::look_cost_on_the_submitting_thread --nocapture`
+    #[test]
+    #[ignore]
+    fn look_cost_on_the_submitting_thread() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const PAGE: usize = 0x1000;
+        const LOOKS: u32 = 50;
+        let mb: usize = std::env::var("XCL_LOOK_BENCH_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(512);
+        let size = mb << 20;
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert!(base != 0, "{mb} MB not committed");
+            for p in (base..base + size).step_by(PAGE) {
+                (p as *mut u8).write_volatile(1);
+            }
+            let mut buf = vec![std::ptr::null_mut::<c_void>(); 16384];
+            let (mut dirty, mut page) = (Vec::new(), 0u32);
+            take_written(base, size, &mut buf, &mut dirty, &mut page);
+            assert_eq!(dirty.len(), size / PAGE);
+            let t = std::time::Instant::now();
+            for i in 0..LOOKS as usize {
+                // a few pages written between submits, as a title does
+                for k in 0..64 {
+                    ((base + ((i * 64 + k) * 7919 * PAGE) % size) as *mut u8).write_volatile(2);
+                }
+                dirty.clear();
+                take_written(base, size, &mut buf, &mut dirty, &mut page);
+            }
+            let look = t.elapsed() / LOOKS;
+            let deferred = super::super::looks::Looks::new();
+            let t = std::time::Instant::now();
+            for _ in 0..LOOKS {
+                let n = deferred.request(&dirty);
+                let (begun, _) = deferred.begin();
+                assert_eq!(begun, n);
+                deferred.issued(n);
+            }
+            let ask = t.elapsed() / LOOKS;
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+            println!(
+                "look of {mb} MB ({} pages found): {:.3} ms a submit ({:.3} ms per GB); deferred: {:.1} us a submit to ask for a look",
+                dirty.len(),
+                look.as_secs_f64() * 1e3,
+                look.as_secs_f64() * 1e3 * 1024.0 / mb as f64,
+                ask.as_secs_f64() * 1e6
+            );
         }
     }
 

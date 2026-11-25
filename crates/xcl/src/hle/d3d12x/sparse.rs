@@ -415,6 +415,14 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// (a list's `Reset`, with `XCL_DRED=1` on every start): the two then waited for each other.
 static QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
 
+/// The fence the deferred looks' values are signalled on (`looks`), outside `STATE`: a queue
+/// is made to wait for it while the worker holds `STATE` for its look.
+static LOOK_FENCE: Mutex<Option<ID3D12Fence>> = Mutex::new(None);
+
+/// Title queues of the deferred submits since the last look, for `State::note_queue` (tiles
+/// unmapped from then on wait for their work), outside `STATE` for the same reason.
+static LOOK_QUEUES: Mutex<Vec<ID3D12CommandQueue>> = Mutex::new(Vec::new());
+
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
 pub fn pool_bytes() -> (usize, usize) {
     let g = lock_state();
@@ -584,6 +592,18 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             // its last buffers reaches `forget_buffer`, which takes the lock (#344)
             // (the queue first: `queue()` never answers with one older than the state's)
             let old_queue = QUEUE.lock().unwrap().replace(s.queue.clone());
+            if super::looks::enabled() {
+                match dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
+                    Ok(f) => {
+                        let _ = f.SetName(windows::core::w!("xcl deferred look fence"));
+                        // queues still waiting for one of the old fence's looks go on
+                        if let Some(old) = LOOK_FENCE.lock().unwrap().replace(f) {
+                            let _ = old.Signal(u64::MAX);
+                        }
+                    }
+                    Err(e) => crate::xlog_warn!("sparse windows: no fence for deferred looks ({e}): looking before each submit"),
+                }
+            }
             let old = STATE.lock().unwrap().replace(s);
             drop(old);
             drop(old_queue);
@@ -1269,9 +1289,24 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     s.rb_value += 1;
     let v = s.rb_value;
     if queue.Signal(&s.rb_fence, v).is_ok() {
+        if super::looks::enabled() {
+            // the sparse queue is to wait for `queue`'s lists up to here, and they wait for their
+            // deferred looks: those looks' signals go on the sparse queue first (the look worker
+            // takes `STATE` for them), or the two queues wait for each other
+            let rb = s.rb_fence.as_raw();
+            drop(g);
+            super::looks::LOOKS.wait_issued();
+            g = lock_state();
+            // (windows set up again meanwhile: `v` is not a value of this state's fence)
+            if g.as_ref().is_none_or(|s| s.rb_fence.as_raw() != rb) {
+                return;
+            }
+        }
+        let Some(s) = g.as_mut() else { return };
         let _ = s.queue.Wait(&s.rb_fence, v);
         super::list_x::note_internal_wait(s.queue.as_raw() as usize, "sparse readback behind a title queue", &s.rb_fence, v);
     }
+    let Some(s) = g.as_mut() else { return };
     s.readback_ranges(&merged);
 }
 
@@ -1556,6 +1591,60 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     s.note_queue(queue);
+    upload_cpu_writes(s, dirty, page, t0);
+    let q = queue.as_raw() as usize;
+    if s.value > 0 && s.waited.get(&q).copied().unwrap_or(0) < s.value {
+        let _ = queue.Wait(&s.fence, s.value);
+        super::list_x::note_internal_wait(q, "sparse uploads and tile mappings", &s.fence, s.value);
+        s.waited.insert(q, s.value);
+    }
+}
+
+/// The fence of the deferred looks, once there is one (`looks`).
+pub fn look_fence() -> Option<ID3D12Fence> {
+    LOOK_FENCE.lock().unwrap().clone()
+}
+
+/// Before asking for the look of a deferred submit on `queue`: the look notes the queue, as
+/// `before_execute` does, before it unmaps anything.
+pub fn note_look_queue(queue: &ID3D12CommandQueue) {
+    let mut q = LOOK_QUEUES.lock().unwrap();
+    if !q.iter().any(|k| k.as_raw() == queue.as_raw()) {
+        q.push(queue.clone());
+    }
+}
+
+/// Before the title's ExecuteCommandLists on `queue`: it GPU-waits for deferred look `n`.
+pub unsafe fn wait_for_look(queue: &ID3D12CommandQueue, fence: &ID3D12Fence, n: u64) {
+    let _ = queue.Wait(fence, n);
+    super::list_x::note_internal_wait(queue.as_raw() as usize, "deferred look for CPU writes", fence, n);
+}
+
+/// Deferred look `n` (`looks`): `before_execute`'s copies of the pages the CPU wrote (`dirty`),
+/// then the sparse queue signals `n` on the look fence after them and after every tile mapping
+/// before them. Signalled from the CPU when there is no sparse queue to do it.
+pub unsafe fn look_done(dirty: &[usize], page: usize, n: u64) {
+    let t0 = std::time::Instant::now();
+    let Some(fence) = look_fence() else { return };
+    let mut g = lock_state();
+    let signalled = match g.as_mut() {
+        Some(s) => {
+            for q in std::mem::take(&mut *LOOK_QUEUES.lock().unwrap()) {
+                s.note_queue(&q);
+            }
+            upload_cpu_writes(s, dirty, page, t0);
+            s.queue.Signal(&fence, n).is_ok()
+        }
+        None => false,
+    };
+    drop(g);
+    if !signalled {
+        let _ = fence.Signal(n);
+    }
+}
+
+/// `before_execute` with the state locked, but for the queue's wait.
+unsafe fn upload_cpu_writes(s: &mut State, dirty: &[usize], page: usize, t0: std::time::Instant) {
     // the title's work sees what was decommitted unmapped, as it was
     let flushed = s.flush_parked();
     let drained = s.drain_quarantined();
@@ -1633,12 +1722,6 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
     dirty_runs.clear();
     s.scratch_runs = dirty_runs;
-    let q = queue.as_raw() as usize;
-    if s.value > 0 && s.waited.get(&q).copied().unwrap_or(0) < s.value {
-        let _ = queue.Wait(&s.fence, s.value);
-        super::list_x::note_internal_wait(q, "sparse uploads and tile mappings", &s.fence, s.value);
-        s.waited.insert(q, s.value);
-    }
 }
 
 /// A buffer the title places at `va` in a sparse window (`bytes` long, `desc` the PC
