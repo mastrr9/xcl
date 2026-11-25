@@ -777,8 +777,9 @@ static GLOBAL: OnceLock<Option<Uma>> = OnceLock::new();
 /// The title's graphics memory XCL places in the coherent window (`note_coherent_need`) is
 /// known only once it asks for it, and the window is committed when it is made: its size is
 /// what the title asked for in its last run (`<data>/cache/uma_coherent.txt`) and XCL's own
-/// 512 MB, at most a window; a whole window in the title's first run (no file yet; not under
-/// Wine), which then writes what it asked for, 0 included. `XCL_COHERENT_MB` chooses it.
+/// 512 MB, at most what the runtime layout commits (`max_coherent_bytes`); a whole window in
+/// the title's first run (no file yet; not under Wine), which then writes what it asked for, 0
+/// included. `XCL_COHERENT_MB` chooses it (up to the same cap).
 fn coherent_file() -> std::path::PathBuf {
     crate::state::data_dir().join("cache").join("uma_coherent.txt")
 }
@@ -810,13 +811,18 @@ pub fn coherent_hint_for(windows: usize) -> usize {
         // what it asks for this run replaces it (`note_coherent_need`); a title that asks for
         // nothing has 512 MB from its second run
         write_coherent_file(0);
-        if size >= MAX_SIZE {
+        if env_mb.is_none() && size >= MAX_SIZE {
             crate::xlog_info!("UMA: the title's first run: a {} MB coherent window until what it asks for is learned", size >> 20);
         } else if env_mb.is_none() && crate::util::under_wine() {
             crate::xlog_info!("UMA: the title's first run under Wine: the coherent window stays at {} MB", size >> 20);
         }
     }
     size
+}
+
+/// A coherent size made for a larger runtime layout, cut to what a layout of `windows` windows commits.
+fn for_layout(hint: usize, windows: usize) -> usize {
+    hint.min(max_coherent_bytes(windows))
 }
 
 /// What the title asked for in its last run from `uma_coherent.txt` as read (None: its first
@@ -902,7 +908,8 @@ pub fn get() -> Option<&'static Uma> {
             let u = if req > MAX_WINDOWS {
                 Uma::for_runtime_windows((mb << 20).max(coherent), coherent, req).or_else(|| {
                     crate::xlog_warn!("UMA: could not reserve {req} aligned windows below 1 TiB – falling back to {MAX_WINDOWS}");
-                    let fallback = coherent_hint_for(MAX_WINDOWS);
+                    // the hint already read (and, in a first run, wrote) the coherent file: reuse it
+                    let fallback = for_layout(coherent, MAX_WINDOWS);
                     Uma::for_runtime_with((mb << 20).max(fallback), fallback)
                 })
             } else {
@@ -1053,6 +1060,16 @@ mod tests {
         assert_eq!(coherent_size(Some(6 << 30), enough, None, false, cap), (6 << 30) + RUNTIME_COMMITTED_CAP);
         assert_eq!(coherent_size(None, enough, None, false, cap), MAX_SIZE);
         assert_eq!(coherent_size(Some(30 << 30), enough, None, false, cap), cap);
+    }
+
+    /// The 4-window fallback after a failed 8/16-window reservation keeps the hint already
+    /// made (a first run's whole window, not the 0 the first call wrote), cut to its own cap.
+    #[test]
+    fn fallback_layout_reuses_the_hint_cut_to_its_cap() {
+        assert_eq!(for_layout(MAX_SIZE, MAX_WINDOWS), MAX_SIZE);
+        assert_eq!(for_layout(RUNTIME_COMMITTED_CAP, MAX_WINDOWS), RUNTIME_COMMITTED_CAP);
+        assert_eq!(for_layout(3 * MAX_SIZE, MAX_WINDOWS), MAX_SIZE);
+        assert_eq!(for_layout(3 * MAX_SIZE, 8), 3 * MAX_SIZE);
     }
 
     /// Only a missing file in a title's run is a first run; one that cannot be read or parsed
