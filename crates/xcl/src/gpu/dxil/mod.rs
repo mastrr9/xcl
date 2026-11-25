@@ -47,6 +47,8 @@ mod tests;
 #[cfg(test)]
 mod ops_tests;
 #[cfg(test)]
+mod covered_tests;
+#[cfg(test)]
 mod bitreader_tests;
 #[cfg(test)]
 mod robustness_tests;
