@@ -1676,7 +1676,8 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         recomp::Mode::Vertex(_) => vec![("vs_6_6", None)],
                         recomp::Mode::Pixel(_) => vec![("ps_6_6", None)],
                         recomp::Mode::Compute(_) => vec![("cs_6_6", None)],
-                        recomp::Mode::Mesh(ms) => vec![("cs_6_6", None), ("ms_6_6", Some(recomp::mesh_passthrough(ms)))],
+                        // the pass-through of a pipeline without a PS (the one known without the PS)
+                        recomp::Mode::Mesh(ms) => vec![("cs_6_6", None), ("ms_6_6", Some(recomp::emit::pipeline_passthrough(ms, None).0))],
                         _ => {
                             skipped.fetch_add(1, Ordering::Relaxed);
                             continue;
