@@ -1450,9 +1450,22 @@ impl StreamDecoder {
     /// Decode one WMA/XMA frame from `self.reservoir`.
     /// Returns `(more_frames, got_frame)`.
     fn decode_frame(&mut self, out_frame: &mut [[f32; SAMPLES_PER_FRAME]; MAX_CHANNELS_PER_STREAM]) -> (bool, bool) {
+        // Borrow the reservoir for the frame instead of cloning all 32 KB of it (an allocation
+        // and a copy per 512-sample frame). Frame decoding only reads the reservoir, and
+        // `save_bits` (the only writer) is never reached from here, so take it and put it back.
+        let data = std::mem::take(&mut self.reservoir.buf);
+        let result = self.decode_frame_from(&data, out_frame);
+        self.reservoir.buf = data;
+        result
+    }
+
+    fn decode_frame_from(
+        &mut self,
+        data: &[u8],
+        out_frame: &mut [[f32; SAMPLES_PER_FRAME]; MAX_CHANNELS_PER_STREAM],
+    ) -> (bool, bool) {
         let st = static_tables();
-        let data = self.reservoir.buf.clone();
-        let mut br = BitReader::new(&data, self.num_saved_bits);
+        let mut br = BitReader::new(data, self.num_saved_bits);
         br.skip_bits(self.frame_offset);
 
         let len = if self.len_prefix {
