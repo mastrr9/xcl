@@ -1187,19 +1187,23 @@ pub(super) unsafe extern "system" fn create_placed_resource_layout_x(this: *mut 
     create_placed_resource_x(this, va, desc, layout_state(layout), clear, riid, ppv)
 }
 
-/// The resource state (D3D12_RESOURCE_STATES) of a D3D12_BARRIER_LAYOUT (undefined: COMMON).
+/// The resource state (D3D12_RESOURCE_STATES) of a D3D12_BARRIER_LAYOUT (undefined, the
+/// queue-specific COMMON layouts and the video ones: COMMON). The DIRECT_QUEUE_* and
+/// COMPUTE_QUEUE_* layouts (18 – 29) are the queue's view of the plain ones.
 pub(super) fn layout_state(layout: u32) -> u32 {
     match layout {
-        1 => 0xAC3, // generic read
-        2 => 0x4,   // render target
-        3 => 0x8,   // unordered access
-        4 => 0x10,  // depth write
-        5 => 0x20,  // depth read
-        6 => 0xC0,  // shader resource (all stages)
-        7 => 0x800, // copy source
-        8 => 0x400, // copy dest
-        9 => 0x2000, // resolve source
-        10 => 0x1000, // resolve dest
+        1 | 19 | 25 => 0xAC3, // generic read
+        2 => 0x4,             // render target
+        3 | 20 | 26 => 0x8,   // unordered access
+        4 => 0x10,            // depth write
+        5 => 0x20,            // depth read
+        6 | 21 => 0xC0,       // shader resource (all stages)
+        27 => 0x40,           // shader resource (compute: non-pixel)
+        7 | 22 | 28 => 0x800, // copy source
+        8 | 23 | 29 => 0x400, // copy dest
+        9 => 0x2000,          // resolve source
+        10 => 0x1000,         // resolve dest
+        11 => 0x100_0000,     // shading rate source
         _ => 0,
     }
 }
@@ -1266,6 +1270,39 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every D3D12_BARRIER_LAYOUT with a legacy equivalent gets it, the queue-specific ones too.
+    #[test]
+    fn barrier_layouts_become_resource_states() {
+        let s = |l: D3D12_BARRIER_LAYOUT| layout_state(l.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_UNDEFINED), 0);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_COMMON), 0);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_GENERIC_READ), D3D12_RESOURCE_STATE_GENERIC_READ.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_RENDER_TARGET), D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE), D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ), D3D12_RESOURCE_STATE_DEPTH_READ.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_SHADER_RESOURCE), D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_COPY_SOURCE), D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_COPY_DEST), D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_RESOLVE_SOURCE), D3D12_RESOURCE_STATE_RESOLVE_SOURCE.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_RESOLVE_DEST), D3D12_RESOURCE_STATE_RESOLVE_DEST.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_SHADING_RATE_SOURCE), D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE.0 as u32);
+        // the queue-specific layouts: their queue's view of the same states
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COMMON), 0);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_GENERIC_READ), D3D12_RESOURCE_STATE_GENERIC_READ.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE), D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_SOURCE), D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_DEST), D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COMMON), 0);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_GENERIC_READ), D3D12_RESOURCE_STATE_GENERIC_READ.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_SHADER_RESOURCE), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_SOURCE), D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_DEST), D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_VIDEO_QUEUE_COMMON), 0);
+    }
 
     #[test]
     fn console_types_and_descs_become_pc_ones() {
