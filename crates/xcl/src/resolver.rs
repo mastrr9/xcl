@@ -258,7 +258,27 @@ fn resolve_inner_opt(key: &str, what: &ImportName, depth: u32, allow_stub: bool)
             return Some((a, Source::HleOther(m.name.to_string())));
         }
     }
+    if let Some((a, dll)) = base_system_by_name(key, what) {
+        return Some((a, Source::System(dll.to_string())));
+    }
     allow_stub.then(|| stub_for(key, None, what))
+}
+
+/// The PC's base system DLLs, for a console DLL that has no route here and no PC counterpart.
+/// Not the network DLLs (`XCL_NETWORK=0` answers those by its own routes).
+const BASE_SYSTEM_DLLS: &[&str] = &["kernelbase.dll", "kernel32.dll", "user32.dll", "advapi32.dll", "combase.dll"];
+
+/// A console system DLL XCL has no route for and the PC does not have (as `minuserx.dll`,
+/// `kernel32legacy.dll`, `advapi32legacy.dll` and `minappmodelx.dll` once were, before each got
+/// its route): a function imported from it by name that the PC's base system DLLs have under the
+/// same name is that function, not a stub returning 0 (a title's CreateWindowExW, InitializeSRWLock
+/// or RegOpenKeyW that "succeeded" with a null result). Ordinals are DLL-specific and stay stubs,
+/// as does a function missing from a DLL the PC does have.
+fn base_system_by_name(key: &str, what: &ImportName) -> Option<(usize, &'static str)> {
+    if !matches!(what, ImportName::Name { .. }) || system_module(key).is_some() {
+        return None;
+    }
+    BASE_SYSTEM_DLLS.iter().find_map(|&dll| system_proc(dll, what).map(|a| (a, dll)))
 }
 
 /// `XCL_TRACE_IMPORTS`: which imports get a call tracer (arguments and result of every call
@@ -359,6 +379,9 @@ pub fn classify(dll: &str, what: &ImportName) -> Source {
                 if let Some((m, _)) = reg.find_any(name) {
                     return Source::HleOther(m.name.to_string());
                 }
+            }
+            if let Some((_, dll)) = base_system_by_name(&key, what) {
+                return Source::System(dll.to_string());
             }
             Source::Stub
         }
@@ -486,6 +509,30 @@ mod tests {
         }
         let h = load_library("advapi32legacy.dll").expect("LoadLibrary(advapi32legacy.dll)");
         assert!(get_proc_address(h, &name("LsaOpenPolicy")).is_some(), "GetProcAddress(advapi32legacy, LsaOpenPolicy)");
+    }
+
+    /// A console DLL with no route and no PC counterpart: a function the PC's base system DLLs
+    /// have by that name resolves there (before: a stub returning 0). An ordinal, or a name no
+    /// base DLL has, stays a stub; a PC DLL that lacks the function is not searched further.
+    #[test]
+    fn unrouted_console_dll_functions_resolve_by_name_in_base_system_dlls() {
+        let name = |s: &str| ImportName::Name { hint: 0, name: s.into() };
+        let dll = "xcl_console_only_probe.dll";
+        let (a, s) = resolve_inner(dll, &name("GetCurrentProcessId"), 0);
+        assert_eq!(s, Source::System("kernelbase.dll".into()));
+        assert_eq!(Some(a), system_proc("kernelbase.dll", &name("GetCurrentProcessId")));
+        let f: extern "system" fn() -> u32 = unsafe { std::mem::transmute(a) };
+        assert_eq!(f(), std::process::id());
+        let (a, s) = resolve_inner(dll, &name("GetSystemMetrics"), 0);
+        assert_eq!(s, Source::System("user32.dll".into()));
+        assert_eq!(Some(a), system_proc("user32.dll", &name("GetSystemMetrics")));
+        assert_eq!(classify(dll, &name("GetSystemMetrics")), Source::System("user32.dll".into()));
+        // ordinals and unknown names stay stubs
+        assert_eq!(resolve_inner(dll, &ImportName::Ordinal(1), 0).1, Source::Stub);
+        assert_eq!(resolve_inner(dll, &name("XclNoSuchFunctionAnywhere"), 0).1, Source::Stub);
+        assert_eq!(classify(dll, &name("XclNoSuchFunctionAnywhere")), Source::Stub);
+        // version.dll is on the PC: what it lacks is not taken from kernelbase
+        assert_eq!(resolve_inner("version.dll", &name("GetCurrentProcessId"), 0).1, Source::Stub);
     }
 
     #[test]
