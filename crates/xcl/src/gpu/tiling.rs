@@ -204,6 +204,25 @@ impl Layout {
         block * self.block_bytes + (xor as usize ^ self.base_xor)
     }
 
+    /// the in-block offset bits z (a depth or array slice) gives
+    fn z_bits(&self, z: usize) -> usize {
+        (self.oz[z % self.block_d] ^ self.hz[(z / self.block_d) % self.hz.len()]) as usize
+    }
+
+    /// Elements of the longest run (a power of two, at most `max`): every aligned group of
+    /// this many x neighbours in a block has consecutive in-block offsets, from a multiple of
+    /// the group's bytes.
+    fn x_run(&self, max: usize) -> usize {
+        let e = 1usize << self.elem_log2;
+        let mut n = 1;
+        while n * 2 <= max.min(self.block_w)
+            && self.ox.chunks_exact(n * 2).all(|g| (g[0] as usize).is_multiple_of(n * 2 * e) && g.iter().enumerate().all(|(k, &o)| o == g[0] + (k * e) as u32))
+        {
+            n *= 2;
+        }
+        n
+    }
+
     /// tiled → linear rows (`w << elem_log2` bytes each); bytes past the end of `src` read as 0
     pub fn detile(&self, src: &[u8], w: usize, h: usize) -> Vec<u8> {
         let e = 1usize << self.elem_log2;
@@ -259,6 +278,34 @@ pub fn image_layout(t: &super::desc::Image, cfg: PipeConfig) -> Option<(Layout, 
     l.base_xor = (t.address as usize) & (l.block_bytes - 1);
     Some((l, t.width.div_ceil(side) as usize, t.height.div_ceil(side) as usize))
 }
+
+/// `f::<E, R>(args)` for elements of `E` = `$e` bytes in runs of `R` = `$r` bytes (powers of
+/// two, `E` <= `R` <= `RUN_BYTES`)
+macro_rules! by_size {
+    ($e:expr, $r:expr, $f:ident($($a:expr),*)) => {
+        match ($e, $r) {
+            (1, 1) => $f::<1, 1>($($a),*),
+            (1, 2) => $f::<1, 2>($($a),*),
+            (1, 4) => $f::<1, 4>($($a),*),
+            (1, 8) => $f::<1, 8>($($a),*),
+            (1, 16) => $f::<1, 16>($($a),*),
+            (2, 2) => $f::<2, 2>($($a),*),
+            (2, 4) => $f::<2, 4>($($a),*),
+            (2, 8) => $f::<2, 8>($($a),*),
+            (2, 16) => $f::<2, 16>($($a),*),
+            (4, 4) => $f::<4, 4>($($a),*),
+            (4, 8) => $f::<4, 8>($($a),*),
+            (4, 16) => $f::<4, 16>($($a),*),
+            (8, 8) => $f::<8, 8>($($a),*),
+            (8, 16) => $f::<8, 16>($($a),*),
+            (16, 16) => $f::<16, 16>($($a),*),
+            _ => unreachable!("{} B elements in runs of {} B", $e, $r),
+        }
+    };
+}
+
+/// the longest run of x neighbours `Walk` copies at once, in bytes
+const RUN_BYTES: usize = 16;
 
 /// One mip level of a tiled surface, in elements.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -394,15 +441,10 @@ impl Chain {
         let l = self.levels[i];
         let e = 1usize << self.layout.elem_log2;
         let mut out = vec![0u8; l.width * l.height * l.depth * e];
-        for z in 0..l.depth {
-            for y in 0..l.height {
-                for x in 0..l.width {
-                    let o = self.element_at_z(&l, x, y, z);
-                    if let Some(s) = mem.get(o..o + e) {
-                        out[((z * l.height + y) * l.width + x) * e..][..e].copy_from_slice(s);
-                    }
-                }
-            }
+        let w = Walk::new(self, &l);
+        for (z, out) in out.chunks_exact_mut(l.width * l.height * e).enumerate() {
+            let (at, zt) = self.layer(&l, z);
+            by_size!(e, w.run * e, detile_rows(&w, mem, at, zt, out));
         }
         out
     }
@@ -411,14 +453,17 @@ impl Chain {
     pub fn tile_volume(&self, dst: &mut [u8], i: usize, linear: &[u8]) {
         let l = self.levels[i];
         let e = 1usize << self.layout.elem_log2;
+        let w = Walk::new(self, &l);
         for z in 0..l.depth {
-            for y in 0..l.height {
-                for x in 0..l.width {
-                    let o = self.element_at_z(&l, x, y, z);
-                    dst[o..o + e].copy_from_slice(&linear[((z * l.height + y) * l.width + x) * e..][..e]);
-                }
-            }
+            let (at, zt) = self.layer(&l, z);
+            by_size!(e, w.run * e, tile_rows(&w, dst, at, zt, linear, z * l.width * l.height * e));
         }
+    }
+
+    /// where depth slice `z` of level `l` starts in a 3D texture, and the in-block bits z gives
+    fn layer(&self, l: &MipLevel, z: usize) -> (usize, usize) {
+        let t = &self.layout;
+        ((z / t.block_d) * self.slice_bytes + l.offset, t.z_bits(z))
     }
 
     /// level `i` of array slice `slice` (`src` = the slice's bytes) → linear rows of elements;
@@ -441,30 +486,10 @@ impl Chain {
             }
             return out;
         }
-        // `element_at` (`Layout::offset_z`) split: what depends on x alone once per level, what
-        // depends on y (and the slice) once per row – per element only two lookups and an XOR.
-        // Element by element it was most of a retail game's render thread while it streamed
-        // textures the CPU writes.
-        let hi = |tab: &[u32], c: usize, b: usize| tab[(c / b) % tab.len()];
-        let pitch_blocks = l.pitch.div_ceil(t.block_w);
-        let columns: Vec<(usize, u32)> = (0..l.width)
-            .map(|x| {
-                let x = x + l.origin.0;
-                (x / t.block_w, t.ox[x % t.block_w] ^ hi(&t.hx, x, t.block_w))
-            })
-            .collect();
-        let z = t.oz[slice % t.block_d] ^ hi(&t.hz, slice, t.block_d);
-        for (y, row) in out.chunks_exact_mut(l.width * e).enumerate() {
-            let y = y + l.origin.1;
-            let row_blocks = (y / t.block_h) * pitch_blocks;
-            let yz = t.oy[y % t.block_h] ^ hi(&t.hy, y, t.block_h) ^ z;
-            for (&(block_x, x), dst) in columns.iter().zip(row.chunks_exact_mut(e)) {
-                let o = l.offset + (row_blocks + block_x) * t.block_bytes + ((x ^ yz) as usize ^ t.base_xor);
-                if let Some(s) = src.get(o..o + e) {
-                    dst.copy_from_slice(s);
-                }
-            }
-        }
+        // Element by element (`element_at` for each) it was most of a retail game's render
+        // thread while it streamed textures the CPU writes: see `Walk`.
+        let w = Walk::new(self, &l);
+        by_size!(e, w.run * e, detile_rows(&w, src, l.offset, t.z_bits(slice), &mut out));
         out
     }
 
@@ -472,13 +497,176 @@ impl Chain {
     pub fn tile_level(&self, dst: &mut [u8], i: usize, slice: usize, linear: &[u8]) {
         let l = self.levels[i];
         let e = 1usize << self.layout.elem_log2;
-        for y in 0..l.height {
-            for x in 0..l.width {
-                let o = self.element_at(&l, x, y, slice);
-                dst[o..o + e].copy_from_slice(&linear[(y * l.width + x) * e..][..e]);
+        let w = Walk::new(self, &l);
+        by_size!(e, w.run * e, tile_rows(&w, dst, l.offset, self.layout.z_bits(slice), linear, 0));
+    }
+}
+
+/// `Chain::element_at_z` of one level, split: what depends on x alone once per level, what
+/// depends on y once per row (and z once per depth slice), so per element only a lookup, an
+/// XOR and an add. An aligned group of `run` x neighbours (the pattern's lowest address bits
+/// are x bits in every mode) lies in `run` consecutive elements, so it is one copy of a fixed
+/// size, in every row whose y / z / base swizzle bits flip none of those bits. And the level is
+/// walked a block at a time: row by row across a wide level, the rows of blocks 64 KB (or 4 KB)
+/// apart fall in the same cache sets and evict each other before the next rows read the rest
+/// of their lines.
+struct Walk {
+    /// per column: its block × block bytes | the in-block bits x gives
+    cols: Vec<usize>,
+    /// columns before the first whole run (its x aligned to `run`), and after the last
+    head: usize,
+    tail: usize,
+    /// per row: (bytes to its block row, the in-block bits y and the base swizzle give)
+    rows: Vec<(usize, usize)>,
+    /// elements in a run (a power of two)
+    run: usize,
+    /// the first row of each block row, then the height
+    bands: Vec<usize>,
+    /// the first column of each block column, then the width
+    spans: Vec<usize>,
+    /// bytes from the level's start past the end of every element
+    end: usize,
+}
+
+/// What a `Walk` copies: `one` element, or a `run` of consecutive ones, between tiled byte `o`
+/// and linear element `i`.
+trait Copier<const E: usize, const R: usize> {
+    fn one(&mut self, o: usize, i: usize);
+    fn run(&mut self, o: usize, i: usize);
+}
+
+impl Walk {
+    fn new(c: &Chain, l: &MipLevel) -> Walk {
+        let t = &c.layout;
+        let e = 1usize << t.elem_log2;
+        let hi = |tab: &[u32], c: usize, b: usize| tab[(c / b) % tab.len()];
+        let cols: Vec<usize> = (0..l.width)
+            .map(|x| {
+                let x = x + l.origin.0;
+                ((x / t.block_w) * t.block_bytes) | (t.ox[x % t.block_w] ^ hi(&t.hx, x, t.block_w)) as usize
+            })
+            .collect();
+        // the base swizzle: bits below the block size are XORed into the in-block offset, the
+        // rest (a base_xor no T# gives) are added
+        let (low, high) = (t.base_xor & (t.block_bytes - 1), t.base_xor & !(t.block_bytes - 1));
+        let pitch_blocks = l.pitch.div_ceil(t.block_w);
+        let rows = (0..l.height)
+            .map(|y| {
+                let y = y + l.origin.1;
+                (high + (y / t.block_h) * pitch_blocks * t.block_bytes, (t.oy[y % t.block_h] ^ hi(&t.hy, y, t.block_h)) as usize ^ low)
+            })
+            .collect();
+        let run = t.x_run(RUN_BYTES / e);
+        let head = ((run - l.origin.0 % run) % run).min(l.width);
+        let tail = head + (l.width - head) / run * run;
+        // block columns / rows start where the coordinate + origin is a multiple of the block
+        // side (for columns a multiple of `run`: a run never crosses one)
+        let starts = |n: usize, o: usize, b: usize| (0..n).filter(|&i| i == 0 || (i + o).is_multiple_of(b)).chain([n]).collect();
+        let last = |n: usize, o: usize, b: usize| (n + o).saturating_sub(1) / b;
+        // (an element can cross its block's end by the base swizzle's bits below the element)
+        let end = high + (last(l.height, l.origin.1, t.block_h) * pitch_blocks + last(l.width, l.origin.0, t.block_w) + 1) * t.block_bytes + e;
+        Walk { cols, head, tail, rows, run, bands: starts(l.height, l.origin.1, t.block_h), spans: starts(l.width, l.origin.0, t.block_w), end }
+    }
+
+    /// Copies the level starting `at` bytes in (`zt`: the in-block bits z gives): a block at a
+    /// time, or (`by_rows`) row by row in the order `Chain::element_at_z` element by element
+    /// would. In a row with a bit of its XOR inside a run's bytes above the element's, element
+    /// by element.
+    #[inline(always)]
+    fn walk<const E: usize, const R: usize>(&self, at: usize, zt: usize, by_rows: bool, c: &mut impl Copier<E, R>) {
+        let (w, h) = (self.cols.len(), self.rows.len());
+        let (all_rows, all_cols) = ([0, h], [0, w]);
+        let (bands, spans) = if by_rows { (&all_rows[..], &all_cols[..]) } else { (&self.bands[..], &self.spans[..]) };
+        for band in bands.windows(2) {
+            for span in spans.windows(2) {
+                let (x0, x1) = (span[0], span[1]);
+                for y in band[0]..band[1] {
+                    let (row, yz) = self.rows[y];
+                    let (at, yz, i) = (at + row, yz ^ zt, y * w);
+                    if R == E || yz & (R - 1) & !(E - 1) != 0 {
+                        for x in x0..x1 {
+                            c.one(at + (self.cols[x] ^ yz), i + x);
+                        }
+                        continue;
+                    }
+                    let (mid0, mid1) = (x0.clamp(self.head, self.tail), x1.clamp(self.head, self.tail));
+                    for x in x0..mid0 {
+                        c.one(at + (self.cols[x] ^ yz), i + x);
+                    }
+                    for x in (mid0..mid1).step_by(self.run) {
+                        c.run(at + (self.cols[x] ^ yz), i + x);
+                    }
+                    for x in mid1..x1 {
+                        c.one(at + (self.cols[x] ^ yz), i + x);
+                    }
+                }
             }
         }
     }
+}
+
+/// tiled `mem` → linear `out`; bytes past the end of `mem` read as 0
+struct Detile<'a, const E: usize> {
+    mem: &'a [u8],
+    out: &'a mut [[u8; E]],
+}
+
+impl<const E: usize, const R: usize> Copier<E, R> for Detile<'_, E> {
+    #[inline(always)]
+    fn one(&mut self, o: usize, i: usize) {
+        if let Some(s) = self.mem.get(o..o + E) {
+            self.out[i].copy_from_slice(s);
+        }
+    }
+    #[inline(always)]
+    fn run(&mut self, o: usize, i: usize) {
+        match self.mem.get(o..o + R) {
+            Some(s) => self.out[i..i + R / E].as_flattened_mut().copy_from_slice(s),
+            None => (0..R / E).for_each(|k| Copier::<E, R>::one(self, o + k * E, i + k)),
+        }
+    }
+}
+
+/// `Walk`'s level `at` bytes into `mem` (`zt`: the in-block bits z gives) → `out`, `E`-byte
+/// elements in `R`-byte runs; bytes past the end of `mem` read as 0
+fn detile_rows<const E: usize, const R: usize>(w: &Walk, mem: &[u8], at: usize, zt: usize, out: &mut [u8]) {
+    let (out, []) = out.as_chunks_mut::<E>() else { unreachable!() };
+    w.walk::<E, R>(at, zt, false, &mut Detile { mem, out });
+}
+
+/// linear elements from byte `from` of `linear` → tiled `dst`, each (`dst`, then `linear`)
+/// indexed as `Chain::element_at_z` element by element would: a short slice panics at the
+/// same element
+struct Tile<'a> {
+    dst: &'a mut [u8],
+    linear: &'a [u8],
+    from: usize,
+}
+
+impl<const E: usize, const R: usize> Copier<E, R> for Tile<'_> {
+    #[inline(always)]
+    fn one(&mut self, o: usize, i: usize) {
+        self.dst[o..o + E].copy_from_slice(&self.linear[self.from + i * E..][..E]);
+    }
+    #[inline(always)]
+    fn run(&mut self, o: usize, i: usize) {
+        let s = self.from + i * E;
+        if let (Some(d), Some(s)) = (self.dst.get_mut(o..o + R), self.linear.get(s..s + R)) {
+            d.copy_from_slice(s);
+            return;
+        }
+        (0..R / E).for_each(|k| Copier::<E, R>::one(self, o + k * E, i + k));
+    }
+}
+
+/// `linear` from byte `from` → `Walk`'s level `at` bytes into `dst` (`zt`: the in-block bits
+/// z gives), `E`-byte elements in `R`-byte runs. A block at a time only when every element is
+/// in both: otherwise in `Chain::element_at_z`'s order, so a short slice panics having written
+/// the same elements. (Two elements in one place – a level with columns past its pitch – are
+/// in different block rows, which both orders write one after the other.)
+fn tile_rows<const E: usize, const R: usize>(w: &Walk, dst: &mut [u8], at: usize, zt: usize, linear: &[u8], from: usize) {
+    let by_rows = at + w.end > dst.len() || from + w.cols.len() * w.rows.len() * E > linear.len();
+    w.walk::<E, R>(at, zt, by_rows, &mut Tile { dst, linear, from });
 }
 
 /// The mip chain of a T#'s image (all `max_mip + 1` levels of the resource, base swizzle in
@@ -568,6 +756,239 @@ mod tests {
                             assert!(c.detile_level(src, k, slice) == want, "mode {mode} e {e} {cfg:?} level {k} slice {slice}");
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// `detile_level` / `tile_level` / `detile_volume` / `tile_volume` as they were, element by
+    /// element (`element_at` / `element_at_z` for each): the reference for `Walk`.
+    fn old_detile_level(c: &Chain, src: &[u8], i: usize, slice: usize) -> Vec<u8> {
+        let l = c.levels[i];
+        let e = 1usize << c.layout.elem_log2;
+        let mut out = vec![0u8; l.width * l.height * e];
+        for y in 0..l.height {
+            for x in 0..l.width {
+                let o = c.element_at(&l, x, y, slice);
+                if let Some(s) = src.get(o..o + e) {
+                    out[(y * l.width + x) * e..][..e].copy_from_slice(s);
+                }
+            }
+        }
+        out
+    }
+
+    fn old_tile_level(c: &Chain, dst: &mut [u8], i: usize, slice: usize, linear: &[u8]) {
+        let l = c.levels[i];
+        let e = 1usize << c.layout.elem_log2;
+        for y in 0..l.height {
+            for x in 0..l.width {
+                let o = c.element_at(&l, x, y, slice);
+                dst[o..o + e].copy_from_slice(&linear[(y * l.width + x) * e..][..e]);
+            }
+        }
+    }
+
+    fn old_detile_volume(c: &Chain, mem: &[u8], i: usize) -> Vec<u8> {
+        let l = c.levels[i];
+        let e = 1usize << c.layout.elem_log2;
+        let mut out = vec![0u8; l.width * l.height * l.depth * e];
+        for z in 0..l.depth {
+            for y in 0..l.height {
+                for x in 0..l.width {
+                    let o = c.element_at_z(&l, x, y, z);
+                    if let Some(s) = mem.get(o..o + e) {
+                        out[((z * l.height + y) * l.width + x) * e..][..e].copy_from_slice(s);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn old_tile_volume(c: &Chain, dst: &mut [u8], i: usize, linear: &[u8]) {
+        let l = c.levels[i];
+        let e = 1usize << c.layout.elem_log2;
+        for z in 0..l.depth {
+            for y in 0..l.height {
+                for x in 0..l.width {
+                    let o = c.element_at_z(&l, x, y, z);
+                    dst[o..o + e].copy_from_slice(&linear[((z * l.height + y) * l.width + x) * e..][..e]);
+                }
+            }
+        }
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 33) % n.max(1) as u64) as usize
+        }
+        fn bytes(&mut self, n: usize) -> Vec<u8> {
+            (0..n).map(|_| self.below(256) as u8).collect()
+        }
+        /// a width / height around `block` elements (1, a block and a bit, two blocks and a
+        /// bit, ...), the area at most `area`
+        fn side(&mut self, block: usize, area: usize) -> usize {
+            [1, 1 + self.below(block), block, block + 1 + self.below(block), 2 * block + 1 + self.below(3), 1 + self.below(4 * block)][self.below(6)].min(area).max(1)
+        }
+        /// the base swizzle of a T# (bits below the block), unaligned to the element, or one
+        /// past the block no T# gives
+        fn base_xor(&mut self, l: &Layout) -> usize {
+            let b = self.below(l.block_bytes);
+            [0, b & !((1 << l.elem_log2) - 1), b, b + l.block_bytes * (1 + self.below(3))][self.below(4)]
+        }
+    }
+
+    /// Levels no chain lays out, in a third of the chains: an origin anywhere (not on a run of
+    /// x neighbours), a pitch under the width (two elements in one place).
+    fn odd_levels(r: &mut Lcg, c: &mut Chain) {
+        if r.below(3) == 0 {
+            let (bw, bh) = (c.layout.block_w, c.layout.block_h);
+            for l in &mut c.levels {
+                l.origin = (r.below(2 * bw), r.below(2 * bh));
+                l.pitch = [l.pitch, 1 + r.below(2 * l.width)][r.below(2)];
+            }
+        }
+    }
+
+    /// The source lengths a level of a texture `n` bytes long is tried with (`mem`: the
+    /// bytes there are): all, the texture, a bit more, cut anywhere (inside an element too),
+    /// empty.
+    fn cuts(r: &mut Lcg, n: usize, mem: usize) -> [usize; 6] {
+        [mem, n, n + 1 + r.below(300), r.below(n + 1), (r.below(n + 1) | 1).min(n), 0]
+    }
+
+    /// `Walk` (block by block, runs of x neighbours as one copy) gives the same bytes as the
+    /// element-by-element reference: every mode (linear too), element size and pipe
+    /// configuration, sizes around the block, mips (tails, their origins), base swizzles (also
+    /// unaligned ones and one past the block), array slices, sources cut short (bytes past them
+    /// read as 0) and destinations whose other bytes must stay.
+    #[test]
+    fn walk_matches_element_by_element() {
+        let mut r = Lcg(0x5eed);
+        for mode in std::iter::once(0).chain(MODES) {
+            for e in 0..5u32 {
+                for cfg in configs() {
+                    let mut lay = Layout::new(mode, e, cfg).unwrap();
+                    lay.base_xor = r.base_xor(&lay);
+                    let w = r.side(lay.block_w, 4096);
+                    let h = r.side(lay.block_h, 6144 / w);
+                    let side = [1, 4][r.below(2)];
+                    let mut c = Chain::new(lay, (w * side) as u32, (h * side) as u32, side as u32, 1 + r.below(10) as u32);
+                    odd_levels(&mut r, &mut c);
+                    let what = format!("mode {mode} e{e} {cfg:?} {w}x{h} side {side} xor {:#x}", c.layout.base_xor);
+                    for (i, l) in c.levels.iter().enumerate() {
+                        let slice = [0, 1 + r.below(9)][r.below(2)];
+                        // the bytes the level reaches (a base swizzle past the block or an odd
+                        // level takes it past the slice's end)
+                        let size = (0..l.height).flat_map(|y| (0..l.width).map(move |x| (x, y))).map(|(x, y)| c.element_at(l, x, y, slice) + (1 << e)).fold(c.slice_bytes, usize::max);
+                        let mem = r.bytes(size + 512);
+                        for cut in cuts(&mut r, size, mem.len()) {
+                            let src = &mem[..cut.min(mem.len())];
+                            assert!(c.detile_level(src, i, slice) == old_detile_level(&c, src, i, slice), "{what}: detile level {i} {l:?} slice {slice} src {cut} B");
+                        }
+                        let linear = r.bytes((l.width * l.height) << e);
+                        // (room for every element: block by block)
+                        let extra = [r.below(64), size][r.below(2)];
+                        let mut want = r.bytes(size + extra);
+                        let mut got = want.clone();
+                        old_tile_level(&c, &mut want, i, slice, &linear);
+                        c.tile_level(&mut got, i, slice, &linear);
+                        assert!(got == want, "{what}: tile level {i} {l:?} slice {slice}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The same for 3D textures: thick blocks (z tiled with x and y), thin and linear ones,
+    /// mipped, every element size and pipe configuration.
+    #[test]
+    fn volume_walk_matches_element_by_element() {
+        let mut r = Lcg(0xd3d);
+        for mode in [0u32, 24, 27, 5, 9, 17, 21, 25, 26] {
+            for e in 0..5u32 {
+                for cfg in configs() {
+                    let mut lay = Layout::new_3d(mode, e, cfg).unwrap();
+                    lay.base_xor = r.base_xor(&lay);
+                    let w = r.side(lay.block_w, 2048);
+                    let h = r.side(lay.block_h, 4096 / w);
+                    let d = r.side(lay.block_d, 4096 / (w * h)).min(40);
+                    let mut c = Chain::new_3d(lay, w as u32, h as u32, d as u32, 1, 1 + r.below(6) as u32);
+                    odd_levels(&mut r, &mut c);
+                    let what = format!("mode {mode} e{e} {cfg:?} {w}x{h}x{d} xor {:#x}", c.layout.base_xor);
+                    for (i, l) in c.levels.iter().enumerate() {
+                        let size = (0..l.depth * l.height * l.width).map(|k| c.element_at_z(l, k % l.width, k / l.width % l.height, k / l.width / l.height) + (1 << e)).fold(c.slice_bytes * c.layers(), usize::max);
+                        let mem = r.bytes(size + 512);
+                        for cut in cuts(&mut r, size, mem.len()) {
+                            let src = &mem[..cut.min(mem.len())];
+                            assert!(c.detile_volume(src, i) == old_detile_volume(&c, src, i), "{what}: detile level {i} {l:?} src {cut} B");
+                        }
+                        let linear = r.bytes((l.width * l.height * l.depth) << e);
+                        // (room for every element: block by block)
+                        let extra = [r.below(64), size][r.below(2)];
+                        let mut want = r.bytes(size + extra);
+                        let mut got = want.clone();
+                        old_tile_volume(&c, &mut want, i, &linear);
+                        c.tile_volume(&mut got, i, &linear);
+                        assert!(got == want, "{what}: tile level {i} {l:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A `dst` or `linear` too short panics in `tile_level` / `tile_volume` as it did: after
+    /// writing the same elements.
+    #[test]
+    fn tiling_into_short_slices_panics_at_the_same_element() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let mut r = Lcg(0x7a1);
+        let cfg = PipeConfig { pipes_log2: 3, pkrs_log2: 2 };
+        // a base swizzle unaligned to the element: the last element of a block crosses its end,
+        // and a `dst` ending inside it must not be written block by block
+        for (mode, e, w, h, xor) in [(5u32, 2u32, 64usize, 64usize, 2usize), (10, 3, 128, 128, 0x1005), (27, 4, 128, 128, 0x30b), (9, 1, 256, 512, 1)] {
+            let mut lay = Layout::new(mode, e, cfg).unwrap();
+            lay.base_xor = xor;
+            let c = Chain::new(lay, w as u32, h as u32, 1, 1);
+            let l = c.levels[0];
+            let size = (0..l.height).flat_map(|y| (0..l.width).map(move |x| (x, y))).map(|(x, y)| c.element_at(&l, x, y, 0) + (1 << e)).max().unwrap();
+            assert!(size > c.slice_bytes, "mode {mode}: an element crosses the end");
+            let linear = r.bytes((l.width * l.height) << e);
+            for cut in size - (xor & ((1 << e) - 1))..size {
+                let mut want = r.bytes(cut);
+                let mut got = want.clone();
+                assert!(catch_unwind(AssertUnwindSafe(|| old_tile_level(&c, &mut want, 0, 0, &linear))).is_err());
+                assert!(catch_unwind(AssertUnwindSafe(|| c.tile_level(&mut got, 0, 0, &linear))).is_err());
+                assert!(got == want, "mode {mode} e{e}: dst {cut} B, the level reaches {size}");
+            }
+        }
+        for (mode, e, d) in [(0u32, 2u32, 1usize), (1, 0, 1), (5, 2, 1), (10, 4, 1), (24, 1, 1), (27, 3, 1), (5, 2, 20), (9, 0, 9), (25, 4, 3)] {
+            for _ in 0..6 {
+                let mut lay = if d > 1 { Layout::new_3d(mode, e, cfg).unwrap() } else { Layout::new(mode, e, cfg).unwrap() };
+                lay.base_xor = r.base_xor(&lay);
+                let (w, h) = (r.side(lay.block_w, 1024), r.side(lay.block_h, 512));
+                let c = Chain::new_3d(lay, w as u32, h as u32, d as u32, 1, 1 + r.below(4) as u32);
+                let i = r.below(c.levels.len());
+                let l = c.levels[i];
+                let n = (l.width * l.height * l.depth) << e;
+                // the bytes the level reaches; just under it, the last element crossing a
+                // block's end (a base swizzle unaligned to the element)
+                let at = |k: usize| if d > 1 { c.element_at_z(&l, k % l.width, k / l.width % l.height, k / l.width / l.height) } else { c.element_at(&l, k % l.width, k / l.width, 2) };
+                let size = (0..n >> e).map(|k| at(k) + (1 << e)).max().unwrap();
+                for (dst_len, lin_len) in [(r.below(size), n), (size, r.below(n)), (r.below(size), r.below(n)), (size - 1 - r.below(1 << e).min(size - 1), n)] {
+                    let linear = r.bytes(lin_len);
+                    let mut want = r.bytes(dst_len);
+                    let mut got = want.clone();
+                    let (a, b) = if d > 1 {
+                        (catch_unwind(AssertUnwindSafe(|| old_tile_volume(&c, &mut want, i, &linear))), catch_unwind(AssertUnwindSafe(|| c.tile_volume(&mut got, i, &linear))))
+                    } else {
+                        (catch_unwind(AssertUnwindSafe(|| old_tile_level(&c, &mut want, i, 2, &linear))), catch_unwind(AssertUnwindSafe(|| c.tile_level(&mut got, i, 2, &linear))))
+                    };
+                    assert_eq!(a.is_err(), b.is_err(), "mode {mode} e{e} level {i}: dst {dst_len} linear {lin_len}");
+                    assert!(got == want, "mode {mode} e{e} level {i} {l:?}: dst {dst_len} B of {size}, linear {lin_len} B of {n}");
                 }
             }
         }
