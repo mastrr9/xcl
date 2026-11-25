@@ -7,8 +7,8 @@
 //! * structured form where possible (DXC compiles it much faster): forward skips as `if`,
 //!   if / else, loops with the back edge at their end (also entered in the middle: rotated),
 //!   and any other forward jump – loop breaks, jumps past a join, s_endpgm before the end –
-//!   as a skip flag (`xcl_skip_<target>`: set at the jump, the code up to the target runs
-//!   under `if (!flag)`, loops `break`); retail pack: 90% of the programs need no `pc`,
+//!   as a skip (`xcl_skip` = the target: set at the jump, the code up to the target runs
+//!   under `if (xcl_skip == 0u)`, loops `break`); retail pack: 90% of the programs need no `pc`,
 //! * SGPRs, VCC, EXEC, M0 and SCC are ordinary variables that every lane computes alike
 //!   (uniform); lane masks produced by vector instructions come from `WaveActiveBallot`,
 //! * VGPRs are per-lane variables; vector writes are masked by the lane's EXEC bit,
@@ -670,7 +670,7 @@ type MemoKey = (u64, u64, Option<u64>, usize, Conts, Vec<u64>);
 struct Conts {
     /// the innermost one: a jump back to it is `continue`
     inner: Option<u64>,
-    /// the ones around that: a jump back to one sets its flag (`skip_flag` of the head), which
+    /// the ones around that: a jump back to one is a skip to the head (`skip_id`), which
     /// leaves the loops inside it and is `continue` there
     outer: Vec<u64>,
 }
@@ -760,14 +760,30 @@ const CONT: u64 = u64::MAX - 1;
 /// run out of stack).
 const MAX_NEST: usize = 24;
 
-/// Flag of a forward jump out of nested structured code: set at the jump, every level skips
-/// its following code while it is set, cleared where its target starts.
-fn skip_flag(t: u64) -> String {
+/// Forward jumps out of nested structured code share one variable, `xcl_skip`: the jump sets it
+/// to its target (`skip_id`), every level skips its following code while it is not 0, and it
+/// is cleared where the target starts. At most one such jump is taken at a time: once one is,
+/// no code runs until its target, so no other one can be. A level's guard is therefore
+/// `xcl_skip == 0u` whatever jumps are pending there. One flag per target made it an `||` of
+/// all of them, written again after every block that raised another (a retail compute program:
+/// 10 877 such guards of up to 600 flags, 95 of its 147 MB of HLSL).
+fn skip_id(t: u64) -> String {
     if t == END {
-        "xcl_skip_end".into()
+        "0xFFFFFFFFu".into()
     } else {
-        format!("xcl_skip_{t:x}")
+        // (+1: a loop at offset 0 may be continued through a skip to its head; 0 is "none")
+        format!("{}u", t + 1)
     }
+}
+
+/// The jump to `t` was taken.
+fn skip_taken(t: u64) -> String {
+    format!("xcl_skip == {}", skip_id(t))
+}
+
+/// Ends the jump to `t` if it is the one taken (nothing otherwise).
+fn skip_clear(t: u64) -> String {
+    format!("if ({}) xcl_skip = 0u;", skip_taken(t))
 }
 
 /// One item of a structured level.
@@ -1127,35 +1143,41 @@ fn emit_structured(
             Item::Loop { a, b, entry: None, .. } => enter_loop(&mut pending, a, b),
             _ => BTreeSet::new(),
         };
+        // the target of a taken jump: it ends here, outside the guard that skipped up to here
+        if resolved {
+            if guard.take().is_some() {
+                body.push_str(&format!("{pad}}}\n"));
+            }
+            body.push_str(&format!("{pad}{}\n", skip_clear(s)));
+        }
         if guard.as_ref() != Some(&pending).filter(|p| !p.is_empty()) {
             if guard.take().is_some() {
                 body.push_str(&format!("{pad}}}\n"));
             }
             if !pending.is_empty() {
-                let cond: Vec<String> = pending.iter().map(|&t| skip_flag(t)).collect();
-                body.push_str(&format!("{pad}if (!({})) {{\n", cond.join(" || ")));
+                // the taken jump, if any, is one of `pending` or goes into the loop (`inner`)
+                let into: String = inner.iter().map(|&t| format!(" || {}", skip_taken(t))).collect();
+                body.push_str(&format!("{pad}if (xcl_skip == 0u{into}) {{\n"));
                 guard = Some(pending.clone());
             }
         }
         let d = depth + guard.is_some() as usize;
         let ipad = "    ".repeat(d);
-        if resolved {
-            body.push_str(&format!("{ipad}{} = false;\n", skip_flag(s)));
-        }
         let raised: BTreeSet<u64> = match it {
             Item::Loop { a, b, latch, entry } => {
                 body.push_str(&format!("{ipad}[loop] for (;;) {{\n{ipad}    {LOOP_GUARD}\n"));
                 let (lcont, lin) = if entry.is_none() { (cont.enter(Some(a)), &inner) } else { (cont.enter(None), &none) };
                 let mut r = emit_structured(c, em, body, entry.unwrap_or(a), latch, None, nest + 1, &lcont, lin, d + 1, blocks, flags);
-                for &t in &r {
-                    if t == latch && latch != b {
-                        body.push_str(&format!("{ipad}    {} = false;\n", skip_flag(t)));
-                    } else if t == a {
-                        // `continue` from a loop inside this one
-                        body.push_str(&format!("{ipad}    if ({0}) {{ {0} = false; continue; }}\n", skip_flag(t)));
-                    } else {
-                        body.push_str(&format!("{ipad}    if ({}) break;\n", skip_flag(t)));
-                    }
+                if latch != b && r.contains(&latch) {
+                    body.push_str(&format!("{ipad}    {}\n", skip_clear(latch)));
+                }
+                if r.contains(&a) {
+                    // `continue` from a loop inside this one
+                    body.push_str(&format!("{ipad}    if ({}) {{ xcl_skip = 0u; continue; }}\n", skip_taken(a)));
+                }
+                // any other jump taken leaves the loop
+                if r.iter().any(|&t| t != a && !(t == latch && latch != b)) {
+                    body.push_str(&format!("{ipad}    if (xcl_skip != 0u) break;\n"));
                 }
                 if latch != b {
                     r.remove(&latch);
@@ -1171,7 +1193,7 @@ fn emit_structured(
                 if let Some(u) = entry {
                     // rotated: the head after the latch, falling into the next iteration
                     for t in emit_structured(c, em, body, a, u, None, nest + 1, &cont.enter(None), &none, d + 1, blocks, flags) {
-                        body.push_str(&format!("{ipad}    {} = false;\n", skip_flag(t)));
+                        body.push_str(&format!("{ipad}    {}\n", skip_clear(t)));
                     }
                 }
                 body.push_str(&format!("{ipad}}}\n"));
@@ -1205,8 +1227,8 @@ fn emit_structured(
                     Some(t) => {
                         flags.insert(t);
                         match flow {
-                            emit::Flow::Cond(cond, _) => body.push_str(&format!("{ipad}if ({cond}) {} = true;\n", skip_flag(t))),
-                            _ => body.push_str(&format!("{ipad}{} = true;\n", skip_flag(t))),
+                            emit::Flow::Cond(cond, _) => body.push_str(&format!("{ipad}if ({cond}) xcl_skip = {};\n", skip_id(t))),
+                            _ => body.push_str(&format!("{ipad}xcl_skip = {};\n", skip_id(t))),
                         }
                         BTreeSet::from([t])
                     }
@@ -1275,7 +1297,7 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         if let Some(x) = structured_span(c, i, hi) {
             body.push_str(&format!("{pad}if (pc == {start}u) {{\n"));
             for t in emit_structured(c, em, body, start, x, None, 0, &Conts::default(), &BTreeSet::new(), depth + 1, blocks, flags) {
-                body.push_str(&format!("{pad}    {} = false;\n", skip_flag(t)));
+                body.push_str(&format!("{pad}    {}\n", skip_clear(t)));
             }
             let next = if x == u64::MAX || !c.starts.contains(&x) { "0xFFFFFFFFu".to_string() } else { format!("{x}u") };
             body.push_str(&format!("{pad}    pc = {next};\n{pad}}}\n"));
@@ -1657,8 +1679,8 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
             }
             emit_range(&ctx, &mut em, &mut code, 0, u64::MAX, 1, &mut blocks, &mut flags);
         }
-        for &t in &flags {
-            body.push_str(&format!("    bool {} = false;\n", skip_flag(t)));
+        if !flags.is_empty() {
+            body.push_str("    uint xcl_skip = 0u;\n");
         }
         body.push_str(&code);
     }

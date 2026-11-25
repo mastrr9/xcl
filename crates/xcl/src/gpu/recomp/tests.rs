@@ -10865,3 +10865,56 @@ fn gpu_v_dot8_u32_u4_edge_cases() {
         }
     }
 }
+
+/// Forward jumps whose ranges cross (from block k to target k, every target after every jump)
+/// cannot nest as `if`s: each one is a skip, all of them pending at once. The code between them
+/// is guarded by one test of the shared skip variable, not by one test per pending jump (the
+/// guard after the k-th jump listed all k: quadratic, 95 of a retail program's 147 MB of HLSL),
+/// and the program computes what the block dispatcher computes.
+#[test]
+fn crossing_forward_jumps_guard_in_linear_size() {
+    let i = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let build = |n: usize| -> Vec<u8> {
+        let mut code: Vec<u8> = Vec::new();
+        let mut jumps = Vec::new();
+        for k in 0..n {
+            // s1 += 1; SCC = bit k % 8 of s0
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)]));
+            code.extend(i("S_BITCMP1_B32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128 + (k as u64 % 8))]));
+            jumps.push(code.len());
+            code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        }
+        for &at in &jumps {
+            // target k: s2 ^= s1 + k
+            let d = ((code.len() - at) / 4 - 1) as u16;
+            code[at..at + 2].copy_from_slice(&d.to_le_bytes());
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 2), ("SSRC1", 1)]));
+            code.extend(i("S_XOR_B32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 2), ("SSRC1", 129)]));
+        }
+        code.extend(i("S_ENDPGM", "ENC_SOPP", &[("SIMM16", 0)]));
+        code
+    };
+    let skips = |n: usize| translate(&build(n), &Options::default()).unwrap().hlsl.matches("xcl_skip").count();
+    let (a, b) = (skips(40), skips(160));
+    assert!(a > 0, "the crossing jumps are skips");
+    assert!(b <= 5 * a, "uses of the skip variable grow linearly with the jumps: {a} for 40, {b} for 160");
+
+    // and they skip what they should: the same state as the dispatcher, for several jump patterns
+    if !gpu_waves().contains(&true) {
+        return;
+    }
+    let code = build(24);
+    let t = |s: bool| translate(&code, &Options { structured: s, ..Options::default() }).unwrap();
+    let (a, b) = (t(true), t(false));
+    assert!(!a.hlsl.contains("if (pc =="), "structured");
+    let mem: Vec<u32> = code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let dxil = |h: &str| super::dxc::compile(h, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}
+{h}"));
+    let (da, db) = (dxil(&a.hlsl), dxil(&b.hlsl));
+    for s0 in [0u32, 1, 0x5A, 0xA5, 0xFF, 0x80] {
+        let mut st = KernelState::default();
+        st.sgpr[0] = s0;
+        let (u, w) = (runner::run(&da, &st, &mem).unwrap(), runner::run(&db, &st, &mem).unwrap());
+        assert_eq!(&u.sgpr[..3], &w.sgpr[..3], "s0={s0:#x}");
+    }
+}
