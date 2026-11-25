@@ -580,11 +580,13 @@ impl Lw {
             }),
             "v_frexp_mant_f32" => {
                 let x = fs!(0);
+                let x = self.quiet_f(x);
                 fr!(self.frexp_mant(x))
             }
             "v_frexp_exp_i32_f32" => self.frexp_exp_f32(a, |lw| lw.fsrc(&m, 0, a)),
             "v_ldexp_f32" => {
                 let x = fs!(0);
+                let x = self.quiet_f(x);
                 fr!(self.ldexp_f(x, b))
             }
             "v_add_f32" => {
@@ -1171,7 +1173,8 @@ impl Lw {
                 self.rm_sqrt(ba, n)
             }
             "v_ldexp_f32" => {
-                let n = self.ldexp_f(fa, b);
+                let qa = self.quiet_f(fa);
+                let n = self.ldexp_f(qa, b);
                 self.rm_ldexp(ba, b, n)
             }
             _ => return Ok(None),
