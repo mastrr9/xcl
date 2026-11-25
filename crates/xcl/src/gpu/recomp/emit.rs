@@ -4875,7 +4875,9 @@ impl Em {
                 }
                 h.push_str("    uint xcl_vid : SV_VertexID;\n    uint xcl_iid : SV_InstanceID;\n};\n");
                 out_struct(&mut h, "XclOut", &vs.outputs);
-                h.push_str("XclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n");
+                let vals = out_vals(&vs.outputs);
+                h.push_str(vals.as_deref().unwrap_or(""));
+                h.push_str(if vals.is_some() { "XclOut main(XclIn xi)\n{\n    XclVals xo = (XclVals)0;\n" } else { "XclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n" });
                 h.push_str(if self.opt.wave64 { "    lane_id = WaveGetLaneIndex();\n" } else { "    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n" });
                 if self.upper.is_some() {
                     h.push_str("    xcl_hw32 = WaveGetLaneCount() < 64u;\n");
@@ -4902,7 +4904,7 @@ impl Em {
                     let _ = writeln!(h, "    uint v{v} = {init};");
                 }
                 h.push_str(body);
-                h.push_str("    return xo;\n}\n");
+                h.push_str(if vals.is_some() { "    return xcl_rows(xo);\n}\n" } else { "    return xo;\n}\n" });
             }
             Mode::Compute(cs) => {
                 let lanes = if self.opt.wave64 { 64 } else { 32 };
@@ -5169,6 +5171,7 @@ impl Em {
                 // input non-perspective centroid (or sample)
                 let conservative = ps.outputs.iter().any(|e| matches!(e.system_value, 67 | 68));
                 let pos_mode = if conservative { "noperspective centroid " } else { "" };
+                let decl_start = h.len();
                 let _ = writeln!(h, "struct XclIn {{\n    {pos_mode}float4 xcl_pos : SV_Position;");
                 for (k, e) in ranked(&ps.inputs, false).iter().enumerate() {
                     // the mode of the attribute this input is read through (none: never read)
@@ -5179,11 +5182,22 @@ impl Em {
                     }
                     let _ = writeln!(h, "    {m} {}4 a{k} : {};", hlsl_type(e), e.semantic());
                 }
+                let rows = in_rows(ps, &h[decl_start..]);
+                if let Some((plain, _, _)) = &rows {
+                    h.truncate(decl_start);
+                    h.push_str(plain);
+                }
+                let sys_start = h.len();
                 if ps.input_ena >> 12 & 1 == 1 {
                     h.push_str("    bool xcl_ff : SV_IsFrontFace;\n");
                 }
                 if ps.input_ena >> 14 & 1 == 1 {
                     h.push_str("    uint xcl_cov : SV_Coverage;\n");
+                }
+                // the system values after the inputs, in the entry's struct as well
+                let sys = h[sys_start..].to_string();
+                if let Some((_, decl, _)) = &rows {
+                    let _ = write!(h, "}};\nstruct XclInRows {{\n    {pos_mode}float4 xcl_pos : SV_Position;\n{decl}{sys}");
                 }
                 h.push_str("};\nstruct XclOut {\n");
                 for e in &ps.outputs {
@@ -5201,7 +5215,16 @@ impl Em {
                 if !self.ps_writes_mask && !ps.outputs.iter().any(|e| matches!(e.system_value, 64 | 65 | 67 | 68)) {
                     h.push_str("    float4 xcl_unused : SV_Target7;\n");
                 }
-                h.push_str("};\nXclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n");
+                match &rows {
+                    Some((_, _, copy)) => {
+                        let _ = write!(h, "}};\nXclOut main(XclInRows xr)\n{{\n    XclIn xi;\n    xi.xcl_pos = xr.xcl_pos;\n{copy}");
+                        for m in sys.lines().filter_map(|l| l.split_whitespace().nth(1)) {
+                            let _ = writeln!(h, "    xi.{m} = xr.{m};");
+                        }
+                        h.push_str("    XclOut xo = (XclOut)0;\n");
+                    }
+                    None => h.push_str("};\nXclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n"),
+                }
                 if self.ps_writes_mask {
                     h.push_str("    xo.xcl_mask = 0xFFFFFFFFu;\n");
                 }
@@ -5250,12 +5273,71 @@ impl Em {
 /// the params in `exp param` order (non-system OSG1 elements, then clip/cull distances).
 fn out_struct(h: &mut String, name: &str, outputs: &[SigElement]) {
     let _ = writeln!(h, "struct {name} {{\n    float4 pos : SV_Position;");
-    for (k, e) in ranked(outputs, true).iter().enumerate() {
+    let all = ranked(outputs, true);
+    for (k, row) in out_rows(outputs).iter().enumerate() {
+        let e = all[row[0]];
         let n = out_comps(e);
         let ty = if n == 1 { hlsl_type(e).to_string() } else { format!("{}{n}", hlsl_type(e)) };
         let _ = writeln!(h, "    {ty} p{k} : {};", e.semantic());
     }
     h.push_str("};\n");
+}
+
+/// The rows of `out_struct`, as places in `ranked(outputs, true)`: the user elements'
+/// `signature_rows`, then each clip / cull distance in a row of its own.
+fn out_rows(outputs: &[SigElement]) -> Vec<Vec<usize>> {
+    let mut rows = super::signature_rows(outputs);
+    let user = ranked(outputs, false).len();
+    rows.extend((user..ranked(outputs, true).len()).map(|j| vec![j]));
+    rows
+}
+
+/// A VS whose outputs share rows (`signature_rows`): the program writes `xo.p<j>` per element
+/// of `ranked(outputs, true)` into `XclVals` (every element at a register holds all of it), and
+/// `xcl_rows` copies each row from the element that names it into `XclOut`. None: the program
+/// writes `XclOut` itself.
+fn out_vals(outputs: &[SigElement]) -> Option<String> {
+    if !super::signature_packed(outputs) {
+        return None;
+    }
+    let all = ranked(outputs, true);
+    let mut h = String::from("struct XclVals {\n    float4 pos;\n");
+    for (j, e) in all.iter().enumerate() {
+        let n = out_comps(e);
+        let ty = if n == 1 { hlsl_type(e).to_string() } else { format!("{}{n}", hlsl_type(e)) };
+        let _ = writeln!(h, "    {ty} p{j};");
+    }
+    h.push_str("};\nXclOut xcl_rows(XclVals v)\n{\n    XclOut o;\n    o.pos = v.pos;\n");
+    for (k, row) in out_rows(outputs).iter().enumerate() {
+        let _ = writeln!(h, "    o.p{k} = v.p{};", row[0]);
+    }
+    h.push_str("    return o;\n}\n");
+    Some(h)
+}
+
+/// A PS whose inputs share rows (`signature_rows`): its entry takes `XclInRows`, each row
+/// declared as the input that names it was in `XclIn`, and copies each row into every input it
+/// carries, so the program reads `xi.a<k>` as before. `head`: the `XclIn` declaration so far,
+/// SV_Position and then one line per input of `ranked(inputs, false)`. (`XclIn` so far as a
+/// plain struct for the copies, the rows, the copies); None: the entry takes `XclIn`.
+fn in_rows(ps: &super::PsInterface, head: &str) -> Option<(String, String, String)> {
+    if !super::signature_packed(&ps.inputs) {
+        return None;
+    }
+    let user = ranked(&ps.inputs, false);
+    let lines: Vec<&str> = head.lines().skip(2).collect();
+    let mut plain = String::from("struct XclIn {\n    float4 xcl_pos;\n");
+    let (mut decl, mut copy) = (String::new(), String::new());
+    for (j, e) in user.iter().enumerate() {
+        let _ = writeln!(plain, "    {}4 a{j};", hlsl_type(e));
+    }
+    for (k, row) in super::signature_rows(&ps.inputs).iter().enumerate() {
+        let _ = writeln!(decl, "{}", lines[row[0]].replacen(&format!(" a{} : ", row[0]), &format!(" r{k} : "), 1));
+        for &j in row {
+            let _ = writeln!(copy, "    xi.a{j} = as{}(xr.r{k});", hlsl_type(user[j]));
+        }
+    }
+    Some((plain, decl, copy))
 }
 
 /// Geometry shader for the console's rect lists (IASetPrimitiveTopology 17, AMD's
@@ -5299,8 +5381,9 @@ pub fn rect_list_gs(outputs: &[SigElement]) -> String {
     h.push_str("    if (c == 3u) {\n        s.Append(v[0]);\n        s.Append(v[1]);\n        s.Append(v[2]);\n        return;\n    }\n");
     h.push_str("    XclOut k = v[c], a = v[(c + 1u) % 3u], b = v[(c + 2u) % 3u];\n    XclOut d = v[0];\n");
     h.push_str("    d.pos = a.pos + b.pos - k.pos;\n");
-    for (k, e) in ranked(outputs, true).iter().enumerate() {
-        if hlsl_type(e) == "float" {
+    let all = ranked(outputs, true);
+    for (k, row) in out_rows(outputs).iter().enumerate() {
+        if hlsl_type(all[row[0]]) == "float" {
             let _ = writeln!(h, "    d.p{k} = a.p{k} + b.p{k} - k.p{k};");
         }
     }
@@ -5338,13 +5421,15 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
     let slots = ranked(&ms.outputs, true);
     // (declaration, record slot or None = 0)
     let elems: Vec<(String, &SigElement, Option<usize>)> = match ps_inputs {
-        None => slots.iter().enumerate().map(|(k, e)| (e.semantic(), *e, Some(k))).collect(),
+        // a row of several elements reads the record slot of one of them (each holds the register)
+        None => out_rows(&ms.outputs).iter().map(|row| (slots[row[0]].semantic(), slots[row[0]], Some(row[0]))).collect(),
         Some(ins) => {
-            let mut v: Vec<(String, &SigElement, Option<usize>)> = ranked(ins, false)
+            let user = ranked(ins, false);
+            let mut v: Vec<(String, &SigElement, Option<usize>)> = super::signature_rows(ins)
                 .into_iter()
-                .map(|e| {
-                    let k = slots.iter().position(|o| o.system_value == 0 && o.name.eq_ignore_ascii_case(&e.name) && o.index == e.index);
-                    (e.semantic(), e, k)
+                .map(|row| {
+                    let k = row.iter().find_map(|&j| slots.iter().position(|o| o.system_value == 0 && o.name.eq_ignore_ascii_case(&user[j].name) && o.index == user[j].index));
+                    (user[row[0]].semantic(), user[row[0]], k)
                 })
                 .collect();
             v.extend(slots.iter().enumerate().filter(|(_, o)| matches!(o.system_value, 2 | 3)).map(|(k, o)| (o.semantic(), *o, Some(k))));
@@ -5463,8 +5548,8 @@ pub fn passthrough_split(ms: &MsInterface, elements: usize) -> u32 {
 pub fn passthrough_elements(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) -> usize {
     let slots = ranked(&ms.outputs, true);
     match ps_inputs {
-        None => slots.len(),
-        Some(ins) => ranked(ins, false).len() + slots.iter().filter(|o| matches!(o.system_value, 2 | 3)).count(),
+        None => out_rows(&ms.outputs).len(),
+        Some(ins) => super::signature_rows(ins).len() + slots.iter().filter(|o| matches!(o.system_value, 2 | 3)).count(),
     }
 }
 

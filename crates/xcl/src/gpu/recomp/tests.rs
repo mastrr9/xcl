@@ -1964,6 +1964,188 @@ fn ps_exp_vm_hlsl_and_direct_dxil_codegen() {
     }
 }
 
+/// A console signature with 36 user elements in 18 registers: two TEXCOORDs per register in
+/// .xy and .zw (the .zw one listed first), then a register with a uint in .x and a float3 in
+/// .yzw. One float4 row per element is 37 rows with SV_Position, over D3D12's 32.
+fn packed_signature() -> Vec<crate::gpu::dxbc::SigElement> {
+    let mut s = vec![el("SV_Position", 0, 1, 3, 0, 0xF)];
+    for r in 0..17u32 {
+        s.push(el("TEXCOORD", 2 * r + 1, 0, 3, 1 + r, 0xC));
+        s.push(el("TEXCOORD", 2 * r, 0, 3, 1 + r, 0x3));
+    }
+    s.push(el("TEXCOORD", 34, 0, 3, 18, 0xE));
+    s.push(el("BLENDINDICES", 0, 0, 1, 18, 0x1));
+    s
+}
+
+/// The members of `struct <name>` in `h` after SV_Position, as (type, semantic): what D3D12
+/// links a VS output to a PS input by (one row each, in order).
+fn signature_members(h: &str, name: &str) -> Vec<(String, String)> {
+    let start = h.find(&format!("struct {name} {{\n")).unwrap_or_else(|| panic!("no struct {name}:\n{h}"));
+    let body = &h[start..start + h[start..].find("};").unwrap()];
+    body.lines()
+        .skip(1)
+        .filter(|l| l.contains(" : ") && !l.contains(": SV_"))
+        .map(|l| {
+            let w: Vec<&str> = l.trim_end_matches(';').split_whitespace().collect();
+            (w[w.len() - 4].to_string(), w[w.len() - 1].to_string())
+        })
+        .collect()
+}
+
+/// A console signature with more elements than D3D12 has signature rows, packed two to a
+/// register: the VS output, the PS input, the mesh pass-through and the rect-list GS declare
+/// one row per register (and kind: the uint at .x and the float3 at .yzw of one register are
+/// two rows), named by the element at the lowest component, the same rows on every side. The
+/// programs still write and read their elements (`xo.p<j>`, `xi.a<k>`), copied to / from the
+/// rows. Declared one float4 row per element, as before, each stage had 37 rows and DXC
+/// refused it. Under the limit nothing changes; the direct DXIL path leaves such signatures to
+/// the HLSL path.
+#[test]
+fn packed_console_signature_shares_rows_in_every_stage() {
+    use super::emit::{mesh_passthrough, mesh_passthrough_for, passthrough_elements, rect_list_gs};
+    use super::{signature_packed, signature_rows, MsInterface, PsInterface, VsInterface, SIGNATURE_ROWS};
+    use crate::gpu::dxil::kernel::{translate_pixel, translate_vertex, KernelOptions};
+    let sig = packed_signature();
+    let mut rows: Vec<Vec<usize>> = (0..17).map(|r| vec![2 * r + 1, 2 * r]).collect();
+    rows.push(vec![35]);
+    rows.push(vec![34]);
+    assert_eq!(signature_rows(&sig), rows);
+    assert!(signature_packed(&sig));
+    let mut want: Vec<(String, String)> = (0..17).map(|r| ("float4".to_string(), format!("TEXCOORD{}", 2 * r))).collect();
+    want.push(("uint4".into(), "BLENDINDICES0".into()));
+    want.push(("float4".into(), "TEXCOORD34".into()));
+    assert!(1 + want.len() <= SIGNATURE_ROWS);
+
+    // VS: params 0 and 8 (registers 1 and 9) from COLOR
+    let vs_code = prog(&[
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 40), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11)], None),
+    ]);
+    let vsi = VsInterface { inputs: vec![el("POSITION", 0, 0, 3, 0, 0xF), el("COLOR", 0, 0, 3, 1, 0xF)], outputs: sig.clone(), attr_base: 4, params: None };
+    let vo = Options { mode: Mode::Vertex(vsi.clone()), wave64: true, ..Default::default() };
+    let vt = translate(&vs_code, &vo).unwrap();
+    assert!(vt.complete(), "{:?}", vt.unsupported);
+    let vs = vt.hlsl;
+    assert_eq!(signature_members(&vs, "XclOut"), want, "{vs}");
+    assert!(vs.contains("XclVals xo = (XclVals)0;") && vs.contains("    return xcl_rows(xo);\n}"), "{vs}");
+    // each row from the element that names it; the program writes every element of a register
+    assert!(vs.contains("    o.p0 = v.p1;\n") && vs.contains("    o.p8 = v.p17;\n") && vs.contains("    o.p17 = v.p35;\n") && vs.contains("    o.p18 = v.p34;\n"), "{vs}");
+    assert!(vs.contains("xo.p16[2] = asfloat(v10);") && vs.contains("xo.p17[0] = asfloat(v8);"), "{vs}");
+
+    // PS: reads register 9 (attribute 8): .xy of TEXCOORD16, .z of TEXCOORD17
+    let ps_code = prog(&[
+        ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 0), ("ATTR", 8), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 1), ("ATTR", 8), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 5), ("VSRC", 1), ("ATTR", 8), ("ATTRCHAN", 1)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 6), ("VSRC", 1), ("ATTR", 8), ("ATTRCHAN", 2)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let psi = PsInterface { inputs: sig.clone(), outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x1302, attrs: None };
+    let po = Options { mode: Mode::Pixel(psi.clone()), wave64: true, ..Default::default() };
+    let pt = translate(&ps_code, &po).unwrap();
+    assert!(pt.complete(), "{:?}", pt.unsupported);
+    let ps = pt.hlsl;
+    assert_eq!(signature_members(&ps, "XclInRows"), want, "{ps}");
+    assert!(ps.contains("XclOut main(XclInRows xr)\n{\n    XclIn xi;\n    xi.xcl_pos = xr.xcl_pos;\n"), "{ps}");
+    assert!(ps.contains("struct XclIn {\n    float4 xcl_pos;\n    float4 a0;\n") && ps.contains("    uint4 a35;\n    bool xcl_ff : SV_IsFrontFace;\n};\nstruct XclInRows {"), "{ps}");
+    assert!(ps.contains("     float4 r18 : TEXCOORD34;\n    bool xcl_ff : SV_IsFrontFace;\n};") && ps.contains("    xi.xcl_ff = xr.xcl_ff;\n    XclOut xo = (XclOut)0;\n"), "{ps}");
+    assert!(ps.contains("    nointerpolation uint4 r17 : BLENDINDICES0;\n") && ps.contains("     float4 r8 : TEXCOORD16;\n"), "{ps}");
+    assert!(ps.contains("    xi.a16 = asfloat(xr.r8);\n") && ps.contains("    xi.a17 = asfloat(xr.r8);\n") && ps.contains("    xi.a35 = asuint(xr.r17);\n"), "{ps}");
+    assert!(ps.contains("xi.a17[0]") && ps.contains("xi.a16[2]"), "{ps}");
+
+    // the mesh pass-through for that PS, and without one; the rect-list GS
+    let ms = MsInterface { outputs: sig.clone(), threads: 64, max_vertices: 64, max_primitives: 64, ..Default::default() };
+    let pass = mesh_passthrough_for(&ms, Some(&sig));
+    assert_eq!(signature_members(&pass, "XclVert"), want, "{pass}");
+    assert_eq!(passthrough_elements(&ms, Some(&sig)), want.len());
+    assert!(pass.contains("o.p0 = asfloat(res.Load4(b + 32u).xyzw);") && pass.contains("o.p17 = res.Load4(b + 576u).xyzw;"), "{pass}");
+    let all = mesh_passthrough(&ms);
+    assert_eq!(signature_members(&all, "XclVert"), want, "{all}");
+    assert_eq!(passthrough_elements(&ms, None), want.len());
+    let gs = rect_list_gs(&sig);
+    assert_eq!(signature_members(&gs, "XclOut"), want, "{gs}");
+    assert!(gs.contains("d.p18 = a.p18 + b.p18 - k.p18;") && !gs.contains("d.p17 ="), "{gs}");
+
+    // the direct DXIL path declares a row per element: these go to the HLSL path
+    let ko = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    assert!(translate_vertex(&vs_code, ko, &vsi).is_err_and(|e| e.contains("rows")));
+    assert!(translate_pixel(&ps_code, ko, &psi).is_err_and(|e| e.contains("rows")));
+
+    // under the limit (31 elements, still two to a register): one row per element, as before
+    let few: Vec<_> = sig[..32].to_vec();
+    assert!(!signature_packed(&few) && signature_rows(&few) == (0..31).map(|j| vec![j]).collect::<Vec<_>>());
+    let vf = translate(&vs_code, &Options { mode: Mode::Vertex(VsInterface { outputs: few.clone(), ..vsi.clone() }), wave64: true, ..Default::default() }).unwrap().hlsl;
+    assert!(vf.contains("XclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n") && vf.contains("    float4 p0 : TEXCOORD1;\n") && !vf.contains("XclVals"), "{vf}");
+    let pf = translate(&ps_code, &Options { mode: Mode::Pixel(PsInterface { inputs: few.clone(), ..psi.clone() }), wave64: true, ..Default::default() }).unwrap().hlsl;
+    assert!(pf.contains("XclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n") && !pf.contains("XclInRows"), "{pf}");
+
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&vs, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{vs}"));
+        super::dxc::compile(&ps, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{ps}"));
+        super::dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+        super::dxc::compile(&all, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{all}"));
+        super::dxc::compile(&gs, "main", "gs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{gs}"));
+        // the root cause: the same elements one float4 row each are refused
+        let mut rowwise = String::from("struct O {\n    float4 pos : SV_Position;\n");
+        for (j, e) in super::ranked(&sig, false).iter().enumerate() {
+            let _ = std::fmt::Write::write_fmt(&mut rowwise, format_args!("    {}4 p{j} : {};\n", if e.component_type == 3 { "float" } else { "uint" }, e.semantic()));
+        }
+        rowwise.push_str("};\nO main() { O o = (O)0; return o; }\n");
+        assert!(super::dxc::compile(&rowwise, "main", "vs_6_6", &[]).is_err(), "37 signature rows accepted:\n{rowwise}");
+    }
+}
+
+/// `packed_console_signature_shares_rows_in_every_stage` drawn: a VS and a PS with that
+/// signature link (D3D12 creates the pipeline) and the PS reads what the VS wrote to register
+/// 9 from its row.
+#[test]
+fn gpu_packed_console_signature_links_vs_ps() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{PsInterface, VsInterface};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32_FLOAT};
+    let sig = packed_signature();
+    let vs_code = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V + 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 5)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0xF), ("VSRC0", 2), ("VSRC1", 2), ("VSRC2", 2), ("VSRC3", 2)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 40), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 41), ("EN", 0xF), ("VSRC0", 3), ("VSRC1", 3), ("VSRC2", 3), ("VSRC3", 3)], None),
+    ]);
+    let vsi = VsInterface { inputs: vec![el("POSITION", 0, 0, 3, 0, 3), el("COLOR", 0, 0, 3, 1, 0xF)], outputs: sig.clone(), attr_base: 4, params: None };
+    let ps_code = prog(&[
+        ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 0), ("ATTR", 8), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 1), ("ATTR", 8), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 5), ("VSRC", 1), ("ATTR", 8), ("ATTRCHAN", 1)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 6), ("VSRC", 1), ("ATTR", 8), ("ATTRCHAN", 2)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let psi = PsInterface { inputs: sig, outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None };
+    let vt = translate(&vs_code, &Options { mode: Mode::Vertex(vsi), wave64: true, ..Default::default() }).unwrap();
+    let pt = translate(&ps_code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
+    assert!(vt.complete() && pt.complete(), "{:?} {:?}", vt.unsupported, pt.unsupported);
+    let vs = super::dxc::compile(&vt.hlsl, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", vt.hlsl));
+    let ps = super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
+    let c = [0.8f32, 0.6, 0.4, 1.0];
+    let verts: Vec<f32> = [[-1.0f32, -1.0], [-1.0, 3.0], [3.0, -1.0]].iter().flat_map(|p| [p[0], p[1], c[0], c[1], c[2], c[3]]).collect();
+    let layout = [
+        runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 },
+        runner::VertexElement { semantic: "COLOR", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 8 },
+    ];
+    let px = runner::draw(&vs, &ps, &layout, &verts, 24, &[], &[], 16, [0.0, 0.0, 1.0, 1.0]).unwrap_or_else(|e| panic!("{e}\n{}\n{}", vt.hlsl, pt.hlsl));
+    for (i, got) in px.iter().enumerate() {
+        assert!(got.iter().zip(c).all(|(a, b)| (a - b).abs() < 1e-5), "pixel {i} = {got:?}, expected {c:?}");
+    }
+}
+
 /// GPU draw regression for XCL-BT-012 (#1488): verifies all four `EXP` `VM` pixel-survival
 /// cases on the GPU through both the HLSL and Direct DXIL pixel-shader backends.
 #[test]

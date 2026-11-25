@@ -312,6 +312,46 @@ pub fn geometry_program(es_blob: &[u8], gs_blob: &[u8]) -> Result<(Vec<u8>, GsIn
     Ok((code, g))
 }
 
+/// Signature rows D3D12 has for a vertex shader's outputs and a pixel shader's inputs
+/// (`D3D12_VS_OUTPUT_REGISTER_COUNT`, `D3D12_PS_INPUT_REGISTER_COUNT`), SV_Position's included.
+pub const SIGNATURE_ROWS: usize = 32;
+
+/// The PC signature rows of a console signature's user elements (`ranked(sig, false)`), each
+/// the places there of the elements it carries; the first names the row (its semantic, type
+/// and, in a PS, interpolation). One row per element, as XCL declares them, while that fits
+/// next to SV_Position. A console signature packs elements two or more to a register (each in
+/// the components of its mask), so it can hold more elements than D3D12 has rows: then the
+/// elements of one register share its row, one row per register and kind (float /
+/// integer: an integer input is not interpolated), named by the element at the lowest
+/// component. The VS output, the PS input and the mesh pass-through all take their rows from
+/// here, so a VS and a PS with the same signature declare the same rows (D3D12 links them by
+/// register). A row carries the whole register: what `exp param N` writes to every element
+/// there (`emit::export_graphics`) and what `v_interp` reads from one.
+pub fn signature_rows(sig: &[SigElement]) -> Vec<Vec<usize>> {
+    let user = ranked(sig, false);
+    if user.len() < SIGNATURE_ROWS {
+        return (0..user.len()).map(|j| vec![j]).collect();
+    }
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    for (j, e) in user.iter().enumerate() {
+        let float = e.component_type == 3;
+        match rows.iter_mut().find(|r| user[r[0]].register == e.register && (user[r[0]].component_type == 3) == float) {
+            Some(r) => r.push(j),
+            None => rows.push(vec![j]),
+        }
+    }
+    for r in &mut rows {
+        r.sort_by_key(|&j| user[j].mask.trailing_zeros());
+    }
+    rows.sort_by_key(|r| (user[r[0]].register, user[r[0]].mask.trailing_zeros()));
+    rows
+}
+
+/// Whether `signature_rows` puts two elements of `sig` in one row (else it is one per element).
+pub fn signature_packed(sig: &[SigElement]) -> bool {
+    signature_rows(sig).iter().any(|r| r.len() > 1)
+}
+
 /// Non-system elements in register order – the order of `exp param N` / `v_interp attrN`.
 pub fn ranked(sig: &[SigElement], with_clip: bool) -> Vec<&SigElement> {
     let mut user: Vec<&SigElement> = sig.iter().filter(|e| e.system_value == 0 && !e.name.starts_with("SV_")).collect();

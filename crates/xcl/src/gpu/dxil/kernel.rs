@@ -134,6 +134,11 @@ pub fn translate_geometry(code: &[u8], o: KernelOptions, g: &GsInterface) -> Res
     translate_entry(code, KernelOptions { wave64: true, ..o }, Entry::Geometry(g.clone()), None, None, 0)
 }
 
+/// `setup_vertex` / `setup_pixel` declare one signature row per element; a signature the HLSL
+/// path packs a register to a row (`recomp::signature_rows`) goes there, so that the VS and the
+/// PS of a pipeline declare the same rows whichever path each takes.
+const PACKED_ROWS: &str = "more signature elements than rows: registers packed in the HLSL path";
+
 /// The entry ABI.
 #[derive(Clone)]
 pub enum Entry {
@@ -252,6 +257,9 @@ fn translate_on_this_thread(
             [64, 1, 1]
         }
         Entry::Vertex(vs) => {
+            if crate::gpu::recomp::signature_packed(&vs.outputs) {
+                return Err(PACKED_ROWS.into());
+            }
             lw.setup_lanes_gfx();
             let used: BTreeSet<u64> = cfg.insts.iter().flat_map(|d| {
                 let (r, w) = crate::gpu::rdna2::vgpr_uses(d);
@@ -261,6 +269,9 @@ fn translate_on_this_thread(
             [1, 1, 1]
         }
         Entry::Pixel(ps) => {
+            if crate::gpu::recomp::signature_packed(&ps.inputs) {
+                return Err(PACKED_ROWS.into());
+            }
             lw.setup_lanes_gfx();
             let modes = crate::gpu::recomp::emit::ps_attr_modes(&cfg.insts, ps.input_ena);
             lw.setup_pixel(ps, &modes);
