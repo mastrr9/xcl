@@ -6,7 +6,8 @@
 //! compares the memory with the reference and prints the translation times; with
 //! `XCL_COVERED_BENCH=1` it also times 4096 groups of each on the GPU. A console MS program
 //! does the same for the mesh pass's own classes (`covered::MESH_TABLE`), through both
-//! backends' compute pass and the pass-through mesh shader.
+//! backends' compute pass and the pass-through mesh shader, and a console ES + GS program for
+//! the geometry pass's (`covered::GEOM_TABLE`).
 //!
 //! Candidates are programs for the next classes to flip (transcendental, valu64, cross-lane,
 //! barrier, the LDS, buffer and global atomics), each with its RDNA2 reference. The GPU test
@@ -18,9 +19,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::cfg::{Cfg, Term};
 use super::covered;
-use super::kernel::{translate_compute, translate_mesh, KernelOptions};
+use super::kernel::{translate_compute, translate_geometry, translate_mesh, KernelOptions};
 use crate::gpu::rdna2::{self, encode};
-use crate::gpu::recomp::{CsInterface, Mode, MsInterface, Options};
+use crate::gpu::recomp::{CsInterface, GsInterface, Mode, MsInterface, Options};
 
 const V: u64 = 256; // VALU source code of v0
 const BASE: u32 = 0x400; // s0: where a program's memory starts
@@ -971,9 +972,129 @@ fn mesh_record(ms: &MsInterface, g: u32) -> Vec<(usize, u32)> {
     w
 }
 
+/// Primitives of the geometry pass's test: a full group of 21 and one of 4.
+const GS_PRIMS: u32 = 25;
+/// What the ES's last ESGS dword holds besides the vertex id (`v5 ^ GS_MARK`).
+const GS_MARK: u32 = 0x5A5A;
+
+/// The console ES + GS program of the geometry pass's test and its interface: one ES output
+/// register (16-byte ESGS items), a float4 position and a uint4 TEXCOORD out, 4 vertices at
+/// most per primitive. ES: each lane's item = (v5, 7 v5 + 1, lane, v5 ^ GS_MARK), written
+/// with ds_write_b64 + ds_write2_b32, then s_barrier and the jump into the GS. GS: s_barrier,
+/// EXEC = the group's primitives (s3[15:8]), the triangle's items read through v0 / v1,
+/// four vertices per lane into its LDS output area (s2 + lane * 128) with ds_write_b128 +
+/// ds_write2_b32, each emitted, a cut after the third on odd lanes, then GS_DONE. Vertex k:
+/// position (2 (k >> 1) - 1, 2 (k & 1) - 1, 0, 1) (exact f32 moves), TEXCOORD (3 p,
+/// k, 7 (3 p + 1) + 1, (3 lane + 2) + ((3 p + 2) ^ GS_MARK)) for primitive p.
+fn geometry_program() -> (Vec<u8>, GsInterface) {
+    let sig = |name: &str, sv: u32, reg: u32, ty: u32| crate::gpu::dxbc::SigElement { name: name.into(), index: 0, system_value: sv, component_type: ty, register: reg, mask: 0xF, rw_mask: 0xF, stream: 0 };
+    let mut a = Asm(Vec::new());
+    let lane = |a: &mut Asm| {
+        a.op("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 128)], None)
+            .op("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", V + 20)], None);
+    };
+    // ES
+    lane(&mut a);
+    a.op("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 21), ("SRC0", 132), ("VSRC1", 20)], None) // lane * 16
+        .op("V_MOV_B32", "ENC_VOP1", &[("VDST", 22), ("SRC0", V + 5)], None)
+        .op("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 23), ("SRC0", V + 5), ("SRC1", 135), ("SRC2", 129)], None) // 7 v5 + 1
+        .op("V_MOV_B32", "ENC_VOP1", &[("VDST", 24), ("SRC0", V + 20)], None)
+        .op("V_XOR_B32", "ENC_VOP2", &[("VDST", 25), ("SRC0", 255), ("VSRC1", 5)], Some(GS_MARK))
+        .op("DS_WRITE_B64", "ENC_DS", &[("ADDR", 21), ("DATA0", 22)], None)
+        .op("DS_WRITE2_B32", "ENC_DS", &[("ADDR", 21), ("DATA0", 24), ("DATA1", 25), ("OFFSET0", 2), ("OFFSET1", 3)], None)
+        .op("S_WAITCNT", "ENC_SOPP", &[], None)
+        .op("S_BARRIER", "ENC_SOPP", &[], None)
+        .op("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)], None);
+    let gs_start = a.here() as u64;
+    // GS
+    a.op("S_BARRIER", "ENC_SOPP", &[], None)
+        .op("S_BFE_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 3), ("SSRC1", 255)], Some(0x80008)) // primitives
+        .op("S_BFM_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 0), ("SSRC1", 128)], None);
+    lane(&mut a);
+    a.op("V_AND_B32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 255), ("VSRC1", 0)], Some(0xFFFF))
+        .op("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 130), ("VSRC1", 30)], None)
+        .op("V_LSHRREV_B32", "ENC_VOP2", &[("VDST", 31), ("SRC0", 144), ("VSRC1", 0)], None)
+        .op("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 31), ("SRC0", 130), ("VSRC1", 31)], None)
+        .op("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 32), ("SRC0", 130), ("VSRC1", 1)], None)
+        .op("DS_READ_B32", "ENC_DS", &[("ADDR", 30), ("VDST", 40)], None)
+        .op("DS_READ_B32", "ENC_DS", &[("ADDR", 31), ("VDST", 41), ("OFFSET0", 4)], None)
+        .op("DS_READ2_B32", "ENC_DS", &[("ADDR", 32), ("VDST", 42), ("OFFSET0", 2), ("OFFSET1", 3)], None)
+        .op("S_WAITCNT", "ENC_SOPP", &[], None)
+        .op("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 43), ("SRC0", V + 42), ("VSRC1", 43)], None)
+        .op("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 50), ("SRC0", V + 20), ("SRC1", 255), ("SRC2", 2)], Some(128)) // s2 + lane * 128
+        .op("V_MOV_B32", "ENC_VOP1", &[("VDST", 62), ("SRC0", 128)], None)
+        .op("V_MOV_B32", "ENC_VOP1", &[("VDST", 63), ("SRC0", 242)], None)
+        .op("V_MOV_B32", "ENC_VOP1", &[("VDST", 64), ("SRC0", V + 40)], None)
+        .op("V_MOV_B32", "ENC_VOP1", &[("VDST", 66), ("SRC0", V + 41)], None)
+        .op("V_MOV_B32", "ENC_VOP1", &[("VDST", 67), ("SRC0", V + 43)], None);
+    for k in 0..4u64 {
+        let one = |b: bool| if b { 242 } else { 243 }; // 1.0 / -1.0
+        a.op("V_MOV_B32", "ENC_VOP1", &[("VDST", 60), ("SRC0", one(k >> 1 == 1))], None)
+            .op("V_MOV_B32", "ENC_VOP1", &[("VDST", 61), ("SRC0", one(k & 1 == 1))], None)
+            .op("V_MOV_B32", "ENC_VOP1", &[("VDST", 65), ("SRC0", 128 + k)], None)
+            .op("DS_WRITE_B128", "ENC_DS", &[("ADDR", 50), ("DATA0", 60)], None)
+            .op("DS_WRITE2_B32", "ENC_DS", &[("ADDR", 50), ("DATA0", 64), ("DATA1", 65), ("OFFSET0", 4), ("OFFSET1", 5)], None)
+            .op("DS_WRITE2_B32", "ENC_DS", &[("ADDR", 50), ("DATA0", 66), ("DATA1", 67), ("OFFSET0", 6), ("OFFSET1", 7)], None)
+            .op("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x22)], None) // emit
+            .op("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 50), ("SRC0", 160), ("VSRC1", 50)], None);
+        if k == 2 {
+            // odd lanes: cut
+            a.op("V_AND_B32", "ENC_VOP2", &[("VDST", 70), ("SRC0", 129), ("VSRC1", 20)], None)
+                .op("V_CMP_NE_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 70)], None)
+                .op("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 106)], None)
+                .op("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x12)], None)
+                .op("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 8)], None);
+        }
+    }
+    a.op("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x03)], None); // GS_DONE
+    let g = GsInterface {
+        es_inputs: vec![],
+        es_outputs: vec![sig("SV_Position", 1, 0, 3)],
+        outputs: vec![sig("SV_Position", 1, 0, 3), sig("TEXCOORD", 0, 1, 1)],
+        max_vertex_count: 4,
+        gs_start: Some(gs_start),
+    };
+    (a.end(), g)
+}
+
+/// The words of group `grp`'s record that `geometry_program` writes on RDNA2 for `GS_PRIMS`
+/// primitives: (dword, value).
+fn geometry_record(g: &GsInterface, grp: u32) -> Vec<(usize, u32)> {
+    let header = crate::gpu::recomp::MESH_HEADER;
+    let rec = g.record();
+    let (vd, maxv) = (rec.vert_dwords(), rec.max_vertices as usize);
+    let np = (GS_PRIMS - 21 * grp).min(21);
+    let mut w = Vec::new();
+    let mut tris = 0usize;
+    for l in 0..np {
+        let p = 21 * grp + l;
+        let vb = 4 * l;
+        for k in 0..4u32 {
+            let v = header + (vb + k) as usize * vd;
+            let pos = [2.0 * (k >> 1) as f32 - 1.0, 2.0 * (k & 1) as f32 - 1.0, 0.0, 1.0f32].map(f32::to_bits);
+            let tex = [3 * p, k, 7 * (3 * p + 1) + 1, (3 * l + 2) + ((3 * p + 2) ^ GS_MARK)];
+            w.extend(pos.iter().chain(&tex).enumerate().map(|(c, &x)| (v + c, x)));
+        }
+        let prim = header + maxv * vd + tris;
+        w.push((prim, vb | (vb + 1) << 10 | (vb + 2) << 20));
+        tris += 1;
+        if l % 2 == 0 {
+            // the strip's second triangle, its first two vertices swapped; odd lanes cut before
+            w.push((prim + 1, (vb + 2) | (vb + 1) << 10 | (vb + 3) << 20));
+            tris += 1;
+        }
+    }
+    w.extend([(0, 4 * np), (1, tris as u32)]);
+    w
+}
+
 /// The classes `classify` gives the instructions `covered::check` looks at in `code`.
 fn classes(code: &[u8], classify: fn(&rdna2::Decoded) -> &'static str) -> BTreeSet<&'static str> {
-    let cfg = Cfg::build(code).unwrap_or_else(|e| panic!("{e}"));
+    classes_in(&Cfg::build(code).unwrap_or_else(|e| panic!("{e}")), classify)
+}
+
+/// `classes` over a CFG built already (the geometry pass's, `Cfg::build_geometry`).
+fn classes_in(cfg: &Cfg, classify: fn(&rdna2::Decoded) -> &'static str) -> BTreeSet<&'static str> {
     let mut out = BTreeSet::new();
     for &b in &cfg.rpo {
         let block = &cfg.blocks[b];
@@ -1225,6 +1346,105 @@ fn gpu_covered_mesh_pass_matches_on_both_backends() {
                 }
             }
             drawn.push((px, rec));
+        }
+        if drawn[0] != drawn[1] {
+            wrong.push(format!("{form}: the two backends leave other records or pixels"));
+        }
+    }
+    assert!(wrong.is_empty(), "outside RDNA2's results:\n{}", wrong.join("\n"));
+}
+
+/// The GS program is in the geometry pass's covered set, uses each of its own classes, and
+/// is no compute or MS program of the covered set (its messages and barrier are that pass's
+/// only).
+#[test]
+fn the_geometry_program_is_in_the_covered_geometry_set() {
+    let (code, g) = geometry_program();
+    assert_eq!(covered::check_geometry(&code, g.gs_start), Ok(()));
+    assert_eq!(covered::check(&code), Err("s_barrier: outside the covered set (class barrier)".into()));
+    assert_eq!(covered::check_mesh(&code), Err("s_barrier: outside the covered set (class barrier)".into()));
+    let seen = classes_in(&Cfg::build_geometry(&code, g.gs_start).unwrap(), covered::geom_class);
+    let missing: Vec<&str> = covered::GEOM_TABLE.iter().filter(|r| r.1 && !seen.contains(r.0)).map(|r| r.0).collect();
+    assert!(missing.is_empty(), "geometry classes without a program: {missing:?}");
+    assert!(seen.contains("lds"), "the ESGS ring and the output vertices are LDS");
+    let rec = g.record();
+    assert_eq!((g.es_item_bytes(), g.es_ring_bytes(), g.vertex_bytes(), rec.vert_dwords()), (16, 1024, 32, 8));
+    // 11 even lanes with 2 triangles, 10 odd ones with 1; the second group's 4 primitives
+    let header = |grp| geometry_record(&g, grp).into_iter().filter(|&(k, _)| k < 2).collect::<Vec<_>>();
+    assert_eq!(header(0), [(0, 84), (1, 32)]);
+    assert_eq!(header(1), [(0, 16), (1, 6)]);
+    assert!(rec.max_vertices >= 84 && rec.max_primitives >= 32);
+    // group 1, primitive 22 (lane 1): its first vertex's TEXCOORD
+    let v = crate::gpu::recomp::MESH_HEADER + 4 * rec.vert_dwords() + 4;
+    let w = geometry_record(&g, 1);
+    assert_eq!(w.iter().filter(|e| (v..v + 4).contains(&e.0)).map(|e| e.1).collect::<Vec<_>>(), [66, 0, 470, 5 + (68 ^ GS_MARK)]);
+}
+
+#[test]
+fn the_geometry_program_translates_directly() {
+    let (code, g) = geometry_program();
+    for split in [false, true] {
+        let o = KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
+        translate_geometry(&code, o, &g).unwrap_or_else(|e| panic!("split {split}: {e}"));
+    }
+}
+
+/// The compute pass of the ES + GS program through HLSL + DXC and through the direct path, in
+/// the split form and (64-lane hardware) the native one, each drawn by the HLSL pass-through
+/// mesh shader: the records RDNA2 leaves (a full and a partial group) and the same pixels.
+#[test]
+fn gpu_covered_geometry_pass_matches_on_both_backends() {
+    use crate::gpu::recomp::{dxc, mesh_passthrough, runner, translate_geometry as hlsl_geometry, IO_GS_PRIMS};
+    let skip = [
+        (runner::adapter().is_err(), "no GPU"),
+        (dxc::location().is_err(), "no DXC"),
+        (runner::wave64_programs_supported() != Ok(true), "no wave64"),
+        (runner::mesh_shaders_supported() != Ok(true), "no mesh shaders"),
+    ];
+    if let Some(&(_, reason)) = skip.iter().find(|s| s.0) {
+        runner::skip_test(reason);
+        return;
+    }
+    println!("GPU: {}", runner::adapter().unwrap());
+    let (code, g) = geometry_program();
+    let rec = g.record();
+    let rd = rec.record_dwords();
+    let pass = dxc::compile(&mesh_passthrough(&rec), "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+    let ps_src = "struct V { float4 pos : SV_Position; nointerpolation uint4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return float4(1.0, 0.0, 0.0, 1.0); }\n";
+    let ps = dxc::compile(ps_src, "main", "ps_6_6", &[]).unwrap();
+    let mut io = vec![0u32; 128];
+    io[IO_GS_PRIMS] = GS_PRIMS;
+    let groups = GS_PRIMS.div_ceil(21);
+    let mut forms = vec![true];
+    if runner::wave64_supported() == Ok(true) {
+        forms.push(false);
+    }
+    let mut wrong = Vec::new();
+    for split in forms {
+        let form = if split { "split" } else { "native" };
+        let t = hlsl_geometry(&code, g.clone(), split, 1).unwrap_or_else(|e| panic!("{form}: {e}"));
+        assert!(t.complete(), "{form}: {:?}", t.unsupported_why);
+        let hlsl = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let o = KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
+        let direct = translate_geometry(&code, o, &g).unwrap_or_else(|e| panic!("{form}: {e}")).dxil;
+        let mut drawn = Vec::new();
+        for (backend, cs) in [("HLSL", &hlsl), ("direct", &direct)] {
+            let (px, got) = runner::mesh_draw(cs, &pass, &ps, groups, rd, &io, &[0; 64], 32, [0.0; 4]).unwrap_or_else(|e| panic!("{backend} ({form}): {e}"));
+            for grp in 0..groups {
+                let bad: Vec<(usize, u32, u32)> =
+                    geometry_record(&g, grp).into_iter().filter(|&(k, v)| got[grp as usize * rd + k] != v).map(|(k, v)| (k, got[grp as usize * rd + k], v)).collect();
+                if !bad.is_empty() {
+                    wrong.push(format!("{backend} ({form}) group {grp}: {} word(s), first (word, got, want) {:x?}", bad.len(), &bad[..bad.len().min(4)]));
+                }
+            }
+            // the even lanes' strips cover the target, the odd lanes' triangle its lower left
+            for (x, y) in [(4, 27), (28, 4)] {
+                let p = px[y * 32 + x];
+                if p != [1.0, 0.0, 0.0, 1.0] {
+                    wrong.push(format!("{backend} ({form}) pixel ({x}, {y}): {p:?}, want red"));
+                }
+            }
+            drawn.push((px, got));
         }
         if drawn[0] != drawn[1] {
             wrong.push(format!("{form}: the two backends leave other records or pixels"));
