@@ -136,6 +136,9 @@ fn test_title_runs_and_game_folder_is_untouched() {
         .arg("--")
         .arg("--hello")
         .env("XCL_DATA_ROOT", &data)
+        // a new data folder is a title's first run, with a whole coherent window the test title
+        // does not use: the 512 MB of later runs
+        .env("XCL_COHERENT_MB", "512")
         // the shader dumps and their translation, which the report's shader counts come from
         .env("XCL_DUMP_SHADERS", "1")
         .output()
@@ -299,7 +302,7 @@ fn title_under_the_debug_layer(dred: bool) {
         std::fs::copy(bin_dir.join(f), game.join(f)).unwrap_or_else(|e| panic!("{f}: {e} – build first: cargo build --workspace"));
     }
     let mut cmd = Command::new(&xcl);
-    cmd.arg("run").arg(&game).arg("--").arg("--hello").env("XCL_DATA_ROOT", &data).env("XCL_D3D12_DEBUG", "1");
+    cmd.arg("run").arg(&game).arg("--").arg("--hello").env("XCL_DATA_ROOT", &data).env("XCL_COHERENT_MB", "512").env("XCL_D3D12_DEBUG", "1");
     if dred {
         cmd.env("XCL_DRED", "1");
     } else {

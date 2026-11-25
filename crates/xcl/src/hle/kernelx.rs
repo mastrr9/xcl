@@ -327,7 +327,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     // the CPU writes and the GPU reads, as a PC game's upload heaps): in the coherent window, which
     // the GPU reads where it is – one copy (a retail game's 4.4 GB; as plain memory its shaders
     // read zeros, in the sparse windows video memory would have doubled them). The window is as
-    // large as what the title asked for last time (`uma::coherent_hint`).
+    // large as what the title asked for last time, a whole one in its first run (`uma::coherent_hint`).
     if addr.is_null() && t & 0x1000 != 0 && p & PAGE_GRAPHICS_ANY != 0 && size <= crate::gpu::uma::MAX_SIZE && std::env::var("XCL_COHERENT_HEAPS").map_or(true, |v| v != "0") {
         static ASKED: AtomicUsize = AtomicUsize::new(0);
         let asked = ASKED.fetch_add(size, Ordering::Relaxed) + size;
