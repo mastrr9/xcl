@@ -14,7 +14,9 @@
 //! the inner one is a real query (Fortnite nests its per-object queries in a dummy outer one).
 //!
 //! Console GPU addresses in unified memory are the title's own addresses; memory operations
-//! go to that window's buffer (`real::uma_window_buffer`), which is in COMMON between them.
+//! go to that window's buffer (`real::uma_window_buffer`), which is in COMMON between them –
+//! except after a bottom-of-pipe label or a timestamp, which leave it in COPY_DEST until the
+//! list's next barrier, wait on memory it wrote or close (`into_copy_dest_left`).
 //! An index buffer at such an address is given to the PC as the window buffer's GPU address.
 
 use std::collections::HashMap;
@@ -108,8 +110,9 @@ pub(super) fn tracked_list_type(list: *mut c_void) -> Option<D3D12_COMMAND_LIST_
     LISTS.lock().unwrap().as_ref()?.get(&(list as usize))?.list_type
 }
 
-pub(super) unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
-    let b = D3D12_RESOURCE_BARRIER {
+/// A transition barrier of the whole of `res`
+unsafe fn transition_barrier(res: usize, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
@@ -120,8 +123,29 @@ pub(super) unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RES
                 StateAfter: after,
             }),
         },
-    };
-    pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(list, PC_RESOURCE_BARRIER)(list, 1, &b);
+    }
+}
+
+unsafe fn resource_barriers(list: *mut c_void, b: &[D3D12_RESOURCE_BARRIER]) {
+    if !b.is_empty() {
+        pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(list, PC_RESOURCE_BARRIER)(list, b.len() as u32, b.as_ptr());
+    }
+}
+
+/// `res` from `before` to `after`, in one ResourceBarrier call with the buffers this list left
+/// out of COMMON (`in_state_left`) going back to COMMON; if `res` is one of them, it is back in
+/// COMMON (a call of its own) before its transition.
+pub(super) unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
+    let mut b = left_flush(list);
+    if b.is_empty() {
+        return resource_barriers(list, &[transition_barrier(res, before, after)]);
+    }
+    if b.iter().any(|x| barrier_resource(x) == res) {
+        resource_barriers(list, &b);
+        b.clear();
+    }
+    b.push(transition_barrier(res, before, after));
+    resource_barriers(list, &b);
 }
 
 /// `op` with the window buffer `res` as a copy destination (back to COMMON after it)
@@ -129,6 +153,113 @@ unsafe fn as_copy_dest(list: *mut c_void, res: usize, op: impl FnOnce()) {
     transition(list, res, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     op();
     transition(list, res, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+}
+
+// ---------------------------------------------------------------------------------------
+// buffers left out of COMMON until the list's next barrier (labels' window buffers)
+// ---------------------------------------------------------------------------------------
+
+/// `(list, buffer, state)`: a buffer the open recording `list` left in `state` instead of moving
+/// it back to COMMON (`in_state_left`): a window buffer in COPY_DEST after a bottom-of-pipe label
+/// or a timestamp written into it. Back to COMMON at the list's next barrier of any kind (the
+/// title's, XCL's own), at a wait on memory the list wrote, and before the list closes (Close,
+/// KickoffX, a mid-list split) – not at draws and dispatches.
+static LEFT_IN_STATE: Mutex<Vec<(usize, usize, D3D12_RESOURCE_STATES)>> = Mutex::new(Vec::new());
+/// Entries in `LEFT_IN_STATE` (none: no lock on the barrier, wait and close paths).
+static LEFT_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether bottom-of-pipe labels and timestamps leave their window buffer in COPY_DEST until
+/// the list's next barrier (`XCL_DEFER_LABEL_BARRIERS=0`: back to COMMON after each, as before).
+fn defer_label_barriers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_DEFER_LABEL_BARRIERS").map_or(true, |v| v.trim() != "0"))
+}
+
+fn barrier_resource(b: &D3D12_RESOURCE_BARRIER) -> usize {
+    // SAFETY: only transition barriers are built from `left_flush`
+    unsafe { (std::ptr::addr_of!(b.Anonymous.Transition.pResource) as *const usize).read_unaligned() }
+}
+
+/// Whether `list` left `res` in `state`.
+fn left_in(list: *mut c_void, res: usize, state: D3D12_RESOURCE_STATES) -> bool {
+    LEFT_ENTRIES.load(Ordering::Acquire) != 0 && LEFT_IN_STATE.lock().unwrap().contains(&(list as usize, res, state))
+}
+
+/// Takes the buffers `list` left out of COMMON, with their states.
+fn take_left(list: *mut c_void) -> Vec<(usize, D3D12_RESOURCE_STATES)> {
+    if LEFT_ENTRIES.load(Ordering::Acquire) == 0 {
+        return Vec::new();
+    }
+    let mut g = LEFT_IN_STATE.lock().unwrap();
+    let mut taken = Vec::new();
+    g.retain(|&(l, r, s)| {
+        let mine = l == list as usize;
+        if mine {
+            taken.push((r, s));
+        }
+        !mine
+    });
+    LEFT_ENTRIES.fetch_sub(taken.len(), Ordering::AcqRel);
+    taken
+}
+
+/// The barriers that take the buffers `list` left out of COMMON back to it (none left out of it
+/// afterwards).
+unsafe fn left_flush(list: *mut c_void) -> Vec<D3D12_RESOURCE_BARRIER> {
+    take_left(list).into_iter().map(|(r, s)| transition_barrier(r, s, D3D12_RESOURCE_STATE_COMMON)).collect()
+}
+
+/// The buffers `list` left out of COMMON back in it, in one ResourceBarrier call.
+unsafe fn flush_left(list: *mut c_void) {
+    resource_barriers(list, &left_flush(list));
+}
+
+/// `op` with the buffer `res` in `state`, left there for the list's next one that needs no other
+/// state of it (back to COMMON at the list's next barrier, wait on memory it wrote or close:
+/// `LEFT_IN_STATE`). True: `res` was already there, no barrier was recorded.
+unsafe fn in_state_left(list: *mut c_void, res: usize, state: D3D12_RESOURCE_STATES, op: impl FnOnce()) -> bool {
+    let already = left_in(list, res, state);
+    if !already {
+        // (the others left out of COMMON stay there)
+        resource_barriers(list, &[transition_barrier(res, D3D12_RESOURCE_STATE_COMMON, state)]);
+        LEFT_IN_STATE.lock().unwrap().push((list as usize, res, state));
+        LEFT_ENTRIES.fetch_add(1, Ordering::AcqRel);
+    }
+    op();
+    already
+}
+
+/// `op`, a bottom-of-pipe write (WriteBufferImmediate MARKER_OUT) or a timestamp resolve into the
+/// window buffer `res`, with `res` left in COPY_DEST for the list's next one.
+///
+/// Such a write lands when the work before it is done, on the console as here, and the work
+/// after it does not wait for it there either: a title that reads the value on the GPU orders
+/// the read with a barrier or a wait first. So the transition back to COMMON (on most drivers a
+/// pipe drain and a cache flush) waits for the list's next barrier, close or wait on memory it
+/// wrote (`in_state_left`), and a run of labels between two barriers takes one transition to
+/// COPY_DEST instead of two transitions per label.
+unsafe fn into_copy_dest_left(list: *mut c_void, res: usize, op: impl FnOnce()) {
+    if !defer_label_barriers() {
+        return as_copy_dest(list, res, op);
+    }
+    if in_state_left(list, res, D3D12_RESOURCE_STATE_COPY_DEST, op) {
+        // (two barrier calls fewer than with a transition before and after it)
+        static JOINED: AtomicU64 = AtomicU64::new(0);
+        let n = JOINED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: labels and timestamps that found their window still in COPY_DEST: {n}");
+        }
+    }
+}
+
+/// `op`, a top-of-pipe write into the window buffer `res`, with `res` back in COMMON after it:
+/// the work after it may read the value without a barrier of its own.
+unsafe fn into_copy_dest(list: *mut c_void, res: usize, op: impl FnOnce()) {
+    if !left_in(list, res, D3D12_RESOURCE_STATE_COPY_DEST) {
+        return as_copy_dest(list, res, op);
+    }
+    op();
+    flush_left(list);
 }
 
 unsafe fn copy_buffer_region(list: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
@@ -799,6 +930,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
     let key = list as usize;
     // (of a list that was here before and whose release was not seen: the GPU may still use it)
     release_copy_scratch(key);
+    take_left(list);
     let old = {
         let mut g = LISTS.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
@@ -836,6 +968,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
 /// Clean up all tracked state when a command list is released for good.
 pub(super) fn on_release(list: usize) {
     super::alloc_pool::forget_list(list);
+    take_left(list as *mut c_void);
     release_copy_scratch(list);
     super::title_textures::list_reset(list);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
@@ -2430,10 +2563,22 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
     };
     note_write(list as usize, va, n);
+    write_window(list, d, at, words, mode);
+}
+
+/// The WriteBufferImmediate of `words` at the GPU address `at` in the window buffer `d`: a
+/// MARKER_OUT (bottom-of-pipe) write leaves `d` in COPY_DEST for the list's next barrier
+/// (`into_copy_dest_left`), a MARKER_IN one puts it back in COMMON after it.
+unsafe fn write_window(list: *mut c_void, d: usize, at: u64, words: &[u32], mode: D3D12_WRITEBUFFERIMMEDIATE_MODE) {
     let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words.iter().enumerate().map(|(i, &w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * i as u64, Value: w }).collect();
     let modes = vec![mode; words.len()];
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
-    as_copy_dest(list, d, || pc::<F>(list, PC_WRITE_BUFFER_IMMEDIATE)(list, params.len() as u32, params.as_ptr(), modes.as_ptr()));
+    let op = || pc::<F>(list, PC_WRITE_BUFFER_IMMEDIATE)(list, params.len() as u32, params.as_ptr(), modes.as_ptr());
+    if mode == D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT {
+        into_copy_dest_left(list, d, op);
+    } else {
+        into_copy_dest(list, d, op);
+    }
 }
 
 /// timestamp queries (one heap per device, used round-robin) and a lazily created READBACK
@@ -2523,8 +2668,7 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
     type Resolve = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
     if let Some((d, off)) = uma_dst {
         note_write(list as usize, va, 8);
-        pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
-        as_copy_dest(list, d, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, d, off));
+        timestamp_into_window(list, heap, i, d, off);
     } else if let Some((rb, base)) = readback {
         // Queue the CPU copy only if the list is tracked; otherwise avoid emitting an unused resolve.
         let mut g = LISTS.lock().unwrap();
@@ -2538,6 +2682,14 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
         pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
         pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, rb_raw, off);
     }
+}
+
+/// The timestamp query `i` of `heap`, resolved into the window buffer `d` at `off` when the work
+/// before it is done; `d` is left in COPY_DEST for the list's next barrier (`into_copy_dest_left`).
+unsafe fn timestamp_into_window(list: *mut c_void, heap: usize, i: u32, d: usize, off: u64) {
+    type Resolve = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
+    pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
+    into_copy_dest_left(list, d, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, d, off));
 }
 
 /// command list #69 Write32BitValueBottomOfPipeX(address, value, flush, flags)
@@ -2656,6 +2808,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
         }
     }
 
+    flush_left(list);
     let ext = *(list as *const usize);
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(list, PC_CLOSE)(list);
     real::preserve_vtable(list, ext);
@@ -2810,6 +2963,8 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
 /// on the GPU, so we do not stall before submission (which would deadlock waiting on our own
 /// unsubmitted list). If this list already recorded a `Write64BitValue*` to a different cell,
 /// we split into a new deferred PC segment so earlier `Write64` signals run BEFORE this wait.
+/// (A bottom-of-pipe label leaves its window in COPY_DEST: that barrier back to COMMON is
+/// recorded at such a wait, `into_copy_dest_left`.)
 unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, value: u64, mask: u64, what: &str) {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = width as u64;
@@ -2833,6 +2988,9 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
         if s.has_prior_write(va, n) {
+            drop(g);
+            // a label's window left in COPY_DEST: its barrier back to COMMON goes here
+            flush_left(list);
             return;
         }
         if s.write64_signals.is_empty() {
@@ -2906,7 +3064,13 @@ pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _
             UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: ManuallyDrop::new(None) }),
         },
     };
-    pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER)(this, 1, &b);
+    // (with the buffers this list left out of COMMON back in it: `in_state_left`)
+    let mut all = left_flush(this);
+    if all.is_empty() {
+        return resource_barriers(this, &[b]);
+    }
+    all.push(b);
+    resource_barriers(this, &all);
 }
 
 /// command list #84 CopyResourceX(destination, source, flags); in place (the console's
@@ -2963,7 +3127,11 @@ unsafe fn predication_buffer(list: *mut c_void) -> Option<usize> {
 /// Before `Close()` on a command list: return `pred_buf` to `COMMON` if it is currently in
 /// `D3D12_RESOURCE_STATE_PREDICATION`.
 pub(super) unsafe fn before_close(list: *mut c_void) {
-    if !PREDICATION_USED.load(Ordering::Acquire) || list.is_null() {
+    if list.is_null() {
+        return;
+    }
+    flush_left(list);
+    if !PREDICATION_USED.load(Ordering::Acquire) {
         return;
     }
     let pb = {
@@ -2986,6 +3154,7 @@ pub(super) unsafe fn before_close(list: *mut c_void) {
 /// Clear active predication state when `ID3D12GraphicsCommandList::Reset` resets a recording.
 pub(super) fn on_pc_reset(list: *mut c_void) {
     reset_copy_scratch(list);
+    take_left(list);
     if !PREDICATION_USED.load(Ordering::Acquire) || list.is_null() {
         return;
     }
@@ -3138,6 +3307,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         }
     }
 
+    flush_left(this);
     let ext = *(this as *const usize);
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_CLOSE)(this);
     real::preserve_vtable(this, ext);
@@ -3896,6 +4066,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
     }
 
     reset_copy_scratch(this);
+    take_left(this);
     let is_bundle = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
@@ -4016,6 +4187,10 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
         let t: Vec<(usize, u32, D3D12_RESOURCE_STATES)> =
             out.iter().filter(|b| b[0] == 0).map(|b| ((b[2] as u64 | (b[3] as u64) << 32) as usize, b[4], D3D12_RESOURCE_STATES(b[6] as i32))).collect();
         super::title_textures::note_transitions(this as usize, &t);
+    }
+    // the buffers this list left out of COMMON (`in_state_left`) go back in the same call
+    for (r, s) in take_left(this) {
+        out.push([0, 0, r as u32, (r as u64 >> 32) as u32, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, s.0 as u32, D3D12_RESOURCE_STATE_COMMON.0 as u32, 0]);
     }
     if !out.is_empty() {
         pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER)(this, out.len() as u32, out.as_ptr());
@@ -5402,6 +5577,332 @@ mod tests {
         );
 
         on_release(list_ptr as usize);
+    }
+
+    /// One ResourceBarrier entry of `FakeBarrierList`: a transition (resource, before, after)
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum B {
+        T(usize, i32, i32),
+        Uav,
+    }
+
+    /// What `FakeBarrierList` recorded
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Ev {
+        /// one ResourceBarrier call
+        Barriers(Vec<B>),
+        /// WriteBufferImmediate: (destination, value) of each word, its mode
+        Write(Vec<(u64, u32)>, D3D12_WRITEBUFFERIMMEDIATE_MODE),
+        Resolve(usize, u64),
+        Copy(usize, usize),
+    }
+
+    /// A PC list (an adopted one's layout: its PC table at vtable[-1]) recording its barrier calls,
+    /// immediate writes, query resolves and buffer copies
+    #[repr(C)]
+    struct FakeBarrierList {
+        vt: *const usize,
+        events: Mutex<Vec<Ev>>,
+        _tables: Box<([usize; 128], [usize; 129])>,
+    }
+
+    impl FakeBarrierList {
+        fn new() -> Box<Self> {
+            unsafe fn push(this: *mut c_void, e: Ev) {
+                (*(this as *const FakeBarrierList)).events.lock().unwrap().push(e)
+            }
+            unsafe extern "system" fn barrier(this: *mut c_void, n: u32, b: *const D3D12_RESOURCE_BARRIER) {
+                let v = (0..n as usize)
+                    .map(|i| {
+                        let b = &*b.add(i);
+                        if b.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV {
+                            return B::Uav;
+                        }
+                        let t = &*b.Anonymous.Transition;
+                        B::T((std::ptr::addr_of!(t.pResource) as *const usize).read_unaligned(), t.StateBefore.0, t.StateAfter.0)
+                    })
+                    .collect();
+                push(this, Ev::Barriers(v));
+            }
+            unsafe extern "system" fn write(this: *mut c_void, n: u32, p: *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, m: *const D3D12_WRITEBUFFERIMMEDIATE_MODE) {
+                let words = (0..n as usize).map(|i| ((*p.add(i)).Dest, (*p.add(i)).Value)).collect();
+                push(this, Ev::Write(words, *m));
+            }
+            unsafe extern "system" fn end_query(_: *mut c_void, _: usize, _: D3D12_QUERY_TYPE, _: u32) {}
+            unsafe extern "system" fn resolve(this: *mut c_void, _: usize, _: D3D12_QUERY_TYPE, _: u32, _: u32, dst: usize, off: u64) {
+                push(this, Ev::Resolve(dst, off));
+            }
+            unsafe extern "system" fn copy(this: *mut c_void, dst: usize, _: u64, src: usize, _: u64, _: u64) {
+                push(this, Ev::Copy(dst, src));
+            }
+            let mut t = Box::new(([0usize; 128], [0usize; 129]));
+            t.0[PC_RESOURCE_BARRIER] = barrier as usize;
+            t.0[PC_WRITE_BUFFER_IMMEDIATE] = write as usize;
+            t.0[PC_END_QUERY] = end_query as usize;
+            t.0[PC_RESOLVE_QUERY_DATA] = resolve as usize;
+            t.0[PC_COPY_BUFFER_REGION] = copy as usize;
+            t.1[0] = t.0.as_ptr() as usize;
+            let orig = t.0;
+            t.1[1..].copy_from_slice(&orig);
+            // the boxed tables do not move with `t`: slot 0 at `vt`, the PC table at `vt[-1]`
+            let vt = t.1[1..].as_ptr();
+            Box::new(FakeBarrierList { vt, events: Mutex::new(Vec::new()), _tables: t })
+        }
+
+        fn ptr(&self) -> *mut c_void {
+            self as *const Self as *mut c_void
+        }
+
+        fn take(&self) -> Vec<Ev> {
+            std::mem::take(&mut *self.events.lock().unwrap())
+        }
+    }
+
+    /// Bottom-of-pipe labels and timestamps leave their window buffer in COPY_DEST: a run of them
+    /// takes one transition, and the window goes back to COMMON in the title's next barrier call,
+    /// in XCL's next transition or UAV barrier, at a wait on memory the list wrote and before
+    /// Close; a top-of-pipe label puts it back after itself. Replayed with D3D12's state rules
+    /// (a transition starts from the state the buffer is in), every write finds its window in
+    /// COPY_DEST, no ResourceBarrier call names a buffer twice, and the list ends in COMMON.
+    #[test]
+    fn labels_leave_their_window_in_copy_dest_until_the_next_barrier() {
+        let fake = FakeBarrierList::new();
+        let list = fake.ptr();
+        let take = || fake.take();
+
+        // two window buffers (GPU addresses 1 << 40, 2 << 40), a scratch buffer, a title texture
+        let (w0, w1, scratch, title) = (0x1_0000usize, 0x2_0000usize, 0x3_0000usize, 0x4_0000usize);
+        let (a0, a1) = (1u64 << 40, 2u64 << 40);
+        const C: i32 = D3D12_RESOURCE_STATE_COMMON.0;
+        const CD: i32 = D3D12_RESOURCE_STATE_COPY_DEST.0;
+        const CS: i32 = D3D12_RESOURCE_STATE_COPY_SOURCE.0;
+        const RT: i32 = D3D12_RESOURCE_STATE_RENDER_TARGET.0;
+        const PS: i32 = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0;
+        let out = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+        let into = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN;
+        let mut all = Vec::new();
+        let step = |want: Vec<Ev>, all: &mut Vec<Ev>| {
+            let got = take();
+            assert_eq!(got, want);
+            all.extend(got);
+        };
+        let window = |at: u64| if at >> 40 == 1 { w0 } else { w1 };
+        let mut wait_slot = 0u64;
+        let wait_va = &mut wait_slot as *mut u64 as u64;
+
+        unsafe {
+            on_create(list, 0x100, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+
+            // a run of bottom-of-pipe labels and a timestamp in one window: one transition
+            write_window(list, w0, a0, &[1], out);
+            write_window(list, w0, a0 + 8, &[2, 3], out);
+            timestamp_into_window(list, 0x99, 0, w0, 0x10);
+            step(vec![Ev::Barriers(vec![B::T(w0, C, CD)]), Ev::Write(vec![(a0, 1)], out), Ev::Write(vec![(a0 + 8, 2), (a0 + 12, 3)], out), Ev::Resolve(w0, 0x10)], &mut all);
+            // another window: its own transition, the first one stays in COPY_DEST
+            write_window(list, w1, a1, &[4], out);
+            step(vec![Ev::Barriers(vec![B::T(w1, C, CD)]), Ev::Write(vec![(a1, 4)], out)], &mut all);
+            assert!(left_in(list, w0, D3D12_RESOURCE_STATE_COPY_DEST) && left_in(list, w1, D3D12_RESOURCE_STATE_COPY_DEST));
+
+            // the title's next barrier takes both back to COMMON in its own call
+            let title_barrier: [u32; 8] = [0, 0, title as u32, 0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, RT as u32, PS as u32, 0];
+            resource_barrier_x(list, 1, &title_barrier);
+            step(vec![Ev::Barriers(vec![B::T(title, RT, PS), B::T(w0, CD, C), B::T(w1, CD, C)])], &mut all);
+            assert!(!left_in(list, w0, D3D12_RESOURCE_STATE_COPY_DEST) && !left_in(list, w1, D3D12_RESOURCE_STATE_COPY_DEST));
+
+            // a top-of-pipe label: back to COMMON after it, as before
+            write_window(list, w0, a0, &[5], into);
+            step(vec![Ev::Barriers(vec![B::T(w0, C, CD)]), Ev::Write(vec![(a0, 5)], into), Ev::Barriers(vec![B::T(w0, CD, C)])], &mut all);
+            // … also after a bottom-of-pipe one left the window in COPY_DEST
+            write_window(list, w0, a0, &[6], out);
+            write_window(list, w0, a0 + 4, &[7], into);
+            step(vec![Ev::Barriers(vec![B::T(w0, C, CD)]), Ev::Write(vec![(a0, 6)], out), Ev::Write(vec![(a0 + 4, 7)], into), Ev::Barriers(vec![B::T(w0, CD, C)])], &mut all);
+
+            // XCL's own copies: the window goes back in the call of their first transition, or
+            // in a call of its own before it where that transition names the same window
+            write_window(list, w0, a0, &[8], out);
+            transition(list, scratch, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            as_copy_dest(list, w1, || copy_buffer_region(list, w1, 0, scratch, 0, 4));
+            transition(list, scratch, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            let copy = |w| [Ev::Barriers(vec![B::T(w, C, CD)]), Ev::Copy(w, scratch), Ev::Barriers(vec![B::T(w, CD, C)])];
+            let mut want = vec![Ev::Barriers(vec![B::T(w0, C, CD)]), Ev::Write(vec![(a0, 8)], out), Ev::Barriers(vec![B::T(w0, CD, C), B::T(scratch, C, CS)])];
+            want.extend(copy(w1));
+            want.push(Ev::Barriers(vec![B::T(scratch, CS, C)]));
+            step(want, &mut all);
+            write_window(list, w0, a0, &[9], out);
+            as_copy_dest(list, w0, || copy_buffer_region(list, w0, 0, scratch, 0, 4));
+            let mut want = vec![Ev::Barriers(vec![B::T(w0, C, CD)]), Ev::Write(vec![(a0, 9)], out), Ev::Barriers(vec![B::T(w0, CD, C)])];
+            want.extend(copy(w0));
+            step(want, &mut all);
+
+            // a UAV barrier (#146) takes it back in its call
+            write_window(list, w1, a1, &[10], out);
+            uav_barrier_x(list, 0, std::ptr::null());
+            step(vec![Ev::Barriers(vec![B::T(w1, C, CD)]), Ev::Write(vec![(a1, 10)], out), Ev::Barriers(vec![B::T(w1, CD, C), B::Uav])], &mut all);
+
+            // a wait on memory this list wrote is met by the write's barrier, recorded there
+            write_window(list, w0, a0, &[11], out);
+            note_write(list as usize, wait_va, 8);
+            wait_memory(list, wait_va, 8, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, 1, u64::MAX, "test");
+            step(vec![Ev::Barriers(vec![B::T(w0, C, CD)]), Ev::Write(vec![(a0, 11)], out), Ev::Barriers(vec![B::T(w0, CD, C)])], &mut all);
+
+            // Close: whatever is left goes back in one call
+            write_window(list, w0, a0, &[12], out);
+            timestamp_into_window(list, 0x99, 1, w1, 0x18);
+            before_close(list);
+            let left = [B::T(w0, CD, C), B::T(w1, CD, C)];
+            step(vec![Ev::Barriers(vec![B::T(w0, C, CD)]), Ev::Write(vec![(a0, 12)], out), Ev::Barriers(vec![B::T(w1, C, CD)]), Ev::Resolve(w1, 0x18), Ev::Barriers(left.to_vec())], &mut all);
+            on_release(list as usize);
+        }
+
+        // replay with D3D12's rules
+        let mut state: HashMap<usize, i32> = HashMap::from([(title, RT)]);
+        let (mut labels, mut calls) = (0, 0);
+        for e in &all {
+            match e {
+                Ev::Barriers(v) => {
+                    calls += 1;
+                    let mut named = std::collections::HashSet::new();
+                    for b in v {
+                        if let B::T(r, before, after) = *b {
+                            assert!(named.insert(r), "one call names {r:#x} twice: {v:?}");
+                            let s = state.entry(r).or_insert(C);
+                            assert_eq!(*s, before, "{r:#x} is in {:#x}, not {before:#x}", *s);
+                            *s = after;
+                        }
+                    }
+                }
+                Ev::Write(words, _) => {
+                    labels += 1;
+                    assert_eq!(state.get(&window(words[0].0)).copied().unwrap_or(C), CD, "a label into a window not in COPY_DEST");
+                }
+                Ev::Resolve(d, _) => {
+                    labels += 1;
+                    assert_eq!(state.get(d).copied().unwrap_or(C), CD, "a timestamp into a window not in COPY_DEST");
+                }
+                Ev::Copy(d, _) => assert_eq!(state.get(d).copied().unwrap_or(C), CD, "a copy into a window not in COPY_DEST"),
+            }
+        }
+        assert!(state.iter().all(|(&r, &s)| s == C || r == title), "a buffer left out of COMMON at Close: {state:x?}");
+        assert_eq!((labels, calls), (13, 23), "labels and timestamps, ResourceBarrier calls");
+    }
+
+    /// GPU time of a list of dispatches with a bottom-of-pipe label after each, the label's window
+    /// moved to COPY_DEST and back around each label (`as_copy_dest`, as before) and left in
+    /// COPY_DEST until Close (`into_copy_dest_left`); also checks that every label landed:
+    /// `cargo test --release -p xcl --lib -- --ignored --exact
+    /// hle::d3d12x::list_x::tests::bench_label_barriers --nocapture` (`XCL_BENCH_LABELS=n` labels
+    /// per list, `XCL_BENCH_GROUPS=n` groups of 64 threads per dispatch; with
+    /// `XCL_DEFER_LABEL_BARRIERS=0` both forms are the old one).
+    #[test]
+    #[ignore]
+    fn bench_label_barriers() {
+        use crate::gpu::recomp::runner::skip_test;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        let arg = |name: &str, default: u32| std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(default);
+        let (labels, groups) = (arg("XCL_BENCH_LABELS", 512).clamp(1, 16384), arg("XCL_BENCH_GROUPS", 64).max(1));
+        let src = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer w : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint t : SV_DispatchThreadID) {
+    float x = (float)t;
+    [loop] for (uint i = 0u; i < 256u; i++) { x = x * 1.0001f + 0.5f; }
+    w.Store(65536u + (t & 16383u) * 4u, asuint(x));
+}
+"#;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                return skip_test("no GPU");
+            }
+            let dev = dev.unwrap();
+            let Ok(dxil) = crate::gpu::recomp::dxc::compile(src, "main", "cs_6_0", &[]) else {
+                return skip_test("no DXC");
+            };
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &dxil).unwrap();
+            let cs = D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() };
+            let pso: ID3D12PipelineState = dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC { pRootSignature: transmute_copy(&rs), CS: cs, ..Default::default() }).unwrap();
+            let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let buffer = |heap: D3D12_HEAP_TYPE, bytes: u64, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES| -> ID3D12Resource {
+                let (sample, layout) = (DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
+                let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: sample, Layout: layout, Flags: flags, ..Default::default() };
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut r).unwrap();
+                r.unwrap()
+            };
+            // the window: labels in its first 64 KiB, the dispatches' stores after them
+            let window = buffer(D3D12_HEAP_TYPE_DEFAULT, 128 << 10, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+            let labels_rb = buffer(D3D12_HEAP_TYPE_READBACK, 64 << 10, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+            let ticks_rb = buffer(D3D12_HEAP_TYPE_READBACK, 16, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+            let mut qh: Option<ID3D12QueryHeap> = None;
+            dev.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2, NodeMask: 0 }, &mut qh).unwrap();
+            let qh = qh.unwrap();
+            let freq = queue.GetTimestampFrequency().unwrap() as f64;
+            let w = window.as_raw() as usize;
+            let at = window.GetGPUVirtualAddress();
+            let run = |deferred: bool| -> f64 {
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, &pso).unwrap();
+                list.SetComputeRootSignature(&rs);
+                list.SetComputeRootUnorderedAccessView(0, at);
+                list.EndQuery(&qh, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                // from here as XCL records a title's labels: on the adopted list
+                let raw = list.as_raw();
+                real::adopt(raw, real::Kind::CommandList);
+                type W = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
+                for k in 0..labels {
+                    pc::<unsafe extern "system" fn(*mut c_void, u32, u32, u32)>(raw, 14)(raw, groups, 1, 1);
+                    let p = D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * k as u64, Value: k + 1 };
+                    let m = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+                    let op = || pc::<W>(raw, PC_WRITE_BUFFER_IMMEDIATE)(raw, 1, &p, &m);
+                    if deferred {
+                        into_copy_dest_left(raw, w, op);
+                    } else {
+                        as_copy_dest(raw, w, op);
+                    }
+                }
+                before_close(raw);
+                pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(raw, PC_END_QUERY)(raw, qh.as_raw() as usize, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                type Resolve = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
+                pc::<Resolve>(raw, PC_RESOLVE_QUERY_DATA)(raw, qh.as_raw() as usize, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, ticks_rb.as_raw() as usize, 0);
+                transition(raw, w, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                copy_buffer_region(raw, labels_rb.as_raw() as usize, 0, w, 0, 4 * labels as u64);
+                transition(raw, w, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+                assert!(pc::<unsafe extern "system" fn(*mut c_void) -> i32>(raw, PC_CLOSE)(raw) >= 0, "Close");
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                let v = done.GetCompletedValue() + 1;
+                queue.Signal(&done, v).unwrap();
+                crate::gpu::fence::wait(&done, v, &dev, None, 10_000).unwrap();
+                let mut p = std::ptr::null_mut();
+                labels_rb.Map(0, None, Some(&mut p)).unwrap();
+                let got = std::slice::from_raw_parts(p as *const u32, labels as usize).to_vec();
+                labels_rb.Unmap(0, None);
+                assert!(got.iter().enumerate().all(|(k, &v)| v == k as u32 + 1), "a label did not land (deferred: {deferred}): {:?}", &got[..got.len().min(8)]);
+                ticks_rb.Map(0, None, Some(&mut p)).unwrap();
+                let t = std::slice::from_raw_parts(p as *const u64, 2).to_vec();
+                ticks_rb.Unmap(0, None);
+                (t[1].wrapping_sub(t[0])) as f64 / freq * 1e3
+            };
+            run(false);
+            run(true);
+            let (mut eager, mut deferred) = (Vec::new(), Vec::new());
+            for _ in 0..9 {
+                eager.push(run(false));
+                deferred.push(run(true));
+            }
+            let median = |v: &mut Vec<f64>| {
+                v.sort_by(f64::total_cmp);
+                v[v.len() / 2]
+            };
+            let (e, d) = (median(&mut eager), median(&mut deferred));
+            println!(
+                "bench_label_barriers: {labels} labels after dispatches of {groups} groups: barriers around each label {e:.3} ms, window left in COPY_DEST {d:.3} ms ({:.2} us a label saved)",
+                (e - d) * 1e3 / labels as f64
+            );
+        }
     }
 
     #[test]
