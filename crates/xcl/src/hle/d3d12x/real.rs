@@ -5827,6 +5827,26 @@ fn known_subobjects(buf: &[u8]) -> Vec<(u32, &[u8])> {
     out
 }
 
+/// A stream `stream_subobjects` cannot read to its end (a subobject type XCL does not know, or
+/// one cut by SizeInBytes) with a console AS or MS before that point: why it is refused. None:
+/// no console AS / MS in the part that is read.
+unsafe fn unread_console_mesh(buf: &[u8]) -> Option<String> {
+    let known = known_subobjects(buf);
+    let (ty, code) = known.iter().filter(|s| matches!(s.0, 24 | 25)).find_map(|s| payload_shader(s.1).filter(|c| crate::gpu::recomp::pso::is_console(c)).map(|c| (s.0, c)))?;
+    // where reading stopped: the end of the last subobject read
+    let end = known.last().map_or(0, |(_, p)| (p.as_ptr() as usize - buf.as_ptr() as usize + p.len() + 7) & !7);
+    let next = buf.get(end..end + 4).map_or("the end of the stream".into(), |t| format!("type {}", u32::from_le_bytes(t.try_into().unwrap())));
+    Some(format!(
+        "mesh pipeline stream not read past {end:#x} of {:#x} ({next}) – its console {} {:016x} refused",
+        buf.len(),
+        if ty == 24 { "AS" } else { "MS" },
+        crate::gpu::shader::fnv64(code)
+    ))
+}
+
+#[cfg(test)]
+mod console_mesh_refusal;
+
 unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
     let b = D3D12_SHADER_BYTECODE { pShaderBytecode: u64::from_le_bytes(p[0..8].try_into().ok()?) as usize as *const c_void, BytecodeLength: u64::from_le_bytes(p[8..16].try_into().ok()?) as usize };
     shader_bytes(&b)
@@ -6007,7 +6027,14 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     if !crate::gpu::shader::readable(base, size) {
         return None;
     }
-    let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))?;
+    let buf = std::slice::from_raw_parts(base as *const u8, size);
+    let Some(subs) = stream_subobjects(buf) else {
+        // a stream not read to its end: a console AS / MS in the part that is read must not
+        // reach the driver (the caller's next step hands it the stream as it is)
+        let e = unread_console_mesh(buf)?;
+        note_translation_error(e);
+        return Some(E_INVALIDARG);
+    };
     let as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1));
     let ms_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1));
     // A console MS container in the AS slot and no MS subobject (a retail game's minimap
@@ -6020,7 +6047,15 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             return Some(E_INVALIDARG);
         }
     }
-    let ms = ms_slot?;
+    let Some(ms) = ms_slot else {
+        // an AS and no MS: nothing XCL translates (and no pipeline D3D12 takes); a console AS
+        // must not reach the driver as it is either
+        if let Some(a) = as_slot.filter(|a| is_console(a)) {
+            note_translation_error(format!("pipeline stream with the console AS {:016x} and no MS – refused", crate::gpu::shader::fnv64(a)));
+            return Some(E_INVALIDARG);
+        }
+        return None;
+    };
     if !is_console(ms) {
         return None;
     }
