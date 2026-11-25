@@ -5468,6 +5468,17 @@ pub fn passthrough_elements(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
     }
 }
 
+/// The pass-through of a pipeline and its mesh groups per record: with a pixel shader whose
+/// input signature is `ps_inputs`, its inputs (`mesh_passthrough_for`); without one (`None`,
+/// a depth-only pipeline) SV_Position and the clip / cull distances alone, as for a PS that
+/// reads nothing. No stage reads the other outputs there, and each would cost a signature row
+/// (over D3D12's 32 DXC refuses the shader, and the pipeline with it) and vertex output space
+/// (a record over the 32 KB mesh output limit goes out split, three vertex copies per triangle).
+pub fn pipeline_passthrough(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) -> (String, u32) {
+    let ins = Some(ps_inputs.unwrap_or(&[]));
+    (mesh_passthrough_for(ms, ins), passthrough_split(ms, passthrough_elements(ms, ins)))
+}
+
 fn hlsl_type(e: &SigElement) -> &'static str {
     match e.component_type {
         1 => "uint",

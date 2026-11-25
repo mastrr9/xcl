@@ -983,8 +983,8 @@ pub struct TwoPass {
 
 fn finish_two_pass_compiled(cs: Compiled, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
     let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
-    let ms = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
-    let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
+    let (hlsl, mesh_groups_per_record) = super::emit::pipeline_passthrough(&record, ps_inputs.as_deref());
+    let ms = dxc::compile_cached(&hlsl, "main", "ms_6_6")?.0;
     Ok(TwoPass { cs: cs.dxil, ms, record, mesh_groups_per_record, samplers: cs.samplers })
 }
 
@@ -1137,8 +1137,8 @@ pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: b
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("GS");
                 let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
-                let msb = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
-                let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
+                let (hlsl, mesh_groups_per_record) = super::emit::pipeline_passthrough(&record, ps_inputs.as_deref());
+                let msb = dxc::compile_cached(&hlsl, "main", "ms_6_6")?.0;
                 return Ok(TwoPass { cs: k.dxil, ms: msb, record, mesh_groups_per_record, samplers: k.static_samplers });
             }
             Err(e) => direct_fallback("GS", &e),

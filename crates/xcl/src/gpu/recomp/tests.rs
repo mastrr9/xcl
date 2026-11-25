@@ -3688,6 +3688,53 @@ fn mesh_split_accounts_vertex_chunks() {
     super::dxc::compile(&pass8, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass8}"));
 }
 
+/// A pipeline without a pixel shader (depth only) gets a pass-through with SV_Position and the
+/// clip / cull distances alone, as for a PS that reads nothing. Declared with every output of
+/// the program, as before, 12 attributes on 256 vertices went out in 7 split groups per record
+/// (three vertex copies per triangle), and 34 attributes (two to a register, as a console
+/// signature packs them) with a clip distance were 36 signature rows, over D3D12's 32: DXC
+/// refused the pass-through and the pipeline with it.
+#[test]
+fn mesh_passthrough_without_a_pixel_shader_keeps_position_and_clip_alone() {
+    use super::emit::{mesh_passthrough, mesh_passthrough_for, passthrough_elements, passthrough_split, pipeline_passthrough};
+    use super::MsInterface;
+    let mut outputs = vec![el("SV_Position", 0, 1, 3, 0, 0xF)];
+    for k in 0..34u32 {
+        outputs.push(el("TEXCOORD", k, 0, 3, 1 + k / 2, if k % 2 == 0 { 0x3 } else { 0xC }));
+    }
+    outputs.push(el("SV_ClipDistance", 0, 2, 3, 18, 0xF));
+    let ms = MsInterface { outputs, threads: 128, max_vertices: 256, max_primitives: 256, ..Default::default() };
+    assert_eq!(passthrough_elements(&ms, None), 35, "every output: 36 rows with SV_Position");
+    let (pass, split) = pipeline_passthrough(&ms, None);
+    assert_eq!(split, 1, "{pass}");
+    assert!(!pass.contains("TEXCOORD"), "{pass}");
+    assert!(pass.contains("struct XclVert {\n    float4 pos : SV_Position;\n    float4 p0 : SV_ClipDistance0;\n};"), "{pass}");
+    // the clip distance keeps its record slot (35th of the program's outputs)
+    assert!(pass.contains("o.p0 = asfloat(res.Load4(b + 560u).xyzw);"), "{pass}");
+    assert!(pass.contains("out vertices XclVert verts[256]"), "{pass}");
+    // 12 attributes, no clip: whole records instead of 7 split groups
+    let mut ms12 = ms.clone();
+    ms12.outputs.truncate(13);
+    assert_eq!(passthrough_split(&ms12, passthrough_elements(&ms12, None)), 7);
+    let (pass12, split12) = pipeline_passthrough(&ms12, None);
+    assert_eq!(split12, 1, "{pass12}");
+    assert!(pass12.contains("struct XclVert {\n    float4 pos : SV_Position;\n};") && pass12.contains("verts[256]"), "{pass12}");
+    // with a pixel shader: its inputs, as `mesh_passthrough_for` declares them
+    let ins = vec![el("SV_Position", 0, 1, 3, 0, 0xF), el("TEXCOORD", 3, 0, 3, 1, 0xF)];
+    let (with_ps, split_ps) = pipeline_passthrough(&ms, Some(&ins));
+    assert_eq!(with_ps, mesh_passthrough_for(&ms, Some(&ins)));
+    assert_eq!(split_ps, passthrough_split(&ms, passthrough_elements(&ms, Some(&ins))));
+    assert!(with_ps.contains("float4 p0 : TEXCOORD3;") && with_ps.contains("float4 p1 : SV_ClipDistance0;"), "{with_ps}");
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+        super::dxc::compile(&pass12, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass12}"));
+        super::dxc::compile(&with_ps, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{with_ps}"));
+        // what a pipeline without a PS compiled before: every output, 36 rows
+        let all = mesh_passthrough(&ms);
+        assert!(super::dxc::compile(&all, "main", "ms_6_6", &[]).is_err(), "36 signature rows accepted:\n{all}");
+    }
+}
+
 /// The layout and the dispatch count are chosen separately: a record of 80 vertices with 22
 /// float4 rows does not fit the mesh output budget as a whole (DXC accounts 96 vertices:
 /// 33792 B > 32768 B), but its single triangle's copies fit one compact group. The pass-
