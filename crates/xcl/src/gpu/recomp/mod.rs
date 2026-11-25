@@ -164,6 +164,9 @@ pub struct MsInterface {
     pub threads: u32,
     pub max_vertices: u32,
     pub max_primitives: u32,
+    /// PSV0 output topology is lines (2 vertex indices per primitive, `outputtopology("line")`);
+    /// false: triangles
+    pub lines: bool,
 }
 
 /// dwords before the vertices of a mesh record: vertex count, primitive count, 2 spare
@@ -230,6 +233,7 @@ impl GsInterface {
             threads: 64,
             max_vertices: (GS_PRIMS_PER_GROUP * mvc).clamp(1, 256),
             max_primitives: (GS_PRIMS_PER_GROUP * mvc.saturating_sub(2).max(1)).clamp(1, 256),
+            lines: false,
         }
     }
 }
@@ -483,14 +487,16 @@ pub fn interface(blob: &[u8], sh: &super::xbox::XboxShader, f: &super::xbox::Fss
         ("MS", 7) => {
             let p = super::dxbc::psv(blob)?;
             let threads = p.numthreads.map(|t| t[0] * t[1].max(1) * t[2].max(1)).filter(|&t| t > 0).unwrap_or(128);
-            if p.ms_topology != 2 {
-                return None; // lines / points: not yet
+            // DXIL's mesh output topologies: 1 line, 2 triangle (D3D12 has no point form)
+            if !matches!(p.ms_topology, 1 | 2) {
+                return None;
             }
             Some(Mode::Mesh(MsInterface {
                 outputs,
                 threads,
                 max_vertices: (p.ms_max_vertices as u32).clamp(1, 256),
                 max_primitives: (p.ms_max_primitives as u32).clamp(1, 256),
+                lines: p.ms_topology == 1,
             }))
         }
         _ => None,

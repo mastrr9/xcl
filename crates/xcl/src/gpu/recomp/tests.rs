@@ -3675,7 +3675,7 @@ fn gpu_mesh_mode_two_passes() {
         rw_mask: 0xF,
         stream: 0,
     };
-    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128 };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128, ..Default::default() };
     let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
         ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
     };
@@ -3771,6 +3771,7 @@ fn mesh_passthrough_strips_rdna2_edge_flag_bits() {
         threads: 128,
         max_vertices: 128,
         max_primitives: 128,
+        lines: false,
     };
     let unsplit = mesh_passthrough(&ms);
     assert!(unsplit.contains("uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu)"), "{unsplit}");
@@ -3812,7 +3813,7 @@ fn mesh_split_accounts_vertex_chunks() {
         outputs.push(sig("TEXCOORD", 0, k + 1, k));
     }
     outputs.push(sig("SV_ClipDistance", 2, 21, 0));
-    let ms = MsInterface { outputs, threads: 128, max_vertices: 128, max_primitives: 128 };
+    let ms = MsInterface { outputs, threads: 128, max_vertices: 128, max_primitives: 128, ..Default::default() };
     let elems = passthrough_elements(&ms, None);
     assert_eq!(elems, 21);
     // 22 rows * 16 B = 352 B/vertex: 64 accounted vertices fit (96 would be 33792 B), so at
@@ -3869,7 +3870,7 @@ fn mesh_layout_independent_of_group_count() {
     }
     outputs.push(sig("SV_ClipDistance", 2, 21, 0));
     // 22 rows * 16 B = 352 B/vertex: 64 accounted vertices fit; 80 declared do not
-    let ms = MsInterface { outputs, threads: 128, max_vertices: 80, max_primitives: 1 };
+    let ms = MsInterface { outputs, threads: 128, max_vertices: 80, max_primitives: 1, ..Default::default() };
     let elems = passthrough_elements(&ms, None);
     assert_eq!(elems, 21);
     // one triangle: its 3 copies fit one compact group, so the dispatch count is 1
@@ -3882,6 +3883,133 @@ fn mesh_layout_independent_of_group_count() {
     let whole = pass.replace("verts[3]", "verts[80]");
     assert!(whole.contains("verts[80]"), "the whole-record declaration for the refusal check:\n{whole}");
     assert!(super::dxc::compile(&whole, "main", "ms_6_6", &[]).is_err(), "DXC refuses 96 accounted vertices of 352 B");
+}
+
+/// A console MS whose PSV0 output topology is lines draws through a line pass-through: two
+/// indices per primitive (the first two of the record's packed three), `outputtopology("line")`
+/// and `uint2` indices, also in the split form, where each line gets its own two vertex copies
+/// and a group carries more lines than triangles. Triangle records keep the triangle form.
+#[test]
+fn mesh_passthrough_draws_line_records_as_lines() {
+    use super::emit::{mesh_passthrough, passthrough_elements, passthrough_split};
+    use super::MsInterface;
+    let sig = |name: &str, sv: u32, reg: u32, index: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let tri = MsInterface { outputs: vec![sig("SV_Position", 1, 0, 0), sig("TEXCOORD", 0, 1, 0)], threads: 128, max_vertices: 128, max_primitives: 128, lines: false };
+    let line = MsInterface { lines: true, ..tri.clone() };
+    let pass = mesh_passthrough(&line);
+    assert!(pass.contains("[outputtopology(\"line\")]"), "{pass}");
+    assert!(pass.contains("out vertices XclVert verts[128], out indices uint2 tris[128])"), "{pass}");
+    assert!(pass.contains("bool bad = or((p >> 31) != 0u, any(x.xy >= nv));"), "{pass}");
+    assert!(pass.contains("tris[j] = select(bad, uint2(0u, 0u), x.xy);"), "{pass}");
+    assert!(!pass.contains("triangle") && !pass.contains("uint3 tris"), "{pass}");
+    let tpass = mesh_passthrough(&tri);
+    assert!(tpass.contains("[outputtopology(\"triangle\")]") && tpass.contains("out indices uint3 tris[128])"), "{tpass}");
+    assert!(tpass.contains("tris[j] = select(bad, uint3(0u, 0u, 0u), x);"), "{tpass}");
+
+    // 22 float4 rows: 64 vertices per group – 21 triangles (7 groups) or 32 lines (4 groups)
+    let mut wide = vec![sig("SV_Position", 1, 0, 0)];
+    for k in 0..21u32 {
+        wide.push(sig("TEXCOORD", 0, k + 1, k));
+    }
+    let wtri = MsInterface { outputs: wide, ..tri.clone() };
+    let wline = MsInterface { lines: true, ..wtri.clone() };
+    assert_eq!(passthrough_split(&wtri, passthrough_elements(&wtri, None)), 7);
+    assert_eq!(passthrough_split(&wline, passthrough_elements(&wline, None)), 4);
+    let split = mesh_passthrough(&wline);
+    assert!(split.contains("[outputtopology(\"line\")]"), "{split}");
+    assert!(split.contains("out vertices XclVert verts[64], out indices uint2 tris[32])"), "{split}");
+    assert!(split.contains("SetMeshOutputCounts(2u * n, n);") && split.contains("c < 2u; c++"), "{split}");
+    assert!(split.contains("verts[2u * j + c] = o;"), "{split}");
+    assert!(split.contains("tris[j] = select(bad, uint2(0u, 0u), uint2(2u * j, 2u * j + 1u));"), "{split}");
+    assert!(!split.contains("triangle") && !split.contains("3u * j"), "{split}");
+    let tsplit = mesh_passthrough(&wtri);
+    assert!(tsplit.contains("verts[57], out indices uint3 tris[19])") && tsplit.contains("SetMeshOutputCounts(3u * n, n);"), "{tsplit}");
+
+    if super::dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    for p in [&pass, &split] {
+        super::dxc::compile(p, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{p}"));
+    }
+}
+
+/// `gpu_mesh_mode_two_passes` with a line: the program exports one primitive whose first
+/// two indices are a horizontal line through the pixel centres of row 16, the line pass-
+/// through rasterises it, and only that row is drawn.
+#[test]
+fn gpu_mesh_mode_two_passes_line() {
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    use super::{dxc, mesh_passthrough, MsInterface, MESH_HEADER};
+    let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index: 0,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128, lines: true };
+    let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
+    };
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
+        ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None), // thread
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 124), ("SSRC0", 255)], Some(1 << 12 | 2)), // 1 primitive, 2 vertices
+        ("S_SENDMSG", "ENC_SOPP", vec![("SIMM16", 9)], None),
+        ("V_CMPX_GT_U32", "ENC_VOPC", vec![("SRC0", 130), ("VSRC1", 0)], None), // threads 0..1
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", vec![("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 14), ("SRC0", 242)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 15), ("SRC0", 128)], None),
+    ];
+    list.push(exp(12, 0xF, [10, 11, 12, 13], 1));
+    list.push(exp(32, 0xF, [14, 15, 15, 14], 0));
+    list.push(("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None));
+    list.push(("V_CMPX_EQ_U32", "ENC_VOPC", vec![("SRC0", 128), ("VSRC1", 0)], None)); // thread 0
+    list.push(("V_MOV_B32", "ENC_VOP1", vec![("VDST", 21), ("SRC0", 255)], Some(1 << 10)));
+    list.push(exp(20, 1, [21, 0, 0, 0], 1));
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+    let opt = on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() });
+    let t = translate(&code, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let cs = direct_or(&code, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap());
+    let pass = mesh_passthrough(&ms);
+    assert!(pass.contains("[outputtopology(\"line\")]"), "{pass}");
+    let msb = dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+    let ps = dxc::compile("struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return v.p0; }\n", "main", "ps_6_6", &[]).unwrap();
+    // vertex table at byte 0x100, V# in s[16:19] (stride 16, 2 records): (-1, y) and (1, y),
+    // y the centre of pixel row 16 of 32
+    let y = 1.0f32 - 16.5 / 16.0;
+    let mut mem = vec![0u32; 256];
+    for (i, x) in [-1.0f32, 1.0].iter().enumerate() {
+        mem[0x40 + 4 * i..0x40 + 4 * i + 4].copy_from_slice(&[f(*x), f(y), f(0.0), f(1.0)]);
+    }
+    let mut sg = vec![0u32; 128];
+    sg[16..20].copy_from_slice(&[0x100, 16 << 16, 2, 0]);
+    let (px, rec) = runner::mesh_draw(&cs, &msb, &ps, 1, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+    assert_eq!((rec[0], rec[1]), (2, 1), "GS_ALLOC_REQ counts");
+    assert_eq!(rec[MESH_HEADER + 128 * ms.vert_dwords()], 1 << 10, "the line primitive");
+    let at = |x: usize, y: usize| px[y * 32 + x];
+    for x in [4usize, 16, 27] {
+        assert_eq!(at(x, 16), [1.0, 0.0, 0.0, 1.0], "pixel {x} on the line");
+        assert_eq!(at(x, 13), [-1.0; 4], "pixel {x} above the line");
+        assert_eq!(at(x, 19), [-1.0; 4], "pixel {x} below the line");
+    }
 }
 
 /// DXC optimisation levels on a saved HLSL file (`XCL_TIME_HLSL=path`, profile in `XCL_TIME_PROFILE`).
@@ -4125,7 +4253,7 @@ fn gpu_mesh_mode_reads_memory_windows() {
         rw_mask: 0xF,
         stream: 0,
     };
-    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0)], threads: 64, max_vertices: 64, max_primitives: 64 };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0)], threads: 64, max_vertices: 64, max_primitives: 64, ..Default::default() };
     let list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
         ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
         ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None), // thread
@@ -7044,7 +7172,7 @@ fn far_jumps_are_direct_branches() {
 /// programs with cross-half operations included; native wave64 and wave32 programs unchanged.
 #[test]
 fn mesh_split_wave64_form() {
-    let ms = super::MsInterface { threads: 128, max_vertices: 64, max_primitives: 64, outputs: vec![] };
+    let ms = super::MsInterface { threads: 128, max_vertices: 64, max_primitives: 64, outputs: vec![], ..Default::default() };
     let lane = prog(&[("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V)], None)]);
     let branch = prog(&[("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)], None)]);
     for code in [&lane, &branch] {
