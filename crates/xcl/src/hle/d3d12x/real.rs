@@ -124,6 +124,12 @@ pub struct D3d12Stats {
     /// why console shaders could not be used (first messages)
     #[serde(default)]
     pub translation_errors: Vec<String>,
+    /// pipelines left without a translation (all of them, past the first messages) …
+    #[serde(default)]
+    pub pipelines_without_translation: u64,
+    /// … by reason, most first (`refusal_reason`)
+    #[serde(default)]
+    pub without_translation_by_reason: Vec<(String, u64)>,
     /// pipelines built in the background behind a stand-in: built, failed, still building
     #[serde(default)]
     pub background_pipelines: (usize, usize, usize),
@@ -387,6 +393,7 @@ pub fn stats() -> D3d12Stats {
         })
         .unwrap_or_default();
     let (presents, boundaries) = super::present::counters();
+    let refusals = REFUSALS.lock().map(|r| (r.total, r.by_count())).unwrap_or_default();
     D3d12Stats {
         backend: format!("{:?}", super::backend()).to_lowercase(),
         adapter: ADAPTER.lock().map(|a| a.clone()).unwrap_or_default(),
@@ -408,6 +415,8 @@ pub fn stats() -> D3d12Stats {
         uma_import_check: UMA_IMPORT_CHECK.lock().map(|e| e.clone()).unwrap_or_default(),
         translated_pipelines: TRANSLATED_PSO.load(Ordering::Relaxed),
         translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.clone()).unwrap_or_default(),
+        pipelines_without_translation: refusals.0,
+        without_translation_by_reason: refusals.1,
         background_pipelines: super::pso_async::counts(),
         dxil_cache: crate::gpu::recomp::dxc::cache_stats(),
     }
@@ -3849,6 +3858,223 @@ fn attempt<R>(f: impl FnOnce() -> R) -> (R, bool) {
     (r, missed)
 }
 
+/// Pipelines left without a translation, counted by reason: every one, also past the 40 texts
+/// `note_translation_error` logs one by one: a text with a shader hash in it uses one of the 40
+/// per pipeline, and one driver refusal text stands for every pipeline refused with that HRESULT,
+/// so the log could not tell how many pipelines were refused, or why. The summary goes to the
+/// log when the count reaches 32, 64, 128 …, and once more when the report is written
+/// (`log_refusal_summary`); `report.json` has the counts.
+static REFUSALS: Mutex<Refusals> = Mutex::new(Refusals::new());
+
+/// reasons counted by name; the rest are "other reasons"
+const MAX_REFUSAL_REASONS: usize = 24;
+
+struct Refusals {
+    total: u64,
+    /// (reason, count), in the order first seen
+    by_reason: Vec<(String, u64)>,
+    /// refusals of a reason past the first `MAX_REFUSAL_REASONS`
+    other: u64,
+    /// `total` in the last summary logged
+    logged: u64,
+}
+
+impl Refusals {
+    const fn new() -> Self {
+        Refusals { total: 0, by_reason: Vec::new(), other: 0, logged: 0 }
+    }
+
+    /// Count one refusal; the summary to log when the count reaches 32, 64, 128 …
+    fn note(&mut self, reason: String) -> Option<String> {
+        self.total += 1;
+        if let Some(r) = self.by_reason.iter_mut().find(|r| r.0 == reason) {
+            r.1 += 1;
+        } else if self.by_reason.len() < MAX_REFUSAL_REASONS {
+            self.by_reason.push((reason, 1));
+        } else {
+            self.other += 1;
+        }
+        (self.total >= 32 && self.total.is_power_of_two()).then(|| self.summary())
+    }
+
+    /// The summary once more, if anything was counted after the last one logged.
+    fn final_summary(&mut self) -> Option<String> {
+        (self.total > self.logged).then(|| self.summary())
+    }
+
+    /// (reason, count), most first; ties in the order first seen
+    fn by_count(&self) -> Vec<(String, u64)> {
+        let mut v = self.by_reason.clone();
+        v.sort_by_key(|r| std::cmp::Reverse(r.1));
+        if self.other > 0 {
+            v.push(("other reasons".into(), self.other));
+        }
+        v
+    }
+
+    fn summary(&mut self) -> String {
+        self.logged = self.total;
+        let reasons: Vec<String> = self.by_count().iter().map(|(r, n)| format!("{n} × {r}")).collect();
+        format!("{} console pipelines without a translation so far; by reason: {}", self.total, reasons.join(", "))
+    }
+}
+
+/// What a translation error is counted under in `REFUSALS`: short, and the same for every
+/// pipeline it stands for (no shader hashes, sizes or subobject lists; the HRESULT by name).
+/// None: not a refusal, the pipeline is built all the same (a rect list drawn as triangles).
+fn refusal_reason(e: &str) -> Option<String> {
+    if e.contains("rect list drawn as triangles") {
+        return None;
+    }
+    let two_pass = if e.contains("console GS") { "VS+GS" } else { "mesh" };
+    let r = if let Some(what) = e.strip_prefix("the driver rejected the ") {
+        let what = if what.starts_with("mesh pipeline") {
+            format!("{two_pass} pipeline")
+        } else if what.contains("compute pass") {
+            format!("{two_pass} compute pass")
+        } else if what.starts_with("compute") {
+            "compute pipeline".into()
+        } else {
+            "graphics pipeline".into()
+        };
+        format!("{what}: driver refused ({})", hresult_name(e))
+    } else if e.starts_with("mesh pipeline with its MS") {
+        "mesh: MS in the AS slot".into()
+    } else if e.starts_with("mesh pipeline with AS") {
+        "mesh: AS and MS".into()
+    } else if e.starts_with("PSO with HS/DS") {
+        "graphics: HS/DS".into()
+    } else if e.starts_with("XCL ABI root signature") {
+        "XCL ABI root signature".into()
+    } else {
+        // a stage's translation: "MS: unknown MS interface (…)", "PS: incomplete translation,
+        // missing: […]", "CS: dxc: …": its first words, a word with a digit in it as #
+        let (stage, why) = match e.split_once(": ") {
+            Some((s, w)) if ["VS", "PS", "CS", "MS", "VS+GS"].contains(&s) => (s, w),
+            _ => ("", e),
+        };
+        let head = why.split([':', '(', ',', ';', '\n']).next().unwrap_or_default();
+        let head: Vec<&str> = head.split_whitespace().map(|w| if w.bytes().any(|b| b.is_ascii_digit()) { "#" } else { w }).collect();
+        if stage.is_empty() {
+            head.join(" ")
+        } else {
+            format!("{stage}: {}", head.join(" "))
+        }
+    };
+    Some(r.chars().take(64).collect())
+}
+
+/// The HRESULT in a translation error ("… (0x80070057)"), by name if it is a common one.
+fn hresult_name(e: &str) -> String {
+    let Some(at) = e.find("0x") else { return "no HRESULT".into() };
+    let hex: String = e[at + 2..].chars().take_while(char::is_ascii_hexdigit).take(8).collect();
+    match u32::from_str_radix(&hex, 16).map(|h| h as HRESULT) {
+        Ok(E_INVALIDARG) => "E_INVALIDARG".into(),
+        Ok(E_OUTOFMEMORY) => "E_OUTOFMEMORY".into(),
+        Ok(h) if h == DXGI_ERROR_DEVICE_REMOVED.0 => "DXGI_ERROR_DEVICE_REMOVED".into(),
+        Ok(h) if h == windows::Win32::Foundation::E_FAIL.0 => "E_FAIL".into(),
+        _ => format!("0x{hex}"),
+    }
+}
+
+/// The summary of pipelines without a translation once more, if any were counted after the
+/// last one logged: the report is written (the title ends, or crashed).
+pub fn log_refusal_summary() {
+    // never waits: a crash may have left the lock held by this very thread
+    let Ok(mut g) = REFUSALS.try_lock() else { return };
+    if let Some(s) = g.final_summary() {
+        drop(g);
+        crate::xlog_warn!("D3D12.X: {s}");
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    fn as_slot(i: u64) -> String {
+        format!("mesh pipeline with its MS {:016x} in the AS slot – refused", 0x5eed_0000_0000_0001 ^ i)
+    }
+
+    #[test]
+    fn every_refusal_is_counted_past_the_forty_logged_texts() {
+        let mut r = Refusals::new();
+        let mut summaries = Vec::new();
+        for i in 0..1000 {
+            let e = if i % 4 == 0 { "the driver rejected the mesh pipeline from the console MS (0x80070057)".to_string() } else { as_slot(i) };
+            summaries.extend(r.note(refusal_reason(&e).unwrap()));
+        }
+        assert_eq!(r.total, 1000);
+        assert_eq!(r.by_count(), vec![("mesh: MS in the AS slot".to_string(), 750), ("mesh pipeline: driver refused (E_INVALIDARG)".to_string(), 250)]);
+        // at 32, 64, 128, 256, 512: a few lines for a title that refuses thousands
+        assert_eq!(summaries.len(), 5);
+        assert_eq!(summaries[0], "32 console pipelines without a translation so far; by reason: 24 × mesh: MS in the AS slot, 8 × mesh pipeline: driver refused (E_INVALIDARG)");
+        assert_eq!(r.final_summary().as_deref(), Some("1000 console pipelines without a translation so far; by reason: 750 × mesh: MS in the AS slot, 250 × mesh pipeline: driver refused (E_INVALIDARG)"));
+        assert_eq!(r.final_summary(), None, "the report is written twice (window closed, process detach): one summary");
+        r.note("mesh: AS and MS".into());
+        assert!(r.final_summary().is_some(), "a refusal after the last summary");
+    }
+
+    #[test]
+    fn reasons_are_bounded_with_an_other_bucket() {
+        let mut r = Refusals::new();
+        for i in 0..100u64 {
+            r.note(format!("reason {i}"));
+            r.note("reason 0".into());
+        }
+        assert_eq!(r.total, 200);
+        assert_eq!(r.by_reason.len(), MAX_REFUSAL_REASONS);
+        let c = r.by_count();
+        assert_eq!(c[0], ("reason 0".to_string(), 101));
+        assert_eq!(c.last(), Some(&("other reasons".to_string(), 100 - MAX_REFUSAL_REASONS as u64)));
+        assert_eq!(c.iter().map(|x| x.1).sum::<u64>(), 200);
+        assert!(r.summary().ends_with(&format!("1 × reason 23, {} × other reasons", 100 - MAX_REFUSAL_REASONS)));
+    }
+
+    #[test]
+    fn nothing_counted_no_summary() {
+        let mut r = Refusals::new();
+        assert_eq!(r.final_summary(), None);
+        assert!(r.by_count().is_empty());
+        for _ in 0..31 {
+            assert_eq!(r.note("x".into()), None);
+        }
+        assert!(r.note("x".into()).is_some());
+        assert_eq!(r.final_summary(), None, "32 were in the summary just logged");
+    }
+
+    #[test]
+    fn a_reason_has_no_hashes_sizes_or_subobject_lists() {
+        let reason = |e: &str| refusal_reason(e).unwrap();
+        assert_eq!(reason(&as_slot(7)), reason(&as_slot(8)));
+        assert_eq!(reason(&as_slot(7)), "mesh: MS in the AS slot");
+        assert_eq!(reason("mesh pipeline with AS 0123456789abcdef (MS fedcba9876543210) – not supported yet; subobjects [0, 24, 25, 2]"), "mesh: AS and MS");
+        assert_eq!(reason("the driver rejected the mesh pipeline from the console MS (0x8007000e)"), "mesh pipeline: driver refused (E_OUTOFMEMORY)");
+        assert_eq!(reason("the driver rejected the mesh pipeline from the console GS (0x80070057)"), "VS+GS pipeline: driver refused (E_INVALIDARG)");
+        assert_eq!(reason("the driver rejected the compute pass of the console MS (0x887a0005)"), "mesh compute pass: driver refused (DXGI_ERROR_DEVICE_REMOVED)");
+        assert_eq!(reason("the driver rejected the compute pass of the console GS (0x80004005)"), "VS+GS compute pass: driver refused (E_FAIL)");
+        assert_eq!(reason("the driver rejected the compute PSO with the translated CS (0x80070057)"), "compute pipeline: driver refused (E_INVALIDARG)");
+        assert_eq!(
+            reason("the driver rejected the PSO with the translated shaders (0x887a0006; topology type 3, 1 render targets, DSV format 0, HS false, GS false)"),
+            "graphics pipeline: driver refused (0x887a0006)"
+        );
+        assert_eq!(reason("MS: unknown MS interface (e.g. lines / points)"), "MS: unknown MS interface");
+        assert_eq!(reason("MS: no NGG hardware variant"), "MS: no NGG hardware variant");
+        assert_eq!(reason("PS: incomplete translation, missing: [\"image_sample_c\"]"), "PS: incomplete translation");
+        assert_eq!(reason("CS: dxc: hlsl.hlsl:12:3: error: too many"), "CS: dxc");
+        assert_eq!(reason("VS+GS: 4096 B of output over the limit"), "VS+GS: # B of output over the limit");
+        assert_eq!(reason("PSO with HS/DS – not supported yet"), "graphics: HS/DS");
+        assert_eq!(reason("XCL ABI root signature with static samplers: 0x80070057"), "XCL ABI root signature");
+        assert!(reason(&"a long unknown failure ".repeat(10)).chars().count() <= 64);
+    }
+
+    #[test]
+    fn a_rect_list_drawn_as_triangles_is_not_a_refusal() {
+        assert_eq!(refusal_reason("the driver rejected the PSO with the rect list GS (0x80070057): rect list drawn as triangles"), None);
+        assert_eq!(refusal_reason("rect list drawn as triangles: no position output"), None);
+    }
+}
+
 fn note_translation_error(e: String) {
     // a refusal `with_switch_fallback` builds again in the switch form (it says so itself)
     if HEAP_WINDOW_OOM.with(|o| o.get()) {
@@ -3857,6 +4083,9 @@ fn note_translation_error(e: String) {
     if crate::gpu::recomp::dxc::in_cached_only() {
         ATTEMPT_NOTES.with(|n| n.borrow_mut().push(e));
         return;
+    }
+    if let Some(summary) = refusal_reason(&e).and_then(|r| REFUSALS.lock().unwrap().note(r)) {
+        crate::xlog_warn!("D3D12.X: {summary}");
     }
     // each different reason once (the first five only hid a retail game's "mesh pipeline with
     // AS" behind five earlier ones)
