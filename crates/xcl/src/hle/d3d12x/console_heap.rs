@@ -181,6 +181,8 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32,
             free: Vec::new(),
         });
+        // (lists checked without it bind it before their next translated draw)
+        super::list_x::heap_bindings_changed();
     }
     true
 }
@@ -727,6 +729,7 @@ pub unsafe fn shared_sampler_heap(dev: &ID3D12Device) -> bool {
             next: 1,
             free: Vec::new(),
         });
+        super::list_x::heap_bindings_changed();
     }
     true
 }

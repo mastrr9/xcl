@@ -829,6 +829,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
         m.insert(key, ListState { allocator: alloc, list_type: Some(ty), bound_pso: pso, ..Default::default() });
         old
     };
+    heap_bindings_changed();
     drop(old);
     super::title_textures::list_reset(key);
     // Dynamic-depth-bias PSOs ignore baked RasterizerState depth bias; seed the list with the
@@ -850,6 +851,7 @@ pub(super) fn on_release(list: usize) {
     release_copy_scratch(list);
     super::title_textures::list_reset(list);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
+    heap_bindings_changed();
     if let Some(old) = old {
         if !old.pending_waits.is_empty() {
             PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
@@ -877,6 +879,7 @@ pub(super) fn clear_segment_state(list: usize) {
         s.pred_in_state = false;
         s.bindings = Bindings::default();
     }
+    heap_bindings_changed();
 }
 
 #[cfg(test)]
@@ -969,6 +972,7 @@ pub(super) unsafe fn on_clear_state(list: *mut c_void, pso: usize) {
             false
         }
     };
+    heap_bindings_changed();
     if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(list, static_bias) {
@@ -2754,6 +2758,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
         );
         old
     };
+    heap_bindings_changed();
     drop(old_next);
     super::title_textures::list_reset(next_pc as usize);
     super::bind::inherit_for_split(list, next_pc, alloc);
@@ -3232,6 +3237,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             s.cpu_writes.clear();
             s.bindings = bindings_copy;
         }
+        heap_bindings_changed();
         primary
     } else {
         this
@@ -3731,6 +3737,51 @@ pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12D
 /// shader-visible view and sampler heaps to be bound even if the title bound 0 heaps (or only a
 /// view heap with 0 sampler heaps).
 pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
+    // the check this thread made last still holds: no list's heaps changed since (each
+    // translated draw and dispatch comes here; the shared heaps' locks, two references taken
+    // and dropped on them, and the table of all lists' lock were its cost every time)
+    let epoch = HEAP_BINDINGS.load(Ordering::Acquire);
+    let key = (this as usize, epoch);
+    if HEAPS_CHECKED.try_with(|c| c.get() == key).unwrap_or(false) {
+        return;
+    }
+    #[cfg(test)]
+    HEAP_CHECKS.with(|n| n.set(n.get() + 1));
+    check_view_heap(this);
+    let _ = HEAPS_CHECKED.try_with(|c| c.set(key));
+}
+
+/// Changes whenever a list's heaps as kept here (`Bindings::heaps`, `has_sampler_heap`) may have
+/// changed, or a list's state was made or dropped, or a shared heap was made: a list that
+/// `check_view_heap` found with what a translated draw needs bound has it still while this stays
+/// the same. (A list is recorded on one thread at a time, so its own check cannot race a change
+/// of it; a change of another list only makes a thread check again.)
+static HEAP_BINDINGS: AtomicU64 = AtomicU64::new(0);
+
+/// After a change `ensure_view_heap` must see (`HEAP_BINDINGS`).
+pub(super) fn heap_bindings_changed() {
+    HEAP_BINDINGS.fetch_add(1, Ordering::AcqRel);
+}
+
+/// `with_bindings` for a change of the list's heaps.
+fn with_heap_bindings(list: *mut c_void, f: impl FnOnce(&mut Bindings)) {
+    with_bindings(list, f);
+    heap_bindings_changed();
+}
+
+thread_local! {
+    /// (list, `HEAP_BINDINGS`) of the last list this thread checked in `ensure_view_heap`
+    static HEAPS_CHECKED: std::cell::Cell<(usize, u64)> = const { std::cell::Cell::new((0, u64::MAX)) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `check_view_heap` calls made by `ensure_view_heap` on this thread (a test's own)
+    static HEAP_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `ensure_view_heap`'s check: the shared heaps bound on `this` where the title left them out.
+unsafe fn check_view_heap(this: *mut c_void) {
     let view = if crate::gpu::recomp::pso::heap_windows() {
         super::console_heap::global_heap()
     } else {
@@ -3762,7 +3813,7 @@ pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n
     if heaps.is_null() || n == 0 {
         // no heaps: nothing bound any more (`ensure_view_heap` binds the shared heaps again
         // before a translated draw or dispatch reads memory windows or samplers from them)
-        with_bindings(this, |b| {
+        with_heap_bindings(this, |b| {
             b.heaps.clear();
             b.has_sampler_heap = false;
         });
@@ -3774,7 +3825,7 @@ pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n
             let p = p as *mut c_void;
             ID3D12DescriptorHeap::from_raw_borrowed(&p).is_some_and(|h| h.GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
         });
-        with_bindings(this, |b| {
+        with_heap_bindings(this, |b| {
             b.heaps = given;
             b.has_sampler_heap = has_sampler;
         });
@@ -3784,7 +3835,7 @@ pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n
     let has_sampler = h.iter().any(|x| x.as_ref().is_some_and(|h| h.GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER));
     let raw: Vec<usize> = h.iter().map(|x| x.as_ref().map_or(0, |x| x.as_raw() as usize)).collect();
     let kept = raw.clone();
-    with_bindings(this, |b| {
+    with_heap_bindings(this, |b| {
         b.heaps = kept;
         b.has_sampler_heap = has_sampler;
     });
@@ -3978,6 +4029,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
         s.bindings = Bindings::default();
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
+    heap_bindings_changed();
     super::title_textures::list_reset(this as usize);
     super::bind::reset(this, alloc, pso);
     if !is_bundle && pso != 0 {
@@ -5233,6 +5285,158 @@ mod tests {
             }
         }
         LISTS.lock().unwrap().as_mut().map(|m| m.remove(&(list as usize)));
+    }
+
+    /// A fake PC list for `ensure_view_heap`: its SetDescriptorHeaps (slot 28) records the heaps.
+    #[repr(C)]
+    struct HeapList {
+        vt: *const usize,
+        calls: Mutex<Vec<Vec<usize>>>,
+        _vts: (Box<[usize; 64]>, Vec<usize>),
+    }
+
+    unsafe extern "system" fn heap_list_set_heaps(this: *mut c_void, n: u32, heaps: *const usize) {
+        let v = if heaps.is_null() { Vec::new() } else { std::slice::from_raw_parts(heaps, n as usize).to_vec() };
+        (*(this as *const HeapList)).calls.lock().unwrap().push(v);
+    }
+
+    fn heap_list() -> Box<HeapList> {
+        let mut orig_vt = Box::new([0usize; 64]);
+        orig_vt[28] = heap_list_set_heaps as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt[..]);
+        let vt = unsafe { ext_vt.as_ptr().add(1) };
+        Box::new(HeapList { vt, calls: Mutex::new(Vec::new()), _vts: (orig_vt, ext_vt) })
+    }
+
+    /// The shared heaps a translated draw binds where the title left them out
+    /// (`check_view_heap`).
+    fn shared_heaps() -> Vec<usize> {
+        let mut out = Vec::new();
+        if crate::gpu::recomp::pso::heap_windows() {
+            out.extend(super::super::console_heap::global_heap().map(|g| g.as_raw() as usize));
+        }
+        out.extend(super::super::console_heap::global_sampler_heap().map(|s| s.as_raw() as usize));
+        out
+    }
+
+    /// `check_view_heap` calls `f` makes on this thread, measured again when another test
+    /// changed a list's heaps meanwhile (that makes every thread check again).
+    fn heap_checks_in(f: impl Fn()) -> u64 {
+        for _ in 0..100 {
+            let (epoch, n) = (HEAP_BINDINGS.load(Ordering::Acquire), HEAP_CHECKS.with(|c| c.get()));
+            f();
+            if HEAP_BINDINGS.load(Ordering::Acquire) == epoch {
+                return HEAP_CHECKS.with(|c| c.get()) - n;
+            }
+        }
+        panic!("lists' heaps kept changing");
+    }
+
+    /// A translated draw checks its list's heaps once while no list's heaps change (before: the
+    /// shared heaps' locks, a reference taken and dropped on each and the table's lock at every
+    /// draw and dispatch), and checks again after anything that changes them – SetDescriptorHeaps,
+    /// ClearState, Reset, a release – binding then what the check always bound.
+    #[test]
+    fn a_list_s_heaps_are_checked_again_only_after_they_change() {
+        let fake = heap_list();
+        let list = &*fake as *const HeapList as *mut c_void;
+        let checks = || HEAP_CHECKS.with(|c| c.get());
+        let bound = || {
+            let mut b = Vec::new();
+            with_bindings(list, |x| b = x.heaps.clone());
+            b
+        };
+        unsafe {
+            ensure_view_heap(list);
+            assert_eq!(heap_checks_in(|| (0..1000).for_each(|_| ensure_view_heap(list))), 0, "1000 draws, no check");
+
+            // SetDescriptorHeaps(0, NULL): checked (and the shared heaps bound) at the next draw
+            set_descriptor_heaps_x(list, 0, std::ptr::null());
+            let (n, calls) = (checks(), fake.calls.lock().unwrap().len());
+            ensure_view_heap(list);
+            assert_eq!(checks() - n, 1);
+            let expected = shared_heaps();
+            assert_eq!(bound(), expected, "the shared heaps are bound again");
+            if !expected.is_empty() {
+                assert_eq!(fake.calls.lock().unwrap().len(), calls + 1);
+                assert_eq!(fake.calls.lock().unwrap().last(), Some(&expected));
+            }
+            assert_eq!(heap_checks_in(|| ensure_view_heap(list)), 0);
+
+            // the title's heaps (as SetDescriptorHeaps keeps them): checked again, nothing added
+            // where the check adds nothing
+            with_heap_bindings(list, |b| {
+                b.heaps = vec![0x7E5A_0000, 0x7E5A_1000];
+                b.has_sampler_heap = true;
+            });
+            let (n, calls) = (checks(), fake.calls.lock().unwrap().len());
+            ensure_view_heap(list);
+            assert_eq!(checks() - n, 1);
+            assert_eq!(fake.calls.lock().unwrap().len(), calls, "two heaps bound: nothing to add");
+
+            // ClearState, Reset (a split segment's), release: each makes the next draw check
+            for change in [
+                &(|| on_clear_state(list, 0)) as &dyn Fn(),
+                &(|| clear_segment_state(list as usize)),
+                &(|| on_release(list as usize)),
+            ] {
+                ensure_view_heap(list);
+                change();
+                let n = checks();
+                ensure_view_heap(list);
+                assert_eq!(checks() - n, 1);
+                assert_eq!(bound(), expected, "the shared heaps are bound again");
+            }
+
+            // another list: checked on its own
+            let other = heap_list();
+            let other_list = &*other as *const HeapList as *mut c_void;
+            let n = checks();
+            ensure_view_heap(other_list);
+            assert_eq!(checks() - n, 1);
+            on_release(other_list as usize);
+        }
+        on_release(list as usize);
+    }
+
+    /// `XCL_ACTIVITY`-free timing of the heap check of a translated draw: the kept check against
+    /// the check made at every draw (as before), one list on each of 1 and 4 threads.
+    /// `cargo test -p xcl --lib heap_check_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn heap_check_timing() {
+        const N: u32 = 1_000_000;
+        for threads in [1usize, 4] {
+            for kept in [false, true] {
+                let t = std::time::Instant::now();
+                std::thread::scope(|s| {
+                    for _ in 0..threads {
+                        s.spawn(move || {
+                            let fake = heap_list();
+                            let list = &*fake as *const HeapList as *mut c_void;
+                            with_heap_bindings(list, |b| {
+                                b.heaps = vec![0x7E5B_0000, 0x7E5B_1000];
+                                b.has_sampler_heap = true;
+                            });
+                            unsafe {
+                                for _ in 0..N {
+                                    if kept {
+                                        ensure_view_heap(list);
+                                    } else {
+                                        check_view_heap(list);
+                                    }
+                                }
+                            }
+                            on_release(list as usize);
+                        });
+                    }
+                });
+                let ns = t.elapsed().as_nanos() as f64 / N as f64;
+                eprintln!("heap check, {threads} thread(s), {}: {ns:.1} ns of wall time per draw", if kept { "kept" } else { "every draw" });
+            }
+        }
     }
 
     #[test]
