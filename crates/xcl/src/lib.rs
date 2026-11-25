@@ -10,6 +10,7 @@ pub mod log;
 pub mod manifest;
 pub(crate) mod cli;
 pub mod config;
+pub mod crash_log;
 pub mod disasm;
 pub mod eh;
 pub mod gpu;

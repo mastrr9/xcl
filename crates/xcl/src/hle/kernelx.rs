@@ -852,12 +852,14 @@ pub unsafe extern "system" fn XMemTransferMemory(_direction: u32, _size: usize) 
 /// The title's debug output (console builds print a lot there) goes to XCL's log as well.
 pub unsafe extern "system" fn OutputDebugStringA(s: *const u8) {
     if let Some(m) = from_ansi_ptr(s) {
+        crate::crash_log::note_title_output(&m);
         crate::xlog_info!("[debug] {}", m.trim_end());
     }
 }
 
 pub unsafe extern "system" fn OutputDebugStringW(s: *const u16) {
     if let Some(m) = from_wide_ptr(s) {
+        crate::crash_log::note_title_output(&m);
         crate::xlog_info!("[debug] {}", m.trim_end());
     }
 }
