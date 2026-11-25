@@ -1032,7 +1032,7 @@ fn console_mesh_with(
 ) -> Result<TwoPass, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).ok_or("no NGG hardware variant")?;
-    let mode = interface(blob, &sh, f).ok_or("unknown MS interface (e.g. lines / points)")?;
+    let mode = interface(blob, &sh, f).ok_or("unknown MS interface (no PSV0, or an output topology other than lines / triangles)")?;
     let Mode::Mesh(ms) = &mode else { return Err("the container is not an MS".into()) };
     let record = ms.clone();
     let p = f.programs.first().ok_or("FSSM without a program")?;
@@ -1800,6 +1800,65 @@ mod shader_cache_tests {
             (b"PSV0", &psv0),
             (b"DXIL", &dxil_part(13, &[f])),
         ])
+    }
+
+    /// `synthetic_mesh_container` with another PSV0 output topology (MeshOutputTopology:
+    /// part header 8 bytes, PSVRuntimeInfo size 4, then byte 27 of the runtime info).
+    fn synthetic_mesh_container_with_topology(topology: u8) -> Vec<u8> {
+        let mut blob = synthetic_mesh_container();
+        let at = blob.windows(4).position(|w| w == b"PSV0").unwrap();
+        blob[at + 12 + 27] = topology;
+        blob
+    }
+
+    fn synthetic_ms_interface(blob: &[u8]) -> Option<super::super::MsInterface> {
+        let sh = xbox::parse(blob).unwrap();
+        let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).unwrap();
+        match interface(blob, &sh, f) {
+            Some(Mode::Mesh(ms)) => Some(ms),
+            _ => None,
+        }
+    }
+
+    /// A console MS is read for both mesh output topologies D3D12 has: triangles and lines
+    /// (DXIL's MeshOutputTopology 2 and 1). A line MS used to be refused ("unknown MS
+    /// interface"), so its pipeline failed; topology 0 (undefined) or values DXIL does not
+    /// define still are.
+    #[test]
+    fn console_mesh_interface_reads_line_and_triangle_topologies() {
+        let tri = synthetic_ms_interface(&synthetic_mesh_container_with_topology(2)).expect("triangles");
+        assert!(!tri.lines);
+        let line = synthetic_ms_interface(&synthetic_mesh_container_with_topology(1)).expect("a line MS is read");
+        assert!(line.lines);
+        assert_eq!((line.threads, line.max_vertices, line.max_primitives), (32, 3, 1));
+        assert_eq!(line.outputs, tri.outputs);
+        assert!(synthetic_ms_interface(&synthetic_mesh_container_with_topology(0)).is_none());
+        assert!(synthetic_ms_interface(&synthetic_mesh_container_with_topology(3)).is_none());
+    }
+
+    /// The two passes of a line MS: the record says lines and the pass-through mesh shader
+    /// DXC builds for it declares line output (its PSV0, which the mesh pipeline's topology
+    /// type follows). The compute pass is not what this checks: a stand-in is cached for it.
+    #[test]
+    fn console_line_mesh_gets_a_line_pass_through() {
+        if dxc::location().is_err() {
+            super::super::runner::skip_test("no DXC");
+            return;
+        }
+        let blob = synthetic_mesh_container_with_topology(1);
+        let dir = std::env::temp_dir().join(format!("xcl-mesh-lines-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = Mutex::new(ShaderCache::new(1 << 20));
+        let tp = console_mesh_with(&blob, None, false, 1, &dir, &cache, |_, ms, _| {
+            assert!(ms.lines, "the compute pass gets the line interface");
+            Ok(Compiled { dxil: vec![1, 2, 3, 4], samplers: Vec::new(), dispatch_chain: None })
+        })
+        .expect("a line MS translates");
+        assert!(tp.record.lines);
+        assert_eq!(tp.mesh_groups_per_record, 1);
+        let p = crate::gpu::dxbc::psv(&tp.ms).expect("pass-through PSV0");
+        assert_eq!((p.kind, p.ms_topology), (Some(13), 1), "the pass-through outputs lines");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

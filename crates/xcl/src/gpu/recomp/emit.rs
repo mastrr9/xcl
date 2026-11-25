@@ -5315,7 +5315,9 @@ pub fn rect_list_gs(outputs: &[SigElement]) -> String {
 
 /// Second pass of the mesh mode: a mesh shader that turns the records written by the
 /// translated program (one per group, see `MsInterface::record_dwords`) into vertices and
-/// triangles. Null primitives (bit 31) and out-of-range indices are culled.
+/// triangles, or lines for a program whose PSV0 topology is lines (`MsInterface::lines`: the
+/// first two indices of each primitive). Null primitives (bit 31) and out-of-range indices
+/// are culled.
 pub fn mesh_passthrough(ms: &MsInterface) -> String {
     mesh_passthrough_for(ms, None)
 }
@@ -5379,10 +5381,12 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
     // with 22 float4 rows are accounted as 96: 33792 B > 32768).
     let cap = passthrough_max_vertices(16 * (1 + elems.len() as u32));
     let split = passthrough_split(ms, elems.len());
+    // vertices per primitive, and how the record's packed indices are read for them
+    let (topo, nidx, xs, zero) = if ms.lines { ("line", 2u32, ".xy", "uint2(0u, 0u)") } else { ("triangle", 3, "", "uint3(0u, 0u, 0u)") };
     if mv <= cap {
         let _ = writeln!(
             h,
-            "[outputtopology(\"triangle\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{mv}], out indices uint3 tris[{mp}])\n{{"
+            "[outputtopology(\"{topo}\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{mv}], out indices uint{nidx} tris[{mp}])\n{{"
         );
         let _ = writeln!(h, "    uint rec = gid.x * {rec}u;");
         let _ = writeln!(h, "    uint nv = min(res.Load(rec * 4u), {mv}u);\n    uint np = min(res.Load(rec * 4u + 4u), {mp}u);");
@@ -5396,31 +5400,32 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
         // RDNA2 EXP PRIM packs 9-bit vertex indices at [8:0], [18:10], [28:20] with
         // per-edge flags at [9], [19], [29] and null_prim at [31].
         h.push_str("        uint3 x = uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu);\n");
-        h.push_str("        bool bad = or((p >> 31) != 0u, any(x >= nv));\n");
-        h.push_str("        tris[j] = select(bad, uint3(0u, 0u, 0u), x);\n    }\n}\n");
+        let _ = writeln!(h, "        bool bad = or((p >> 31) != 0u, any(x{xs} >= nv));");
+        let _ = writeln!(h, "        tris[j] = select(bad, {zero}, x{xs});\n    }}\n}}");
         return h;
     }
     // over the mesh output limit: `split` mesh groups per record, each a run of its
-    // triangles with their own copies of the three vertices
+    // primitives with their own copies of their vertices
     let ppg = mp.div_ceil(split);
     let _ = writeln!(
         h,
-        "[outputtopology(\"triangle\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{}], out indices uint3 tris[{ppg}])\n{{",
-        3 * ppg
+        "[outputtopology(\"{topo}\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{}], out indices uint{nidx} tris[{ppg}])\n{{",
+        nidx * ppg
     );
     let _ = writeln!(h, "    uint rec = (gid.x / {split}u) * {rec}u;\n    uint first = (gid.x % {split}u) * {ppg}u;");
     let _ = writeln!(h, "    uint nv = min(res.Load(rec * 4u), {mv}u);\n    uint np = min(res.Load(rec * 4u + 4u), {mp}u);");
     let _ = writeln!(h, "    uint n = select(np > first, min(np - first, {ppg}u), 0u);");
-    h.push_str("    SetMeshOutputCounts(3u * n, n);\n");
+    let _ = writeln!(h, "    SetMeshOutputCounts({nidx}u * n, n);");
     let _ = writeln!(h, "    for (uint j = gi; j < n; j += {t}u) {{");
     let _ = writeln!(h, "        uint p = res.Load((rec + {tri_base}u + first + j) * 4u);");
     h.push_str("        uint3 x = uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu);\n");
-    h.push_str("        bool bad = or((p >> 31) != 0u, any(x >= nv));\n");
-    h.push_str("        [unroll] for (uint c = 0u; c < 3u; c++) {\n");
+    let _ = writeln!(h, "        bool bad = or((p >> 31) != 0u, any(x{xs} >= nv));");
+    let _ = writeln!(h, "        [unroll] for (uint c = 0u; c < {nidx}u; c++) {{");
     let _ = writeln!(h, "        uint b = (rec + {MESH_HEADER}u + select(bad, 0u, x[c]) * {vd}u) * 4u;");
     h.push_str(&fill);
-    h.push_str("        verts[3u * j + c] = o;\n        }\n");
-    h.push_str("        tris[j] = select(bad, uint3(0u, 0u, 0u), uint3(3u * j, 3u * j + 1u, 3u * j + 2u));\n    }\n}\n");
+    let _ = writeln!(h, "        verts[{nidx}u * j + c] = o;\n        }}");
+    let own = if ms.lines { "uint2(2u * j, 2u * j + 1u)" } else { "uint3(3u * j, 3u * j + 1u, 3u * j + 2u)" };
+    let _ = writeln!(h, "        tris[j] = select(bad, {zero}, {own});\n    }}\n}}");
     h
 }
 
@@ -5438,17 +5443,17 @@ fn passthrough_max_vertices(vbytes: u32) -> u32 {
 }
 
 /// Mesh groups the pass-through spends on one record: the record's vertices fit the mesh
-/// output limit as they are, or the triangles go out in runs whose own vertex copies (3 per
-/// triangle) fit. The layout choice in `mesh_passthrough_for` is by the vertex budget alone;
-/// this count is the dispatch's, and one compact group can carry a record whose whole
-/// declaration would be refused. `elements`: output elements besides SV_Position.
+/// output limit as they are, or the primitives go out in runs whose own vertex copies (3 per
+/// triangle, 2 per line) fit. The layout choice in `mesh_passthrough_for` is by the vertex
+/// budget alone; this count is the dispatch's, and one compact group can carry a record whose
+/// whole declaration would be refused. `elements`: output elements besides SV_Position.
 pub fn passthrough_split(ms: &MsInterface, elements: usize) -> u32 {
     let vbytes = 16 * (1 + elements as u32);
     let cap = passthrough_max_vertices(vbytes);
     if ms.max_vertices <= cap {
         return 1;
     }
-    let ppg = (cap / 3).max(1);
+    let ppg = (cap / if ms.lines { 2 } else { 3 }).max(1);
     ms.max_primitives.max(1).div_ceil(ppg)
 }
 

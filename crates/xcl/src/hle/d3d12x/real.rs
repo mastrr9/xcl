@@ -5718,7 +5718,7 @@ pub(super) fn register_two_pass_for_test(pso: usize, kind: &'static str) {
                 compute: 0,
                 compute_rs: 0,
                 mesh_rs: 0,
-                record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 64, max_vertices: 64, max_primitives: 64 },
+                record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 64, max_vertices: 64, max_primitives: 64, ..Default::default() },
                 mesh_groups_per_record: 1,
                 kind,
             }),
@@ -5811,7 +5811,9 @@ unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
     shader_bytes(&b)
 }
 
-/// The passthrough mesh shader emits triangles for both translated MS and GS pipelines.
+/// The passthrough mesh shader emits triangles for translated GS pipelines and for a console
+/// MS whose output topology is triangles, lines for one whose output topology is lines: the
+/// topology type is the one the mesh shader declares (its PSV0).
 fn two_pass_mesh_stream(rs: *mut c_void, ms: &[u8], ps: Option<&[u8]>) -> StreamOut {
     let mut out = StreamOut::default();
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
@@ -5819,8 +5821,35 @@ fn two_pass_mesh_stream(rs: *mut c_void, ms: &[u8], ps: Option<&[u8]>) -> Stream
     if let Some(ps) = ps {
         out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps);
     }
-    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+    let lines = crate::gpu::dxbc::psv(ms).is_some_and(|p| p.kind == Some(13) && p.ms_topology == 1);
+    let topology = if lines { D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE } else { D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE };
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &topology);
     out
+}
+
+/// A pass-through mesh shader that outputs lines gets a line topology type, triangles (and
+/// a mesh shader without PSV0) the triangle one.
+#[cfg(test)]
+#[test]
+fn passthrough_mesh_stream_topology_follows_the_mesh_shader() {
+    let ms_with = |topology: u8| {
+        let mut r = vec![0u8; 48];
+        r[24] = 13; // mesh
+        r[27] = topology;
+        let mut part = 48u32.to_le_bytes().to_vec();
+        part.extend_from_slice(&r);
+        part.extend_from_slice(&0u32.to_le_bytes()); // resources
+        crate::gpu::xbox::tests::container(&[(b"PSV0", &part)])
+    };
+    let of = |ms: &[u8]| {
+        let out = two_pass_mesh_stream(std::ptr::null_mut(), ms, None);
+        let subs = stream_subobjects(&out.0).expect("readable stream");
+        let t = subs.iter().find(|(kind, _)| *kind == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY.0 as u32).expect("a topology type");
+        i32::from_le_bytes(t.1[..4].try_into().unwrap())
+    };
+    assert_eq!(of(&ms_with(1)), D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE.0);
+    assert_eq!(of(&ms_with(2)), D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0);
+    assert_eq!(of(&[0u8; 16]), D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0);
 }
 
 #[cfg(test)]
@@ -8323,7 +8352,7 @@ mod mesh_stream_tests {
         let make_tp = || crate::gpu::recomp::pso::TwoPass {
             cs: vec![0; 16],
             ms: vec![0; 16],
-            record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 32, max_vertices: 3, max_primitives: 1 },
+            record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 32, max_vertices: 3, max_primitives: 1, ..Default::default() },
             mesh_groups_per_record: 1,
             samplers: vec![sampler],
         };
