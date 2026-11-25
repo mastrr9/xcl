@@ -777,31 +777,81 @@ static GLOBAL: OnceLock<Option<Uma>> = OnceLock::new();
 /// The title's graphics memory XCL places in the coherent window (`note_coherent_need`) is
 /// known only once it asks for it, and the window is committed when it is made: its size is
 /// what the title asked for in its last run (`<data>/cache/uma_coherent.txt`) and XCL's own
-/// 512 MB, at most a window. `XCL_COHERENT_MB` chooses it.
+/// 512 MB, at most a window; a whole window in the title's first run (no file yet; not under
+/// Wine), which then writes what it asked for, 0 included. `XCL_COHERENT_MB` chooses it.
 fn coherent_file() -> std::path::PathBuf {
     crate::state::data_dir().join("cache").join("uma_coherent.txt")
+}
+
+fn write_coherent_file(bytes: usize) {
+    let f = coherent_file();
+    if let Some(d) = f.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(&f, bytes.to_string());
 }
 
 /// Bytes the coherent window(s) are made with for a runtime layout of `windows` windows.
 pub fn coherent_hint_for(windows: usize) -> usize {
     let cap = max_coherent_bytes(windows);
-    if let Some(mb) = std::env::var("XCL_COHERENT_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+    let env_mb = std::env::var("XCL_COHERENT_MB").ok().and_then(|v| v.parse::<usize>().ok());
+    let learned = learned_bytes(std::fs::read_to_string(coherent_file()), crate::state::boot().is_some());
+    let first = learned.is_none();
+    let free = free_commit();
+    let size = coherent_size(learned, free, env_mb, crate::util::under_wine(), cap);
+    if env_mb.is_none() && learned != Some(0) && free < NEEDS_FOR_COHERENT_HEAPS {
+        crate::xlog_warn!(
+            "UMA: {} MB of commit free, under {} MB: the title's GPU heaps stay outside unified memory (a larger page file gives them the coherent window)",
+            free >> 20,
+            NEEDS_FOR_COHERENT_HEAPS >> 20
+        );
+    }
+    if first {
+        // what it asks for this run replaces it (`note_coherent_need`); a title that asks for
+        // nothing has 512 MB from its second run
+        write_coherent_file(0);
+        if size >= MAX_SIZE {
+            crate::xlog_info!("UMA: the title's first run: a {} MB coherent window until what it asks for is learned", size >> 20);
+        } else if env_mb.is_none() && crate::util::under_wine() {
+            crate::xlog_info!("UMA: the title's first run under Wine: the coherent window stays at {} MB", size >> 20);
+        }
+    }
+    size
+}
+
+/// What the title asked for in its last run from `uma_coherent.txt` as read (None: its first
+/// run, no file). A file that cannot be read or parsed counts as 0, and without a title (unit
+/// tests) there is no first run: nothing is learned and nothing written.
+fn learned_bytes(file: std::io::Result<String>, title: bool) -> Option<usize> {
+    match file {
+        Ok(s) => Some(s.trim().parse::<usize>().unwrap_or(0)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && title => None,
+        Err(_) => Some(0),
+    }
+}
+
+/// The coherent window's size from what the title asked for in its last run (`learned`, None:
+/// its first run), the commit free, `XCL_COHERENT_MB` (`env_mb`), whether it runs under Wine and
+/// the most the runtime layout commits (`cap`).
+fn coherent_size(learned: Option<usize>, free: usize, env_mb: Option<usize>, wine: bool, cap: usize) -> usize {
+    if let Some(mb) = env_mb {
         return (mb << 20).clamp(GRAIN, cap);
     }
-    let title = std::fs::read_to_string(coherent_file()).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
     // only with the commit for all of it: the title's ~13 GB, video memory for its render targets
     // and textures (WDDM charges commit for each video-memory allocation too) and the window
     // itself – a retail game took ~18 GB; with less free it runs without (its GPU heaps outside
     // unified memory: no image) rather than taking the system's commit
-    if title > 0 && free_commit() < NEEDS_FOR_COHERENT_HEAPS {
-        crate::xlog_warn!(
-            "UMA: {} MB of commit free, under {} MB: the title's GPU heaps stay outside unified memory (a larger page file gives them the coherent window)",
-            free_commit() >> 20,
-            NEEDS_FOR_COHERENT_HEAPS >> 20
-        );
+    if free < NEEDS_FOR_COHERENT_HEAPS {
         return RUNTIME_COMMITTED_CAP;
     }
-    (title + RUNTIME_COMMITTED_CAP).min(cap)
+    match learned {
+        // under Wine (Proton, vkd3d-proton on RADV) a 4095 MB window left a retail title black, with 7 s
+        // of upload in its first 16 sparse submits, where 512 MB drew its menus (#284): the
+        // first run keeps 512 MB
+        None if wine => RUNTIME_COMMITTED_CAP,
+        None => MAX_SIZE,
+        Some(title) => (title + RUNTIME_COMMITTED_CAP).min(cap),
+    }
 }
 
 /// Bytes the coherent window is made with (legacy 4-window cap).
@@ -828,11 +878,7 @@ pub fn note_coherent_need(bytes: usize) {
     static NOTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let before = std::fs::read_to_string(coherent_file()).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
     if bytes > before && NOTED.fetch_max(bytes, std::sync::atomic::Ordering::Relaxed) < bytes {
-        let f = coherent_file();
-        if let Some(d) = f.parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        let _ = std::fs::write(&f, bytes.to_string());
+        write_coherent_file(bytes);
         let cap = max_coherent_bytes(configured_runtime_windows());
         crate::xlog_info!("UMA: the title's graphics memory for the coherent window: {} MB (up to {} MB from the next run)", bytes >> 20, (bytes + RUNTIME_COMMITTED_CAP).min(cap) >> 20);
     }
@@ -980,6 +1026,47 @@ mod tests {
         assert_eq!(u.used(), 0);
         // everything merged back into one range
         assert!(u.alloc(16 << 20, 0).is_some());
+    }
+
+    /// The coherent window: a whole one in a title's first run, then what it asked for and
+    /// 512 MB; 512 MB without the commit; `XCL_COHERENT_MB` over all of it.
+    #[test]
+    fn coherent_window_is_whole_in_the_first_run_then_what_the_title_asked_for() {
+        let (enough, short) = (NEEDS_FOR_COHERENT_HEAPS, NEEDS_FOR_COHERENT_HEAPS - 1);
+        assert_eq!(coherent_size(None, enough, None, false, MAX_SIZE), MAX_SIZE);
+        assert_eq!(coherent_size(None, short, None, false, MAX_SIZE), RUNTIME_COMMITTED_CAP);
+        assert_eq!(coherent_size(Some(0), enough, None, false, MAX_SIZE), RUNTIME_COMMITTED_CAP);
+        assert_eq!(coherent_size(Some(1 << 30), enough, None, false, MAX_SIZE), (1 << 30) + RUNTIME_COMMITTED_CAP);
+        assert_eq!(coherent_size(Some(1 << 30), short, None, false, MAX_SIZE), RUNTIME_COMMITTED_CAP);
+        assert_eq!(coherent_size(Some(4800 << 20), enough, None, false, MAX_SIZE), MAX_SIZE);
+        assert_eq!(coherent_size(None, enough, Some(512), false, MAX_SIZE), 512 << 20);
+        assert_eq!(coherent_size(Some(4800 << 20), short, Some(1024), false, MAX_SIZE), 1024 << 20);
+        assert_eq!(coherent_size(None, enough, Some(0), false, MAX_SIZE), GRAIN);
+        assert_eq!(coherent_size(None, enough, Some(9000), false, MAX_SIZE), MAX_SIZE);
+        // under Wine the first run keeps 512 MB; a learned size and the override are as on Windows
+        assert_eq!(coherent_size(None, enough, None, true, MAX_SIZE), RUNTIME_COMMITTED_CAP);
+        assert_eq!(coherent_size(None, short, None, true, MAX_SIZE), RUNTIME_COMMITTED_CAP);
+        assert_eq!(coherent_size(Some(1 << 30), enough, None, true, MAX_SIZE), (1 << 30) + RUNTIME_COMMITTED_CAP);
+        assert_eq!(coherent_size(None, enough, Some(4095), true, MAX_SIZE), 4095 << 20);
+        // an expanded layout lets a learned size and the override go past one window
+        let cap = 5 * MAX_SIZE;
+        assert_eq!(coherent_size(Some(6 << 30), enough, None, false, cap), (6 << 30) + RUNTIME_COMMITTED_CAP);
+        assert_eq!(coherent_size(None, enough, None, false, cap), MAX_SIZE);
+        assert_eq!(coherent_size(Some(30 << 30), enough, None, false, cap), cap);
+    }
+
+    /// Only a missing file in a title's run is a first run; one that cannot be read or parsed
+    /// is 0, so it does not give a whole window in every run.
+    #[test]
+    fn only_a_missing_coherent_file_is_a_first_run() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(learned_bytes(Err(Error::from(ErrorKind::NotFound)), true), None);
+        assert_eq!(learned_bytes(Err(Error::from(ErrorKind::NotFound)), false), Some(0));
+        assert_eq!(learned_bytes(Err(Error::from(ErrorKind::PermissionDenied)), true), Some(0));
+        assert_eq!(learned_bytes(Ok("5033164800\r\n".into()), true), Some(5033164800));
+        assert_eq!(learned_bytes(Ok("0".into()), true), Some(0));
+        assert_eq!(learned_bytes(Ok("garbage".into()), true), Some(0));
+        assert_eq!(learned_bytes(Ok(String::new()), true), Some(0));
     }
 
     /// Only handed-out blocks are the title's memory: an address in a window's range that is
