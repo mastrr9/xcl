@@ -2,7 +2,8 @@
 //! DirectStorage hardware unpacks them. Decode only; BC2 is left out (no
 //! title data uses it). Ported from VIctory's victory-formats/src/bcpack.rs on 2026-11-23
 //! (https://github.com/Marvisak/VIctory, GPL-3.0; used here under GPL-2.0-only with its
-//! author's permission, see THIRD_PARTY.md).
+//! author's permission, see THIRD_PARTY.md). Changed 2026-11-24: the window table that finds a
+//! slot's bucket and the running record offset of VIctory commit 3e982f7 (TG0000).
 //!
 //! A packed stream has no header. It is 12 or 16 interleaved rANS *lanes*;
 //! each lane is a run of fragments (header byte, length, payload) coded with
@@ -42,6 +43,9 @@ pub struct Tables {
     pub freq: &'static [[u32; tables::BUCKETS]; tables::MODELS],
     pub start: [[u32; tables::BUCKETS]; tables::MODELS],
     pub recip: [[u64; tables::BUCKETS]; tables::MODELS],
+    /// Per model, the bucket of the first slot of each 256-slot window: the search for a slot's
+    /// bucket starts there and seldom moves on (VIctory 3e982f7).
+    pub bucket: Box<[[u8; 256]; tables::MODELS]>,
     pub rank1: &'static [u8; 256],
     pub rank3a: &'static [u8; 64],
     pub rank3c: &'static [u8; 256],
@@ -72,10 +76,18 @@ impl Tables {
                 }
                 start[m][used..].fill(1 << 16);
             }
+            let mut bucket = Box::new([[0u8; 256]; tables::MODELS]);
+            for m in 0..tables::MODELS {
+                for (window, b) in bucket[m].iter_mut().enumerate() {
+                    let first = (window as u32) << 8;
+                    *b = start[m][1..].iter().filter(|&&s| s <= first).count() as u8;
+                }
+            }
             Tables {
                 freq: &tables::FREQ,
                 start,
                 recip,
+                bucket,
                 rank1: &tables::RANK1,
                 rank3a: &tables::RANK3A,
                 rank3c: &tables::RANK3C,
@@ -209,37 +221,9 @@ impl Lane {
         }
         self.need = self.left != 0 && self.latch.is_none();
         if x > LOW {
-            let freq = &t.freq[usize::from(self.model)];
-            let start = &t.start[usize::from(self.model)];
-            let slot = x & 0xffff;
-            // The bucket: starts are ascending, and 65536 past the model's last.
-            let b = start[1..].iter().filter(|&&s| s <= slot).count();
-            // Buckets 0 and 1 hold one symbol. Elsewhere offset and frequency
-            // are below 2^16, where the reciprocal divides exactly.
-            let sym = match b {
-                0 => 0,
-                1 => 1,
-                _ => {
-                    let rec = t.recip[usize::from(self.model)][b];
-                    (1 << (b - 1)) + ((u64::from(slot - start[b]) * rec) >> 32) as u8
-                }
-            };
-            // Slot 0 is never used: symbol 0 owns 1 .. f[0] - 1.
-            let (f, c) = if sym == 0 {
-                (freq[0] - 1, 1)
-            } else {
-                let k = (8 - sym.leading_zeros()) as usize;
-                let f = freq[k];
-                (
-                    f,
-                    (u32::from(sym) - (1 << (k - 1)))
-                        .wrapping_mul(f)
-                        .wrapping_add(start[k])
-                        & 0xffff,
-                )
-            };
-            self.x = (x >> 16).wrapping_mul(f).wrapping_sub(c).wrapping_add(slot);
-            self.out = Some(sym);
+            let (sym, f, rem) = slot_symbol(t, self.model, x & 0xffff);
+            self.x = (x >> 16).wrapping_mul(f).wrapping_add(rem);
+            self.out = Some(sym as u8);
         } else if self.left != 0 {
             // At exactly 2^24 the lane neither reads nor decodes again; only a
             // lane that has delivered its symbols may end up there.
@@ -253,6 +237,36 @@ impl Lane {
             }
         }
         Ok(())
+    }
+}
+
+/// The bucket holding `slot` (below 65536): the last whose start is at or below it. The window
+/// table gives the bucket of the window's first slot; later buckets that start inside the window
+/// are stepped over.
+#[inline]
+pub(super) fn bucket_of(t: &Tables, model: u8, slot: u32) -> usize {
+    let start = &t.start[usize::from(model)];
+    let mut b = usize::from(t.bucket[usize::from(model)][(slot >> 8) as usize]);
+    while b + 1 < tables::BUCKETS && start[b + 1] <= slot {
+        b += 1;
+    }
+    b
+}
+
+/// The symbol whose range holds `slot`, its frequency and `slot`'s offset in its range.
+/// Bucket 0 holds symbol 0, which owns slots 1 .. f[0] - 1 (slot 0 is never used). Bucket b > 0
+/// holds 2^(b-1) symbols of frequency f[b] from start[b] on; offset and frequency are below 2^16,
+/// where the reciprocal divides exactly.
+#[inline]
+pub(super) fn slot_symbol(t: &Tables, model: u8, slot: u32) -> (u32, u32, u32) {
+    let m = usize::from(model);
+    let b = bucket_of(t, model, slot);
+    if b == 0 {
+        (0, t.freq[m][0] - 1, slot.wrapping_sub(1))
+    } else {
+        let offset = slot - t.start[m][b];
+        let q = ((u64::from(offset) * t.recip[m][b]) >> 32) as u32;
+        ((1u32 << (b - 1)) + q, t.freq[m][b], offset - q * t.freq[m][b])
     }
 }
 
@@ -280,6 +294,8 @@ fn lanes(
     let stride = widths.len() * per;
     let full = (1u32 << widths.len()) - 1;
     let (mut pos, mut done, mut idle) = (0, 0u32, 0);
+    // Where symbol `pos` of lane 0 goes; lane j's is `per * j` further on.
+    let mut at = 0;
     while pos < blocks * per {
         let (mut taken, mut moved) = (0, false);
         for (j, lane) in lanes.iter_mut().enumerate() {
@@ -299,13 +315,14 @@ fn lanes(
             lane.stalled = (lane.need && before >= ROUND_BYTES) || waiting;
             if !lane.stalled && lane.out.is_some() {
                 let sym = lane.out.take().unwrap();
-                records[pos / per * stride + j * per + pos % per] = sym;
+                records[at + j * per] = sym;
                 done |= bit;
                 moved = true;
             }
         }
         if done == full {
             pos += 1;
+            at += if pos % per == 0 { stride - per + 1 } else { 1 };
             done = 0;
             moved = true;
         }
