@@ -2332,12 +2332,13 @@ impl Em {
                 }
                 for j in at {
                     let e = params[j];
-                    let n = out_comps(e);
-                    for c in 0..n {
+                    let chans = out_channels(e);
+                    let n = chans.len();
+                    for (i, &c) in chans.iter().enumerate() {
                         if enabled(c) {
                             let v = Self::exp_comp(srcs, compr, c);
                             let v = if e.component_type == 3 { format!("asfloat({v})") } else { format!("{v}") };
-                            let comp = if n == 1 { String::new() } else { format!("[{c}]") };
+                            let comp = if n == 1 { String::new() } else { format!("[{i}]") };
                             st.push(format!("xo.p{j}{comp} = {v};"));
                         }
                     }
@@ -5433,8 +5434,8 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
     // one vertex from record dword address `b` into `o`
     let mut fill = String::from("        XclVert o;\n        o.pos = asfloat(res.Load4(b));\n");
     for (k, (_, e, slot)) in elems.iter().enumerate() {
-        let n = if ps_inputs.is_some() && !matches!(e.system_value, 2 | 3) { 4 } else { out_comps(e) };
-        let sw = ["x", "y", "z", "w"][..n].concat();
+        let chans = if ps_inputs.is_some() && !matches!(e.system_value, 2 | 3) { vec![0, 1, 2, 3] } else { out_channels(e) };
+        let sw: String = chans.iter().map(|&c| ["x", "y", "z", "w"][c]).collect();
         let raw = match slot {
             Some(s) => format!("res.Load4(b + {}u).{sw}", 16 * (s + 1)),
             None => format!("uint4(0u, 0u, 0u, 0u).{sw}"),
@@ -5543,13 +5544,20 @@ fn hlsl_type(e: &SigElement) -> &'static str {
     }
 }
 
-/// Components of an output element: clip/cull distances by their mask, the rest as 4-vectors.
-fn out_comps(e: &SigElement) -> usize {
+/// Register channels of an output element, in component order: clip/cull distances own the
+/// channels of their mask (a clip distance at .x and a cull distance at .y share a register),
+/// the rest are whole 4-vectors.
+fn out_channels(e: &SigElement) -> Vec<usize> {
     if matches!(e.system_value, 2 | 3) {
-        (8 - e.mask.leading_zeros()) as usize
+        (0..4).filter(|c| e.mask >> c & 1 == 1).collect()
     } else {
-        4
+        vec![0, 1, 2, 3]
     }
+}
+
+/// Components of an output element (see `out_channels`).
+fn out_comps(e: &SigElement) -> usize {
+    out_channels(e).len()
 }
 
 /// Interpolation modifier of every PS attribute from the I/J pair its v_interp uses.
