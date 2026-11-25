@@ -5534,6 +5534,44 @@ fn gpu_triangle_pair_and_box16_nodes() {
     assert!(checked > 5, "{checked} triangle hits");
 }
 
+/// bvh_intersect's triangle test rounds every step, as the CPU mirror does: a triangle whose
+/// det is 0 that way (a miss) but 2^-46 when a driver fuses d.y * e2.z into the subtraction
+/// after it (a hit; bvh::tests::triangle_hit_rounds_every_step). Both paths, bit for bit.
+#[test]
+fn gpu_bvh_triangle_rounds_every_step() {
+    use crate::gpu::bvh;
+    if !gpu_ready() {
+        return;
+    }
+    let (a, c) = (1.0 + f32::EPSILON, 1.0 + 2.0 * f32::EPSILON);
+    let base = 0x1000usize;
+    let mut mem = vec![0u32; 0x2000 / 4];
+    // triangle node type 0 at the base: v0 = 0, v1 = (1, 0, 0), v2 = (0, 1, a); id word 0
+    for (k, x) in [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, a].iter().enumerate() {
+        mem[base / 4 + k] = x.to_bits();
+    }
+    let node = 0u32;
+    let mut code = encode("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 100), ("VADDR", 0), ("SRSRC", 2), ("DMASK", 15)], None).unwrap();
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&[(base >> 8) as u32, 1 << 31, u32::MAX, 0]);
+    let (o, d) = ([0.5f32, 0.0, 0.0], [0.0f32, a, c]);
+    let inv = d.map(|x| 1.0 / x);
+    for v in st.vgpr.iter_mut() {
+        v[0] = node;
+        for (k, x) in [100.0f32, o[0], o[1], o[2], d[0], d[1], d[2], inv[0], inv[1], inv[2]].iter().enumerate() {
+            v[1 + k] = x.to_bits();
+        }
+    }
+    let res = runner::run_code(&code, &st, &mem).unwrap();
+    let data: Vec<u8> = mem[base / 4..].iter().flat_map(|x| x.to_le_bytes()).collect();
+    let cpu = bvh::intersect_node(&data, node, 100.0, o, d, inv, true);
+    assert_eq!(cpu, [f32::INFINITY.to_bits(), 1.0f32.to_bits(), 0, 0], "the CPU mirror misses");
+    for (l, v) in res.vgpr.iter().enumerate() {
+        assert_eq!(&v[100..104], &cpu[..], "lane {l}");
+    }
+}
+
 /// Multi-window `image_bvh64_intersect_ray` (full 64-bit node pointer into UMA window 1 with
 /// base = 0, plus 48-bit base in window 1) and axis-aligned grazing ray / NaN-disabled box.
 #[test]
