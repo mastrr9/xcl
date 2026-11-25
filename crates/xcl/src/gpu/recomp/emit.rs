@@ -50,6 +50,12 @@ pub(super) struct Em {
     /// instruction (`x64_masks`); a mask written to none of them is only read lane by lane
     /// (split: stays in its half, no exchange; pixel: no quad reads for the helper lanes)
     pub mask_whole_live: BTreeMap<u64, u128>,
+    /// split wave64: wave-uniform VGPR chains feeding `v_readfirstlane_b32` (`x64_uniform`)
+    pub x64_uniform: super::x64_uniform::X64Uniform,
+    /// live in-block uniform scalar temporaries per VGPR (cleared on block boundary / EXEC change)
+    x64_unif_v: BTreeMap<u64, String>,
+    /// true while reading sources of an `x64_uniform.capture_pcs` producer VALU
+    x64_use_unif_src: bool,
     /// wave64 VS / PS on a GPU with 32-lane waves only: what the console's lanes 32..63 hold
     /// where the program reads them (`upper_lanes`), used when the wave has 32 lanes
     pub upper: Option<super::upper_lanes::UpperLanes>,
@@ -614,6 +620,9 @@ impl Em {
             uses_scratch: false,
             x64_words: 1,
             mask_whole_live: BTreeMap::new(),
+            x64_uniform: super::x64_uniform::X64Uniform::default(),
+            x64_unif_v: BTreeMap::new(),
+            x64_use_unif_src: false,
             upper: None,
             cur_pc: 0,
             static_ss: BTreeMap::new(),
@@ -695,6 +704,7 @@ impl Em {
     }
 
     pub fn take(&mut self) -> String {
+        self.x64_unif_v.clear();
         std::mem::take(&mut self.out)
     }
 
@@ -811,7 +821,15 @@ impl Em {
             252 => format!("(uint)({})", self.mask_zero(126)),
             253 => "scc".into(),
             255 => hex(lit?),
-            256..=511 => self.vreg(code - 256),
+            256..=511 => {
+                let v = code - 256;
+                if self.x64_use_unif_src {
+                    if let Some(u) = self.x64_unif_v.get(&v) {
+                        return Some(u.clone());
+                    }
+                }
+                self.vreg(v)
+            }
             // flat apertures (shared/private base and limit): the flat memory model has none
             235..=238 => "0u".into(),
             // POPS exiting wave id: every overlapping earlier wave has already left, so the
@@ -856,6 +874,11 @@ impl Em {
                 let v = Self::field(d, f);
                 let width = d.enc.field_width(f);
                 if o.ty.starts_with("OPR_VGPR") && width <= 8 {
+                    if self.x64_use_unif_src {
+                        if let Some(u) = self.x64_unif_v.get(&v) {
+                            return Some(u.clone());
+                        }
+                    }
                     return Some(self.vreg(v));
                 }
                 match o.ty {
@@ -935,11 +958,15 @@ impl Em {
             // select, not `if`: straight-line code (a branch per VALU write was more than the
             // driver's compiler could take on a 15 000-instruction console shader)
             Dst::V(n) => {
+                self.x64_unif_v.remove(n);
                 let v = self.vreg(*n);
                 let a = self.act();
                 self.line(&format!("{v} = select({a}, {val}, {v});"));
             }
             Dst::S(n) => {
+                if *n == 126 || *n == 127 {
+                    self.x64_unif_v.clear();
+                }
                 let s = self.sreg(*n);
                 self.line(&format!("{s} = {val};"));
             }
@@ -950,11 +977,16 @@ impl Em {
     fn write64(&mut self, dst: &Dst, lo: &str, hi: &str) {
         match dst {
             Dst::V(n) => {
+                self.x64_unif_v.remove(n);
+                self.x64_unif_v.remove(&(*n + 1));
                 let (a, b) = (self.vreg(*n), self.vreg(*n + 1));
                 let act = self.act();
                 self.line(&format!("{a} = select({act}, {lo}, {a}); {b} = select({act}, {hi}, {b});"));
             }
             Dst::S(n) => {
+                if *n == 126 || *n == 127 {
+                    self.x64_unif_v.clear();
+                }
                 let (a, b) = (self.sreg(*n), self.sreg(*n + 1));
                 self.line(&format!("{a} = {lo}; {b} = {hi};"));
             }
@@ -1544,6 +1576,7 @@ impl Em {
         // SOP1 / SOP2
         let saveexec = name.contains("saveexec") || name.contains("wrexec");
         if saveexec {
+            self.x64_unif_v.clear();
             let op = |a: &str, e: &str| -> Option<String> {
                 Some(match base.split('_').nth(1)? {
                     "and" => format!("{a} & {e}"),
@@ -3802,7 +3835,11 @@ impl Em {
             return self.valu16(d, name);
         }
         let m = Self::mods(d);
-        let u = self.sources(d, &ins, src_f16)?;
+        let capture = self.x64() && self.x64_uniform.capture_pcs.contains(&d.pc);
+        self.x64_use_unif_src = capture;
+        let u = self.sources(d, &ins, src_f16);
+        self.x64_use_unif_src = false;
+        let u = u?;
         if let Some(rest) = name.strip_prefix("v_cmpx_").or_else(|| name.strip_prefix("v_cmp_")) {
             return self.vopc(d, rest, name.starts_with("v_cmpx_"), &outs, &u, &m);
         }
@@ -4057,6 +4094,15 @@ impl Em {
                 }
             }
             "v_readfirstlane_b32" => {
+                if self.x64() && self.x64_uniform.rfl_pcs.contains(&d.pc) {
+                    let src0 = Self::field(d, "SRC0");
+                    if src0 >= 256 {
+                        if let Some(u) = self.x64_unif_v.get(&(src0 - 256)).cloned() {
+                            self.write32(&dst, &u);
+                            return Ok(());
+                        }
+                    }
+                }
                 let (el, eh) = (self.sreg(126), self.sreg(127));
                 let eh = if self.opt.wave64 { eh } else { "0u".into() };
                 let t = self.t();
@@ -4096,6 +4142,7 @@ impl Em {
             "v_writelane_b32" => {
                 // ignores EXEC
                 if let Dst::V(n) = &dst {
+                    self.x64_unif_v.remove(n);
                     let v = self.vreg(*n);
                     self.line(&format!("if (lane_id == ({b} & {wmask}u)) {v} = {a};"));
                     // a spill slot some read takes from its shadow (`upper_lanes`)
@@ -4150,6 +4197,15 @@ impl Em {
         };
         // the value straight into the write (a named temporary is one more local per
         // instruction – tens of thousands on big programs at -O0)
+        if capture {
+            if let Dst::V(v) = dst {
+                let t = self.t();
+                self.line(&format!("uint {t} = ({res});"));
+                self.vwrite(d, &dst, &t);
+                self.x64_unif_v.insert(v, t);
+                return Ok(());
+            }
+        }
         self.vwrite(d, &dst, &format!("({res})"));
         Ok(())
     }

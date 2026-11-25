@@ -7978,6 +7978,69 @@ fn gpu_split_wave64_reduction_tails() {
     assert_eq!(r.sgpr[21], 0x1111, "inactive-lane-0 s_out keeps unmodified old v7[0]");
 }
 
+/// Split-wave64 `v_readfirstlane_b32` reading a VGPR produced by a wave-uniform VALU chain
+/// under guaranteed `EXEC != 0` reads the captured scalar temporary directly with zero
+/// `xcl_x_rla_uniform` exchanges — even when only the upper half (`exec_lo == 0`, lane 40)
+/// is active and lower-half VGPRs hold unrelated values. When `EXEC == 0` is possible, the
+/// exchange is kept and returns lane 0's prior VGPR value.
+#[test]
+fn gpu_split_wave64_uniform_readfirstlane() {
+    if !gpu_ready() {
+        return;
+    }
+    const V: u64 = 256;
+    // Part 1: s_cbranch_execz proves EXEC != 0 -> scalar udiv + float add chains use 0 exchanges
+    let code = prog(&[
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 11)], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 5)], None),
+        ("V_RCP_IFLAG_F32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 1)], None),
+        ("V_MUL_LEGACY_F32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 255), ("VSRC1", 1)], Some(0x4f7f_fffe)),
+        ("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 1)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", V + 1)], None),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 8), ("VSRC1", 2)], None), // non-uniform (v2 live-in)
+        ("V_ADD_F32", "ENC_VOP3", &[("VDST", 3), ("SRC0", 8), ("SRC1", 9)], None),
+        ("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 3), ("SRC0", V + 3)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", V + 3)], None),
+    ]);
+    if runner::split_wave64() {
+        let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+        assert_eq!(t.hlsl.matches("xcl_x_rla_uniform(").count(), 1, "only definition, 0 calls");
+    }
+    let mut st = KernelState::default();
+    st.sgpr[126] = 0;
+    st.sgpr[127] = 1u32 << (40 - 32); // ONLY upper-half lane 40 active (exec_lo == 0!)
+    st.sgpr[5] = 7;
+    st.sgpr[8] = 1.5f32.to_bits();
+    st.sgpr[9] = 2.25f32.to_bits();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = 0xDEAD_0000 + l as u32;
+        r[2] = 0x1000 + l as u32;
+        r[3] = 0xBEEF_0000 + l as u32;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    let expected_rcp = ((1.0f32 / 7.0f32) * f32::from_bits(0x4f7f_fffe)) as u32;
+    // At magnitude ~6.1e8 (2^29), 1 float32 ULP is 2^(29-23) = 64 (AMD v_rcp_f32 differs by 1 ULP from 1.0f/7.0f).
+    assert!((r.sgpr[6] as i64 - expected_rcp as i64).abs() <= 128, "s6={} expected~={expected_rcp}", r.sgpr[6]);
+    assert_eq!(r.sgpr[7], 3, "both halves compute (uint)(1.5 + 2.25) == 3 with exec_lo == 0");
+    assert_eq!(r.vgpr[40][3], 3, "active lane 40 updated v3");
+    assert_eq!(r.vgpr[0][3], 0xBEEF_0000, "inactive lane 0 kept old v3");
+
+    // Part 2: EXEC may be 0 (no s_cbranch_execz in kernel mode) -> must keep exchange & read old lane 0
+    let zero_exec_code = prog(&[
+        ("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 8)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", V + 1)], None),
+    ]);
+    if runner::split_wave64() {
+        let t = translate(&zero_exec_code, &runner::options(Mode::Kernel)).unwrap();
+        assert_eq!(t.hlsl.matches("xcl_x_rla_uniform(").count(), 2, "definition + 1 exchange kept");
+    }
+    st.sgpr[126] = 0;
+    st.sgpr[127] = 0;
+    st.vgpr[0][1] = 0x1234_5678;
+    let r0 = runner::run_code(&zero_exec_code, &st, &[]).unwrap();
+    assert_eq!(r0.sgpr[6], 0x1234_5678, "EXEC == 0 reads unmodified lane 0");
+}
+
 /// Masks that are read whole after a write `x64_masks` must not take for an overwrite (an
 /// SDWA compare into its SDST, `s_bitset1`, `s_movreld`) or through a read the operand
 /// tables do not show (`s_movrels`, an SMEM register offset, an SDWA scalar src1): each is

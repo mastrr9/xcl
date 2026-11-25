@@ -62,6 +62,7 @@ pub mod mesh_dispatch;
 pub mod mesh_wave;
 pub mod partition;
 pub mod x64_masks;
+pub mod x64_uniform;
 pub mod pso;
 pub use emit::mesh_passthrough;
 pub mod diff_kernel;
@@ -1617,6 +1618,9 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         em.mask_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
     } else if matches!(opt.mode, Mode::Pixel(_)) {
         em.mask_whole_live = x64_masks::by_pc(&insts, false);
+    }
+    if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) {
+        em.x64_uniform = x64_uniform::analyze(&insts, &leaders, matches!(opt.mode, Mode::Compute(_) | Mode::Mesh(_)));
     }
     // a wave64 VS / PS on a GPU that can run 32-lane waves: what lanes 32..63 hold where the
     // program reads them (the driver may still pick 64 lanes: decided at run time); only a
