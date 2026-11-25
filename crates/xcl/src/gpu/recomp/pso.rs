@@ -1410,7 +1410,7 @@ mod slab_tests {
 }
 
 #[cfg(test)]
-mod shader_cache_tests {
+pub(crate) mod shader_cache_tests {
     use super::*;
 
     #[test]
@@ -1911,7 +1911,7 @@ mod shader_cache_tests {
         });
     }
 
-    fn synthetic_mesh_container() -> Vec<u8> {
+    pub(crate) fn synthetic_mesh_container() -> Vec<u8> {
         use crate::gpu::xbox::tests::{container, dxil_part, fssm, CODE};
         let mut psv_r = vec![0u8; 48];
         psv_r[12..14].copy_from_slice(&3u16.to_le_bytes()); // max_vertices
