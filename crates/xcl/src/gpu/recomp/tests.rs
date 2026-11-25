@@ -3208,7 +3208,20 @@ fn gpu_format_stores_atomics_global_lds() {
         r[27] = 0;
         r[28] = 1;
     }
+    // buffer_atomic_umax's old values depend on the order the lanes ran in (up to the host, so
+    // `XCL_DXIL_DIFF=1` leaves them to this check): one lane sees 0, every other lane the value
+    // of a lane before it (ds_add_rtn's olds are a multiset: the harness compares them so)
+    let umax_olds = |r: &runner::KernelResult| {
+        let olds: Vec<u32> = r.vgpr.iter().take(64).map(|v| v[16]).collect();
+        assert_eq!(olds.iter().filter(|&&v| v == 0).count(), 1, "umax: one lane sees the initial 0: {olds:?}");
+        for (l, &v) in olds.iter().enumerate() {
+            assert!(v == 0 || (100..164).contains(&v) && v != 100 + l as u32, "lane {l} umax old value {v}");
+        }
+    };
+    let unordered = super::diff_kernel::Unordered { vgprs: vec![16..17], mem: Vec::new(), check: Box::new(umax_olds) };
+    let _relaxed = super::diff_kernel::relax(super::diff_kernel::Relax { unordered: Some(unordered) });
     let r = runner::run_code(&code, &st, &vec![0u32; 1024]).unwrap();
+    umax_olds(&r);
     let byte = |a: usize| (r.mem[a / 4] >> (8 * (a % 4))) & 0xFF;
     for l in 0..64usize {
         let px = [byte(0x100 + 4 * l), byte(0x100 + 4 * l + 1), byte(0x100 + 4 * l + 2), byte(0x100 + 4 * l + 3)];
@@ -3224,7 +3237,6 @@ fn gpu_format_stores_atomics_global_lds() {
             assert_eq!(v[25], l as u32 + 1, "lane {l} ds_read2 (second; LDS is not zeroed past the written area)");
         }
         assert_eq!(v[29], 63 - l as u32, "lane {l} ds_bpermute");
-        assert!(v[16] < 164, "lane {l} umax old value");
     }
     assert_eq!(r.mem[0x400 / 4], 64, "buffer_atomic_add");
     assert_eq!(r.mem[0x404 / 4], 163, "buffer_atomic_umax");
@@ -5724,8 +5736,24 @@ fn gpu_atomic_fcmpswap_x2() {
         mem[a / 4] = INIT as u32;
         mem[a / 4 + 1] = (INIT >> 32) as u32;
     }
-    let r = runner::run_code(&code, &st, &mem).unwrap();
     let old = |v: &[u32], at: usize| v[at] as u64 | (v[at + 1] as u64) << 32;
+    // shared cells: exactly one lane sees INIT (the winner); the cell holds its value. Which
+    // lane wins is up to the host, so `XCL_DXIL_DIFF=1` leaves these values to this check.
+    let shared = move |r: &runner::KernelResult| {
+        let cell = |a: usize| r.mem[a / 4] as u64 | (r.mem[a / 4 + 1] as u64) << 32;
+        for (i, (dst, a, tag)) in [(30, 0xC00usize, 0x5B00u64), (40, 0xE00, 0x5F00), (44, 0x1200, 0x5A00)].iter().enumerate() {
+            let winners: Vec<usize> = r.vgpr.iter().enumerate().filter(|(_, v)| old(v, *dst) == INIT).map(|(l, _)| l).collect();
+            assert_eq!(winners.len(), 1, "shared cell {i}: exactly one lane wins the swap");
+            assert_eq!(cell(*a), newv(*tag, winners[0] as u64), "shared cell {i}: the winner's value landed");
+        }
+    };
+    let unordered = super::diff_kernel::Unordered {
+        vgprs: vec![30..32, 40..42, 44..46],
+        mem: vec![0xC00 / 4..0xC08 / 4, 0xE00 / 4..0xE08 / 4, 0x1200 / 4..0x1208 / 4],
+        check: Box::new(shared),
+    };
+    let _relaxed = super::diff_kernel::relax(super::diff_kernel::Relax { unordered: Some(unordered) });
+    let r = runner::run_code(&code, &st, &mem).unwrap();
     let cell = |a: usize| r.mem[a / 4] as u64 | (r.mem[a / 4 + 1] as u64) << 32;
     for l in 0..64usize {
         let v = &r.vgpr[l];
@@ -5742,12 +5770,7 @@ fn gpu_atomic_fcmpswap_x2() {
         // the compare register half is untouched
         assert_eq!(old(v, 6), cmp, "lane {l}: buffer cmp regs");
     }
-    // shared cells: exactly one lane sees INIT (the winner); the cell holds its value
-    for (i, (dst, a, tag)) in [(30, 0xC00usize, 0x5B00u64), (40, 0xE00, 0x5F00), (44, 0x1200, 0x5A00)].iter().enumerate() {
-        let winners: Vec<usize> = r.vgpr.iter().enumerate().filter(|(_, v)| old(v, *dst) == INIT).map(|(l, _)| l).collect();
-        assert_eq!(winners.len(), 1, "shared cell {i}: exactly one lane wins the swap");
-        assert_eq!(cell(*a), newv(*tag, winners[0] as u64), "shared cell {i}: the winner's value landed");
-    }
+    shared(&r);
 }
 
 /// Float compare-and-swap atomics across LDS (`ds_cmpst_rtn_f32`), buffer/global/flat 32-bit and
