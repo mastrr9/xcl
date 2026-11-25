@@ -268,6 +268,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
+  `d3d12.pipelines_without_translation` counts the pipelines left without a translation.
+  `d3d12.without_translation_by_reason` groups the counts by reason.
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
   the existing optional frame dumps also set `d3d12.last_frame_dump`: the latest sampled frame's
   zero-based index, source dimensions, DXGI format, sample step, sample count and `non_dark_samples`
