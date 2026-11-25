@@ -1431,12 +1431,30 @@ pub unsafe extern "system" fn XGameGetXboxTitleId(out: *mut u32) -> HRESULT {
     S_OK
 }
 
+/// `void XLaunchNewGame(const char* exePath, const char* args, XUserHandle defaultUser)`: as on the
+/// console the title ends and starts again, and the call never returns (titles treat the code
+/// after it as unreachable). The launcher (`xcl run`) starts the same title again with `args`
+/// once this process has ended; XCL runs one title, so another `exePath` is not followed.
 unsafe extern "system" fn XLaunchNewGame(exe: *const u8, args: *const u8, _user: *mut c_void) {
-    crate::xlog_warn!(
-        "XLaunchNewGame({}, {}) – ignored (XCL runs a single title)",
-        crate::util::from_cstr_ptr(exe).unwrap_or_default(),
-        crate::util::from_cstr_ptr(args).unwrap_or_default()
-    );
+    let exe = crate::util::from_cstr_ptr(exe).unwrap_or_default();
+    let args = crate::util::from_cstr_ptr(args).unwrap_or_default();
+    crate::xlog_info!("XLaunchNewGame({exe}, {args}) – the title ends and XCL starts it again with these arguments");
+    match crate::state::boot() {
+        Some(boot) => {
+            let ours = boot.exe_path.file_name().map(|n| n.to_string_lossy().to_lowercase());
+            let theirs = exe.rsplit(['\\', '/']).next().map(str::to_lowercase).filter(|n| !n.is_empty());
+            if theirs.is_some() && theirs != ours {
+                crate::xlog_warn!("XLaunchNewGame: {exe} is not the running title's executable – XCL starts the running title again");
+            }
+            if let Err(e) = std::fs::write(crate::launcher::relaunch_path(boot), &args) {
+                crate::xlog_warn!("XLaunchNewGame: cannot ask the launcher for a relaunch ({e}) – the title only ends");
+            }
+        }
+        None => crate::xlog_warn!("XLaunchNewGame: not started by `xcl run` – the title only ends"),
+    }
+    crate::report::write_final(None);
+    crate::log::flush();
+    windows_sys::Win32::System::Threading::ExitProcess(0);
 }
 
 unsafe extern "system" fn XLaunchRestartOnCrash(_args: *const u8, _reserved: u32) -> HRESULT {
