@@ -85,6 +85,9 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XNetworkingGetConnectivityHint,
         XNetworkingRegisterConnectivityHintChanged,
         XNetworkingUnregisterConnectivityHintChanged,
+        XNetworkingQueryConfigurationSetting,
+        XNetworkingSetConfigurationSetting,
+        XNetworkingQueryStatistics,
         // system
         XSystemGetDeviceType,
         XSystemGetConsoleId,
