@@ -8344,6 +8344,93 @@ fn gpu_nonfused_mad_and_mac_prevent_fma_contraction() {
     assert_eq!(v1[16], 0x2880_0000, "v_fma_f32 cancellation control should stay fused");
 }
 
+/// A v_mul whose result a following v_add / v_sub / v_subrev takes, and a v_add whose
+/// addend the next v_sub takes away again: RDNA2 rounds each instruction, so the result must
+/// be the separately rounded one, not that of a multiply-add fused across the two
+/// instructions or of a reassociated sum. Even lanes: a = f32::MAX, b = 1 + 2^-23,
+/// c = -f32::MAX (separate +inf, fused 0x73FFFFFF); odd lanes: a = b = 1 + 2^-23,
+/// c = -(1 + 2^-22) (separate +0, fused 2^-46); and the same for f64. (1 + 2^24) - 2^24 is 0,
+/// not 1. v_fma controls show that the vectors tell fused from separate. Collects every
+/// difference first, so one run shows which pairs the compiler or the driver fused on which
+/// path (XCL_DIRECT_DXIL=1 for the direct one).
+#[test]
+fn gpu_mul_then_add_rounds_each_instruction() {
+    let p = prog(&[
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V), ("VSRC1", 1)], None),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 10), ("SRC0", V + 2), ("VSRC1", 4)], None),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 11), ("SRC0", V + 4), ("VSRC1", 2)], None),
+        ("V_SUB_F32", "ENC_VOP2", &[("VDST", 12), ("SRC0", V + 2), ("VSRC1", 5)], None),
+        ("V_SUBREV_F32", "ENC_VOP2", &[("VDST", 13), ("SRC0", V + 5), ("VSRC1", 2)], None),
+        ("V_SUB_F32", "ENC_VOP2", &[("VDST", 14), ("SRC0", V + 5), ("VSRC1", 2)], None),
+        ("V_FMA_F32", "ENC_VOP3", &[("VDST", 15), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 4)], None),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 7), ("VSRC1", 8)], None),
+        ("V_SUB_F32", "ENC_VOP2", &[("VDST", 16), ("SRC0", V + 6), ("VSRC1", 8)], None),
+        ("V_MUL_F64", "ENC_VOP3", &[("VDST", 18), ("SRC0", V + 20), ("SRC1", V + 22)], None),
+        ("V_ADD_F64", "ENC_VOP3", &[("VDST", 24), ("SRC0", V + 18), ("SRC1", V + 26)], None),
+        ("V_FMA_F64", "ENC_VOP3", &[("VDST", 28), ("SRC0", V + 20), ("SRC1", V + 22), ("SRC2", V + 26)], None),
+    ]);
+    // (a, b, c) and the f64 (a, b, c): overflow, cancellation
+    let f32s = [(0x7F7F_FFFFu32, 0x3F80_0001u32, 0xFF7F_FFFFu32), (0x3F80_0001, 0x3F80_0001, 0xBF80_0002)];
+    let f64s = [
+        (0x7FEF_FFFF_FFFF_FFFFu64, 0x3FF0_0000_0000_0001u64, 0xFFEF_FFFF_FFFF_FFFFu64),
+        (0x3FF0_0000_0000_0001, 0x3FF0_0000_0000_0001, 0xBFF0_0000_0000_0002),
+    ];
+    // (what, register, separately rounded, fused or reassociated) per vector; d >= 18: f64
+    let want: [[(&str, usize, u64, u64); 11]; 2] = [
+        [
+            ("v_mul_f32", 2, 0x7F80_0000, 0x7F80_0000),
+            ("v_mul_f32 -> v_add_f32 (product first)", 10, 0x7F80_0000, 0x73FF_FFFF),
+            ("v_mul_f32 -> v_add_f32 (product second)", 11, 0x7F80_0000, 0x73FF_FFFF),
+            ("v_mul_f32 -> v_sub_f32 (p - -c)", 12, 0x7F80_0000, 0x73FF_FFFF),
+            ("v_mul_f32 -> v_subrev_f32 (p - -c)", 13, 0x7F80_0000, 0x73FF_FFFF),
+            ("v_mul_f32 -> v_sub_f32 (-c - p)", 14, 0xFF80_0000, 0xF3FF_FFFF),
+            ("v_fma_f32 (control)", 15, 0x73FF_FFFF, 0x73FF_FFFF),
+            ("v_add_f32 -> v_sub_f32 ((x + y) - y)", 16, 0, 0x3F80_0000),
+            ("v_mul_f64", 18, 0x7FF0_0000_0000_0000, 0x7FF0_0000_0000_0000),
+            ("v_mul_f64 -> v_add_f64", 24, 0x7FF0_0000_0000_0000, 0x7CAF_FFFF_FFFF_FFFF),
+            ("v_fma_f64 (control)", 28, 0x7CAF_FFFF_FFFF_FFFF, 0x7CAF_FFFF_FFFF_FFFF),
+        ],
+        [
+            ("v_mul_f32", 2, 0x3F80_0002, 0x3F80_0002),
+            ("v_mul_f32 -> v_add_f32 (product first)", 10, 0, 0x2880_0000),
+            ("v_mul_f32 -> v_add_f32 (product second)", 11, 0, 0x2880_0000),
+            ("v_mul_f32 -> v_sub_f32 (p - -c)", 12, 0, 0x2880_0000),
+            ("v_mul_f32 -> v_subrev_f32 (p - -c)", 13, 0, 0x2880_0000),
+            ("v_mul_f32 -> v_sub_f32 (-c - p)", 14, 0, 0xA880_0000),
+            ("v_fma_f32 (control)", 15, 0x2880_0000, 0x2880_0000),
+            ("v_add_f32 -> v_sub_f32 ((x + y) - y)", 16, 0, 0x3F80_0000),
+            ("v_mul_f64", 18, 0x3FF0_0000_0000_0002, 0x3FF0_0000_0000_0002),
+            ("v_mul_f64 -> v_add_f64", 24, 0, 0x3970_0000_0000_0000),
+            ("v_fma_f64 (control)", 28, 0x3970_0000_0000_0000, 0x3970_0000_0000_0000),
+        ],
+    ];
+    let path = if runner::direct_dxil() { "direct" } else { "HLSL" };
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        for (l, v) in st.vgpr.iter_mut().enumerate() {
+            let ((a, b, c), (da, db, dc)) = (f32s[l % 2], f64s[l % 2]);
+            (v[0], v[1], v[4], v[5], v[7], v[8]) = (a, b, c, c ^ 0x8000_0000, 0x3F80_0000, 0x4B80_0000);
+            for (r, x) in [(20, da), (22, db), (26, dc)] {
+                (v[r], v[r + 1]) = (x as u32, (x >> 32) as u32);
+            }
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        let mut bad = Vec::new();
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            for &(what, d, sep, fused) in &want[l % 2] {
+                let got = if d >= 18 { v[d] as u64 | (v[d + 1] as u64) << 32 } else { v[d] as u64 };
+                if got != sep {
+                    let how = if got == fused { "the fused or reassociated result" } else { "neither" };
+                    bad.push(format!("{path} wave{lanes}, {} vector: {what} = {got:#x}, want {sep:#x} ({how})", ["overflow", "cancellation"][l % 2]));
+                }
+            }
+        }
+        bad.sort();
+        bad.dedup();
+        assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+    }
+}
+
 #[test]
 fn gpu_f16_defaults_to_round_to_nearest_even() {
     if !gpu_ready() {
