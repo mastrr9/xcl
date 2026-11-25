@@ -1,6 +1,15 @@
 //! XGameSave – containers of named blobs (public GDK `XGameSave.h`), stored as files:
 //! `<data>/gamesave/<configuration id>/<container>/b/<blob>` + `display` (display name).
 //! Offline: no cloud sync. Async variants use XAsync.
+//!
+//! An update is all or nothing, as the GDK documents for `XGameSaveSubmitUpdate`: the container's
+//! next blob folder is built beside the current one (`b.xclnew`: unchanged blobs hard-linked, or
+//! copied where the volume has no hard links, written blobs flushed to disk), then two renames
+//! swap it in (`b` → `b.xclold`, `b.xclnew` → `b`). A crash or a failed write leaves the old blobs
+//! or the new ones, never some of each; whatever a crash left is settled before the container is
+//! next read or written (`settle`). The display name is written after the blobs.
+//! (The versioned, all-or-nothing update follows VIctory's XGameSave, github.com/Marvisak/VIctory;
+//! written for XCL's layout, no code taken.)
 
 use std::ffi::{c_void, CString};
 use std::path::{Path, PathBuf};
@@ -12,6 +21,12 @@ use crate::util::{from_cstr_ptr, E_FAIL, E_INVALIDARG, HRESULT, S_OK};
 /// Prefix for atomic-write temporary files placed alongside blobs/display files.
 /// `enc()` always percent-encodes `~` as `%7E`, so no encoded blob name can ever start with this.
 const TMP_PREFIX: &str = "~xcltmp.";
+/// A container's blob folder, the next one while an update is built, the previous one while it is
+/// swapped in. `enc()` never makes a container or blob name with these (it escapes nothing here,
+/// but they live inside a container, beside `b`, where no blob is).
+const BLOBS: &str = "b";
+const BLOBS_NEW: &str = "b.xclnew";
+const BLOBS_OLD: &str = "b.xclold";
 static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 
 pub const E_GS_INVALID_CONTAINER_NAME: HRESULT = 0x8083_0001u32 as i32;
@@ -109,8 +124,39 @@ fn dec(file: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// After a crash between the two renames of an update there is no `b`: finish (`b.xclnew` is
+/// complete before the first rename) or roll back. Leftovers beside a `b` are removed.
+/// Call with `SAVE_MUTATION` held.
+fn settle(dir: &Path) {
+    let (cur, new, old) = (dir.join(BLOBS), dir.join(BLOBS_NEW), dir.join(BLOBS_OLD));
+    if !cur.exists() {
+        if new.is_dir() {
+            if replace_file(&new, &cur).is_err() {
+                return;
+            }
+        } else if old.is_dir() && replace_file(&old, &cur).is_err() {
+            return;
+        }
+    }
+    for leftover in [new, old] {
+        if leftover.exists() {
+            let _ = std::fs::remove_dir_all(leftover);
+        }
+    }
+}
+
+/// The container's blob folder, settled first if an update was cut short.
+fn blob_dir(dir: &Path) -> PathBuf {
+    let cur = dir.join(BLOBS);
+    if !cur.exists() && (dir.join(BLOBS_NEW).exists() || dir.join(BLOBS_OLD).exists()) {
+        let _mutation = SAVE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
+        settle(dir);
+    }
+    cur
+}
+
 fn blobs_of(dir: &Path) -> Vec<(String, PathBuf, u64)> {
-    let mut v: Vec<(String, PathBuf, u64)> = std::fs::read_dir(dir.join("b"))
+    let mut v: Vec<(String, PathBuf, u64)> = std::fs::read_dir(blob_dir(dir))
         .into_iter()
         .flatten()
         .flatten()
@@ -567,8 +613,15 @@ pub unsafe extern "system" fn XGameSaveSubmitBlobDelete(u: *mut Update, name: *c
 
 fn apply(dir: &Path, display: Option<&str>, ops: &[(String, Option<Vec<u8>>)]) -> HRESULT {
     let _mutation = SAVE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
-    let blobs = dir.join("b");
-    if std::fs::create_dir_all(&blobs).is_err() {
+    if std::fs::create_dir_all(dir).is_err() {
+        return crate::util::E_FAIL;
+    }
+    settle(dir);
+    if !ops.is_empty() && commit_blobs(dir, ops).is_err() {
+        let _ = std::fs::remove_dir_all(dir.join(BLOBS_NEW));
+        return crate::util::E_FAIL;
+    }
+    if !dir.join(BLOBS).exists() && std::fs::create_dir_all(dir.join(BLOBS)).is_err() {
         return crate::util::E_FAIL;
     }
     if let Some(d) = display {
@@ -576,21 +629,66 @@ fn apply(dir: &Path, display: Option<&str>, ops: &[(String, Option<Vec<u8>>)]) -
             return crate::util::E_FAIL;
         }
     }
+    S_OK
+}
+
+/// The blobs after `ops` (the last op on a name wins; names compare as NTFS does, without case),
+/// built in `b.xclnew` and swapped in. Called with `SAVE_MUTATION` held, after `settle`.
+fn commit_blobs(dir: &Path, ops: &[(String, Option<Vec<u8>>)]) -> std::io::Result<()> {
+    use std::io::Write;
+    let (cur, new, old) = (dir.join(BLOBS), dir.join(BLOBS_NEW), dir.join(BLOBS_OLD));
+    let mut last: std::collections::BTreeMap<String, (String, Option<&[u8]>)> = std::collections::BTreeMap::new();
     for (name, data) in ops {
-        let path = blobs.join(enc(name));
-        match data {
-            Some(d) => {
-                // write to a unique sibling temp file, sync, then replace atomically
-                if write_atomic(&path, d).is_err() {
-                    return crate::util::E_FAIL;
-                }
-            }
-            None => {
-                let _ = std::fs::remove_file(&path);
-            }
+        let file = enc(name);
+        last.insert(file.to_lowercase(), (file, data.as_deref()));
+    }
+    let _ = std::fs::remove_dir_all(&new);
+    std::fs::create_dir_all(&new)?;
+    // unchanged blobs: the same file, hard-linked (no copy), or copied where links are refused
+    for e in std::fs::read_dir(&cur).into_iter().flatten().flatten() {
+        let file = e.file_name().to_string_lossy().into_owned();
+        if !e.file_type().is_ok_and(|t| t.is_file()) || file.starts_with(TMP_PREFIX) || last.contains_key(&file.to_lowercase()) {
+            continue;
+        }
+        let (from, to) = (e.path(), new.join(&file));
+        if std::fs::hard_link(&from, &to).is_err() {
+            std::fs::copy(&from, &to)?;
         }
     }
-    S_OK
+    for (file, data) in last.values() {
+        if let Some(d) = data {
+            let mut f = std::fs::File::create(new.join(file))?;
+            f.write_all(d)?;
+            f.sync_all()?;
+        }
+    }
+    // swap: until the second rename the old blobs stay whole under one of the two names
+    if cur.exists() {
+        rename_dir(&cur, &old)?;
+        if let Err(e) = rename_dir(&new, &cur) {
+            let _ = rename_dir(&old, &cur);
+            return Err(e);
+        }
+        let _ = std::fs::remove_dir_all(&old);
+    } else {
+        rename_dir(&new, &cur)?;
+    }
+    Ok(())
+}
+
+/// A folder renamed; retried a few times, since Windows refuses while any file in it is open
+/// (a read of the title's on another thread, a virus scanner).
+fn rename_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut tries = 0;
+    loop {
+        match replace_file(from, to) {
+            Err(_) if tries < 10 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            r => return r,
+        }
+    }
 }
 
 pub unsafe extern "system" fn XGameSaveSubmitUpdate(u: *mut Update) -> HRESULT {
@@ -1003,6 +1101,90 @@ mod tests {
             XGameSaveCloseProvider(p);
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    fn temp_container(tag: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("xcl-gamesave-{tag}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn contents(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        blobs_of(dir).into_iter().map(|(n, p, _)| (n, std::fs::read(p).unwrap())).collect()
+    }
+
+    fn write(name: &str, data: &[u8]) -> (String, Option<Vec<u8>>) {
+        (name.to_string(), Some(data.to_vec()))
+    }
+
+    #[test]
+    fn an_update_keeps_unchanged_blobs_and_applies_writes_and_deletes() {
+        let dir = temp_container("update");
+        assert_eq!(apply(&dir, Some("v1"), &[write("a", b"a1"), write("b", b"b1"), write("c", b"c1")]), S_OK);
+        assert_eq!(apply(&dir, Some("v2"), &[write("b", b"b2"), ("c".to_string(), None), write("d", b"d2"), ("d".to_string(), None), write("d", b"d3")]), S_OK);
+        assert_eq!(contents(&dir), vec![("a".into(), b"a1".to_vec()), ("b".into(), b"b2".to_vec()), ("d".into(), b"d3".to_vec())]);
+        assert_eq!(std::fs::read_to_string(dir.join("display")).unwrap(), "v2");
+        assert!(!dir.join(BLOBS_NEW).exists() && !dir.join(BLOBS_OLD).exists());
+        // names that differ only in case are one blob, as on NTFS (the last write wins)
+        assert_eq!(apply(&dir, None, &[write("A", b"A3")]), S_OK);
+        let names: Vec<String> = contents(&dir).into_iter().filter(|(n, _)| n.eq_ignore_ascii_case("a")).map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["A".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_update_changes_no_blob() {
+        let dir = temp_container("failed");
+        assert_eq!(apply(&dir, Some("v1"), &[write("a", b"a1"), write("b", b"b1")]), S_OK);
+        // the second write cannot be made (a file name longer than any volume allows): neither
+        // write of the update may reach the container, and no staging folder may be left
+        let too_long = "x".repeat(300);
+        assert_eq!(apply(&dir, Some("v2"), &[write("a", b"a2"), write(&too_long, b"x")]), crate::util::E_FAIL);
+        assert_eq!(contents(&dir), vec![("a".into(), b"a1".to_vec()), ("b".into(), b"b1".to_vec())]);
+        assert_eq!(std::fs::read_to_string(dir.join("display")).unwrap(), "v1");
+        assert!(!dir.join(BLOBS_NEW).exists() && !dir.join(BLOBS_OLD).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_crash_at_any_step_of_an_update_leaves_old_or_new_blobs() {
+        let make = |tag: &str| {
+            let dir = temp_container(tag);
+            assert_eq!(apply(&dir, None, &[write("a", b"old"), write("b", b"old")]), S_OK);
+            let new = dir.join(BLOBS_NEW);
+            std::fs::create_dir_all(&new).unwrap();
+            std::fs::write(new.join("a"), b"new").unwrap();
+            std::fs::write(new.join("b"), b"new").unwrap();
+            dir
+        };
+        let both = |dir: &Path, v: &[u8]| vec![("a".to_string(), v.to_vec()), ("b".to_string(), v.to_vec())] == contents(dir);
+        // cut while the next folder was built: the old blobs, the partial folder removed
+        let dir = make("crash-staging");
+        assert!(both(&dir, b"old"));
+        assert_eq!(apply(&dir, None, &[]), S_OK);
+        assert!(!dir.join(BLOBS_NEW).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        // cut after the first rename (`b` → `b.xclold`): the complete next folder is taken
+        let dir = make("crash-between");
+        std::fs::rename(dir.join(BLOBS), dir.join(BLOBS_OLD)).unwrap();
+        assert!(both(&dir, b"new"));
+        assert!(!dir.join(BLOBS_NEW).exists() && !dir.join(BLOBS_OLD).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        // cut after the second rename: the new blobs, the old folder removed on the next update
+        let dir = make("crash-after");
+        std::fs::rename(dir.join(BLOBS), dir.join(BLOBS_OLD)).unwrap();
+        std::fs::rename(dir.join(BLOBS_NEW), dir.join(BLOBS)).unwrap();
+        assert!(both(&dir, b"new"));
+        assert_eq!(apply(&dir, None, &[]), S_OK);
+        assert!(!dir.join(BLOBS_OLD).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        // only the previous folder left (the next one never got its name): rolled back
+        let dir = make("crash-rollback");
+        std::fs::remove_dir_all(dir.join(BLOBS_NEW)).unwrap();
+        std::fs::rename(dir.join(BLOBS), dir.join(BLOBS_OLD)).unwrap();
+        assert!(both(&dir, b"old"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
