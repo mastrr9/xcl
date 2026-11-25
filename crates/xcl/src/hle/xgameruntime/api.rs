@@ -810,7 +810,7 @@ fn xgamesave() -> Vec<(&'static str, usize)> {
 }
 
 fn xpls() -> Vec<(&'static str, usize)> {
-    let mut v = named![XPersistentLocalStorageGetPathSize, XPersistentLocalStorageGetPath, XPersistentLocalStorageGetSpaceInfo];
+    let mut v = named![XPersistentLocalStorageGetPathSize, XPersistentLocalStorageGetPath, XPersistentLocalStorageGetSpaceInfo, XPersistentLocalStorageMountForPackage];
     // no prompt to show: the space asked for is granted
     v.extend([("XPersistentLocalStoragePromptUserForSpaceAsync", prompt_space_async as usize), ("XPersistentLocalStoragePromptUserForSpaceResult", empty_result as usize)]);
     v
