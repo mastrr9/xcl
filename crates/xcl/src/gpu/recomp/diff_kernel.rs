@@ -25,7 +25,8 @@
 //! `relax` and `Unordered`; its own check must then accept the direct run.
 //!
 //! A test may also compare the NaNs of some float VGPRs by class (`Nan`) instead of bit for
-//! bit; nothing is relaxed unless a test asks.
+//! bit, or allow some float VGPRs or memory dwords a few ulps (`Ulp`) where an operation is
+//! known to round differently on the two paths; nothing is relaxed unless a test asks.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -61,6 +62,30 @@ pub struct Relax {
     pub unordered: Option<Unordered>,
     /// Float VGPRs whose NaNs compare by class.
     pub nan: Vec<Nan>,
+    /// Float values allowed a few ulps.
+    pub ulp: Vec<Ulp>,
+}
+
+/// VGPRs (every lane that ran) and flat-memory dwords holding f32 values, or f64 values in
+/// pairs from each range's start (low dword first), that may differ by up to `max` ulps: for
+/// an operation known to round differently on the two paths, named by the test so that it
+/// does not hide a real difference elsewhere. Two finite values with at most `max`
+/// representable values between them are equal (+0 and -0 are one value); an infinity or a
+/// NaN still compares bit for bit (`Nan` for those).
+pub struct Ulp {
+    pub vgprs: Range<usize>,
+    pub mem: Range<usize>,
+    pub f64: bool,
+    pub max: u32,
+}
+
+/// The distance in ulps of two finite f32 (`f64`: false) or f64 values; None when either is
+/// an infinity or a NaN.
+fn ulps(a: u64, b: u64, f64: bool) -> Option<u64> {
+    let (sign, inf) = if f64 { (1u64 << 63, 0x7FF0_0000_0000_0000) } else { (1 << 31, 0x7F80_0000) };
+    // the bits as a position on the number line: -0 and +0 are both 0
+    let pos = |x: u64| if x & sign != 0 { -((x & !sign) as i128) } else { x as i128 };
+    (a & !sign < inf && b & !sign < inf).then(|| (pos(a) - pos(b)).unsigned_abs() as u64)
 }
 
 /// VGPRs (every lane that ran) holding f32 values, or f64 values in register pairs from
@@ -430,6 +455,28 @@ pub fn compare_relaxed(state: &KernelState, lanes: usize, hlsl: &KernelResult, d
                 if n.eq.equal(get(h), get(x), n.f64) {
                     x[v..v + step].copy_from_slice(&h[v..v + step]);
                 }
+            }
+        }
+    }
+    for u in &r.ulp {
+        let step = if u.f64 { 2 } else { 1 };
+        let close = |h: &[u32], x: &[u32], v: usize| {
+            let get = |r: &[u32]| if u.f64 { r[v] as u64 | (r[v + 1] as u64) << 32 } else { r[v] as u64 };
+            ulps(get(h), get(x), u.f64).is_some_and(|n| n <= u.max as u64)
+        };
+        for l in 0..lanes {
+            let (h, x) = (&hlsl.vgpr[l], &mut d.vgpr[l]);
+            let end = u.vgprs.end.min(h.len()).min(x.len());
+            for v in u.vgprs.clone().step_by(step).filter(|&v| v + step <= end) {
+                if close(h, x, v) {
+                    x[v..v + step].copy_from_slice(&h[v..v + step]);
+                }
+            }
+        }
+        let end = u.mem.end.min(hlsl.mem.len()).min(d.mem.len());
+        for i in u.mem.clone().step_by(step).filter(|&i| i + step <= end) {
+            if close(&hlsl.mem, &d.mem, i) {
+                d.mem[i..i + step].copy_from_slice(&hlsl.mem[i..i + step]);
             }
         }
     }
@@ -894,6 +941,69 @@ mod tests {
         assert!(rel(0x7FF0_0000_0000_0000, qnan, &nan_rule(14..16, true, NanEq::Any)).is_err());
         // pairs run from the range's start: v13:v14 is not the pair v14:v15
         assert!(rel(snan, qnan, &nan_rule(13..17, true, NanEq::Any)).is_err());
+    }
+
+    #[test]
+    fn ulp_distances() {
+        let f = |x: f32| x.to_bits() as u64;
+        assert_eq!(ulps(f(1.0), f(1.0), false), Some(0));
+        assert_eq!(ulps(f(1.0), 0x3F80_0002, false), Some(2));
+        // across zero: -0 and +0 are one value, the smallest denormals one ulp each side
+        assert_eq!(ulps(f(0.0), f(-0.0), false), Some(0));
+        assert_eq!(ulps(0x0000_0001, 0x8000_0001, false), Some(2));
+        // the largest finite value and infinity: no distance
+        assert_eq!(ulps(f(f32::MAX), f(f32::INFINITY), false), None);
+        assert_eq!(ulps(f(f32::NAN), f(f32::NAN), false), None);
+        assert_eq!(ulps(1.0f64.to_bits(), 1.0f64.to_bits() + 3, true), Some(3));
+        assert_eq!(ulps((-1.0f64).to_bits(), (-1.0f64).to_bits() + 3, true), Some(3));
+        assert_eq!(ulps(f64::INFINITY.to_bits(), f64::MAX.to_bits(), true), None);
+    }
+
+    #[test]
+    fn ulp_tolerance_holds_only_where_a_test_asks() {
+        let st = KernelState::default();
+        let (mut a, mut b) = (blank(), blank());
+        // v100..v104 of every lane: the second value 2 ulps up in lane 7
+        for l in 0..KERNEL_LANES {
+            for v in 100..104 {
+                a.vgpr[l][v] = (1.5f32 + v as f32).to_bits();
+                b.vgpr[l][v] = a.vgpr[l][v];
+            }
+        }
+        b.vgpr[7][101] += 2;
+        let tol = |max| Relax { ulp: vec![Ulp { vgprs: 100..104, mem: 0..0, f64: false, max }], ..Default::default() };
+        // strict by default, 2 ulps within max 2, not within max 1
+        assert!(compare_relaxed(&st, KERNEL_LANES, &a, &b, &[], &Relax::default()).is_err());
+        assert_eq!(compare_relaxed(&st, KERNEL_LANES, &a, &b, &[], &tol(2)), Ok(()));
+        let e = compare_relaxed(&st, KERNEL_LANES, &a, &b, &[], &tol(1)).unwrap_err();
+        assert!(e.contains("lane 7 v101: hlsl 0x42cd0000 direct 0x42cd0002"), "{e}");
+        // a difference outside the range is still one, as is a sign flip or an infinity
+        let mut c = KernelResult { vgpr: b.vgpr.clone(), ..blank() };
+        c.vgpr[7][104] = 1;
+        assert!(compare_relaxed(&st, KERNEL_LANES, &a, &c, &[], &tol(2)).unwrap_err().contains("lane 7 v104"));
+        let mut c = KernelResult { vgpr: b.vgpr.clone(), ..blank() };
+        c.vgpr[3][100] ^= 0x8000_0000;
+        assert!(compare_relaxed(&st, KERNEL_LANES, &a, &c, &[], &tol(1000)).is_err());
+        c.vgpr[3][100] = 0x7F80_0000;
+        assert!(compare_relaxed(&st, KERNEL_LANES, &a, &c, &[], &tol(u32::MAX)).is_err());
+    }
+
+    #[test]
+    fn ulp_tolerance_on_f64_pairs_and_memory() {
+        let st = KernelState::default();
+        let (mut a, mut b) = (blank(), blank());
+        let x = 3.25f64.to_bits();
+        let y = x + 4;
+        (a.vgpr[0][20], a.vgpr[0][21], b.vgpr[0][20], b.vgpr[0][21]) = (x as u32, (x >> 32) as u32, y as u32, (y >> 32) as u32);
+        (a.mem[10], b.mem[10]) = (2.0f32.to_bits(), 2.0f32.to_bits() + 1);
+        let r = Relax {
+            ulp: vec![Ulp { vgprs: 20..22, mem: 0..0, f64: true, max: 4 }, Ulp { vgprs: 0..0, mem: 10..11, f64: false, max: 1 }],
+            ..Default::default()
+        };
+        assert_eq!(compare_relaxed(&st, KERNEL_LANES, &a, &b, &[], &r), Ok(()));
+        // the f64 pair judged as one value: 4 ulps of the f64, not of either dword
+        let r3 = Relax { ulp: vec![Ulp { vgprs: 20..22, mem: 10..11, f64: true, max: 3 }], ..Default::default() };
+        assert!(compare_relaxed(&st, KERNEL_LANES, &a, &b, &[], &r3).unwrap_err().contains("lane 0 v20"));
     }
 
     /// A small program through both backends via the diff entry point (independent of
