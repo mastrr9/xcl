@@ -5921,14 +5921,25 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
         uint o1 = type == 0u ? 12u : (type == 3u ? 48u : 36u);
         uint o2 = type <= 1u ? 24u : (type == 2u ? 48u : 0u);
         float3 v0 = asfloat(mem.Load3(at + o0)), v1 = asfloat(mem.Load3(at + o1)), v2 = asfloat(mem.Load3(at + o2));
-        float3 e1 = v1 - v0, e2 = v2 - v0, p = cross(d, e2);
-        float det = dot(e1, p);
-        float3 sv = o - v0, q = cross(sv, e1);
-        float i = dot(sv, p), j = dot(d, q), t = dot(e2, q);
+        // `precise`: every step rounds on its own, as in the direct DXIL lowering and the CPU
+        // mirror (bvh::triangle_hit). Otherwise a driver may fuse a product of cross() into the
+        // subtraction after it (an fma) or reassociate det - i - j, a few ulps off, and a hit
+        // with det near 0 can turn into a miss.
+        precise float3 e1 = v1 - v0;
+        precise float3 e2 = v2 - v0;
+        precise float3 p = cross(d, e2);
+        precise float det = dot(e1, p);
+        precise float3 sv = o - v0;
+        precise float3 q = cross(sv, e1);
+        precise float i = dot(sv, p);
+        precise float j = dot(d, q);
+        precise float t = dot(e2, q);
+        precise float ij = i + j;
         // inside when i, j, 1 - i - j >= 0 relative to det (either winding); avoid det * det underflow/overflow
-        bool hit = det > 0.0f ? (i >= 0.0f && j >= 0.0f && i + j <= det) : (det < 0.0f && i <= 0.0f && j <= 0.0f && i + j >= det);
+        bool hit = det > 0.0f ? (i >= 0.0f && j >= 0.0f && ij <= det) : (det < 0.0f && i <= 0.0f && j <= 0.0f && ij >= det);
         // barycentrics back to the original vertex order: triangle id @60, per triangle I / J source
-        uint4 bc = asuint(float4(det - i - j, i, j, 0.0f));
+        precise float b0 = det - i - j;
+        uint4 bc = asuint(float4(b0, i, j, 0.0f));
         uint tid = mem.Load(at + 60u) >> (8u * type);
         return hit ? uint4(asuint(t), asuint(det), pick4(bc, tid & 3u), pick4(bc, (tid >> 2) & 3u)) : uint4(0x7F800000u, asuint(1.0f), 0u, 0u);
     }
@@ -6624,5 +6635,29 @@ mod tests {
         assert!(!PRELUDE_MEM.contains("bc[tid"), "runtime local-array index remains in bvh_intersect");
         assert!(PRELUDE_MEM.contains("uint pick4(uint4 v, uint i)"));
         assert!(PRELUDE_MEM.contains("void or_at4(inout uint4 r, uint i, uint v)"));
+    }
+
+    /// The triangle test of bvh_intersect rounds every step (no fma contraction, no
+    /// reassociation), as the direct DXIL lowering and bvh::triangle_hit do.
+    #[test]
+    fn bvh_triangle_test_is_precise() {
+        let at = PRELUDE_MEM.find("if (type <= 3u) {").expect("triangle branch");
+        let tri = &PRELUDE_MEM[at..];
+        for line in [
+            "precise float3 e1 = v1 - v0;",
+            "precise float3 e2 = v2 - v0;",
+            "precise float3 p = cross(d, e2);",
+            "precise float det = dot(e1, p);",
+            "precise float3 sv = o - v0;",
+            "precise float3 q = cross(sv, e1);",
+            "precise float i = dot(sv, p);",
+            "precise float j = dot(d, q);",
+            "precise float t = dot(e2, q);",
+            "precise float ij = i + j;",
+            "precise float b0 = det - i - j;",
+        ] {
+            assert!(tri.contains(line), "{line}");
+        }
+        assert!(!tri.contains("float3 e1 = v1 - v0, e2"), "an imprecise declaration is left");
     }
 }
