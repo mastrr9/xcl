@@ -156,6 +156,11 @@ fn pc() -> Option<&'static Pc> {
     .as_ref()
 }
 
+/// Whether the PC's own XGameRuntime (Gaming Services) is installed and serves `QueryApiImpl`.
+pub(super) fn pc_runtime_present() -> bool {
+    pc().is_some()
+}
+
 unsafe fn pc_object(c: &Guid, i: &Guid) -> Option<usize> {
     let mut o: *mut c_void = std::ptr::null_mut();
     ((pc()?.query)(c, i, &mut o) >= 0 && !o.is_null()).then_some(o as usize)

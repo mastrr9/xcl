@@ -194,8 +194,14 @@ pub unsafe extern "system" fn XGameRuntimeUninitialize() {
     INIT_COUNT.fetch_sub(1, Ordering::AcqRel);
 }
 
+/// Features whose classes only the PC's own runtime (`System32\xgameruntime.dll`) provides:
+/// XGameInvite, XGameUI, XSpeechSynthesizer, XGameStreaming. Without it their `QueryApiImpl`
+/// answers "class not registered", so they are reported unavailable, as a title checks before
+/// it calls them.
+const PC_RUNTIME_ONLY: [u32; 4] = [6, 8, 13, 21];
+
 pub unsafe extern "system" fn XGameRuntimeIsFeatureAvailable(feature: u32) -> bool {
-    matches!(feature, 0 | 2..=13 | 15..=21)
+    matches!(feature, 0 | 2..=13 | 15..=21) && (!PC_RUNTIME_ONLY.contains(&feature) || api::pc_runtime_present())
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1014,10 +1020,11 @@ mod tests {
             (20, "XGameEvent"),
             (21, "XGameStreaming"),
         ];
+        let pc = api::pc_runtime_present();
         for (feature, name) in features {
             assert_eq!(
                 unsafe { XGameRuntimeIsFeatureAvailable(feature) },
-                feature != 1 && feature != 14,
+                feature != 1 && feature != 14 && (pc || ![6, 8, 13, 21].contains(&feature)),
                 "unexpected availability for {name} ({feature})"
             );
         }
