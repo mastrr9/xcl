@@ -2019,6 +2019,15 @@ impl Em {
         }
     }
 
+    /// One memory window: what a raw (stride 0) buffer access's range check needs of the 32-bit
+    /// `{t}_off = voff + OFFSET`, as `raw_in_range` takes it. RDNA2 adds them without wrapping
+    /// (as the 64-bit sum of several windows does), so a sum past 2^32 is past num_records `d2`
+    /// too: `{t}_in` is false when the sum wrapped or is past `d2`, and `{t}_room` is the bytes
+    /// left from `{t}_off` to `d2` (so `{t}_off + bytes` cannot wrap in the check either).
+    fn raw_room(&mut self, t: &str, voff: &str, d2: &str) {
+        self.line(&format!("bool {t}_in = and({t}_off >= {voff}, {t}_off <= {d2}); uint {t}_room = {d2} - {t}_off;"));
+    }
+
     /// Compute the effective address of a FLAT / GLOBAL access into `uint {t}_a` (masked by
     /// `~align_mask` when non-zero) and, when `mem_windows > 1`, select `xcl_w` from the exact
     /// 64-bit address (carrying/borrowing across 4 GiB window boundaries).
@@ -2142,6 +2151,7 @@ impl Em {
         } else {
             self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
             self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
+            self.raw_room(&t, &voff, &d2);
         }
         let act = self.act();
         let multi = self.opt.mem_windows > 1;
@@ -2149,7 +2159,7 @@ impl Em {
             if multi {
                 format!("select({t}_stride == 0u, {t}_off + (uint64_t)({bytes}) <= (uint64_t){d2}, {index} < {d2})")
             } else {
-                format!("select({t}_stride == 0u, {t}_off + {bytes} <= {d2}, {index} < {d2})")
+                format!("select({t}_stride == 0u, {}, {index} < {d2})", raw_in_range(&t, &bytes))
             }
         };
         if let Some((n, signed, store)) = small {
@@ -2332,12 +2342,13 @@ impl Em {
                 }
                 for j in at {
                     let e = params[j];
-                    let n = out_comps(e);
-                    for c in 0..n {
+                    let chans = out_channels(e);
+                    let n = chans.len();
+                    for (i, &c) in chans.iter().enumerate() {
                         if enabled(c) {
                             let v = Self::exp_comp(srcs, compr, c);
                             let v = if e.component_type == 3 { format!("asfloat({v})") } else { format!("{v}") };
-                            let comp = if n == 1 { String::new() } else { format!("[{c}]") };
+                            let comp = if n == 1 { String::new() } else { format!("[{i}]") };
                             st.push(format!("xo.p{j}{comp} = {v};"));
                         }
                     }
@@ -3656,15 +3667,16 @@ impl Em {
                     "v_cvt_f64_f32" => format!("(double)asfloat({})", lo_hi[0].0),
                     "v_cvt_f64_i32" => format!("(double)(int){}", lo_hi[0].0),
                     "v_cvt_f64_u32" => format!("(double){}", lo_hi[0].0),
-                    "v_floor_f64" => format!("floor_d({})", f64v(0)),
-                    "v_ceil_f64" => format!("ceil_d({})", f64v(0)),
-                    "v_fract_f64" => format!("fract_d({})", f64v(0)),
-                    "v_rndne_f64" => format!("round_ne_d({})", f64v(0)),
-                    "v_frexp_mant_f64" => format!("frexp_mant_d({})", f64v(0)),
-                    "v_sqrt_f64" => format!("sqrt_d({})", f64v(0)),
-                    "v_rsq_f64" => format!("rcp_d(sqrt_d({}))", f64v(0)),
-                    "v_trunc_f64" => format!("trunc_d({})", f64v(0)),
-                    "v_ldexp_f64" => format!("ldexp_d({}, (int){})", f64v(0), lo_hi[1].0),
+                    // the helpers return a NaN x unchanged; the hardware returns it quiet
+                    "v_floor_f64" => format!("floor_d(quiet_d({}))", f64v(0)),
+                    "v_ceil_f64" => format!("ceil_d(quiet_d({}))", f64v(0)),
+                    "v_fract_f64" => format!("fract_d(quiet_d({}))", f64v(0)),
+                    "v_rndne_f64" => format!("round_ne_d(quiet_d({}))", f64v(0)),
+                    "v_frexp_mant_f64" => format!("frexp_mant_d(quiet_d({}))", f64v(0)),
+                    "v_sqrt_f64" => format!("sqrt_d(quiet_d({}))", f64v(0)),
+                    "v_rsq_f64" => format!("rcp_d(sqrt_d(quiet_d({})))", f64v(0)),
+                    "v_trunc_f64" => format!("trunc_d(quiet_d({}))", f64v(0)),
+                    "v_ldexp_f64" => format!("ldexp_d(quiet_d({}), (int){})", f64v(0), lo_hi[1].0),
                     "v_cvt_f32_f64" => {
                         self.line(&format!("uint {t} = {};", Self::fres(&m, &format!("(float){}", f64v(0)))));
                         self.write32(&dst, &t);
@@ -3859,12 +3871,12 @@ impl Em {
             "v_floor_f32" => fr(format!("floor({})", fs(0))),
             "v_ceil_f32" => fr(format!("ceil({})", fs(0))),
             "v_rndne_f32" => fr(format!("round({})", fs(0))),
-            "v_frexp_mant_f32" => fr(format!("frexp_mant({})", fs(0))),
+            "v_frexp_mant_f32" => fr(format!("frexp_mant(quiet_f({}))", fs(0))),
             "v_frexp_exp_i32_f32" if self.track_frexp_denorm => {
                 format!("(uint)frexp_exp_f32({a}, {}, xcl_frexp_f32_denorm)", fs(0))
             }
             "v_frexp_exp_i32_f32" => format!("(uint)frexp_exp({})", fs(0)),
-            "v_ldexp_f32" => fr(format!("ldexp_f({}, (int){b})", fs(0))),
+            "v_ldexp_f32" => fr(format!("ldexp_f(quiet_f({}), (int){b})", fs(0))),
             "v_add_f32" => fr(format!("{} + {}", fs(0), fs(1))),
             "v_sub_f32" => fr(format!("{} - {}", fs(0), fs(1))),
             "v_subrev_f32" => fr(format!("{} - {}", fs(1), fs(0))),
@@ -4221,7 +4233,8 @@ impl Em {
         } else {
             self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
             self.line(&format!("uint {t}_a = ({d0} + {soff} + {t}_off + {t}_stride * {index}) & ~{}u;", bytes - 1));
-            self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + {bytes}u <= {d2}, {index} < {d2});"));
+            self.raw_room(&t, &voff, &d2);
+            self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {}, {index} < {d2});", raw_in_range(&t, &format!("{bytes}u"))));
         }
         let act = self.act();
         if x2 {
@@ -4279,11 +4292,12 @@ impl Em {
         } else {
             self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
             self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
+            self.raw_room(&t, &voff, &d2);
         }
         let ok = if self.opt.mem_windows > 1 {
             format!("select({t}_stride == 0u, {t}_off + (uint64_t){n}u <= (uint64_t){d2}, {index} < {d2})")
         } else {
-            format!("select({t}_stride == 0u, {t}_off + {n}u <= {d2}, {index} < {d2})")
+            format!("select({t}_stride == 0u, {}, {index} < {d2})", raw_in_range(&t, &format!("{n}u")))
         };
         let act = self.act();
         let v = self.vreg(vdata);
@@ -4877,7 +4891,9 @@ impl Em {
                 }
                 h.push_str("    uint xcl_vid : SV_VertexID;\n    uint xcl_iid : SV_InstanceID;\n};\n");
                 out_struct(&mut h, "XclOut", &vs.outputs);
-                h.push_str("XclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n");
+                let vals = out_vals(&vs.outputs);
+                h.push_str(vals.as_deref().unwrap_or(""));
+                h.push_str(if vals.is_some() { "XclOut main(XclIn xi)\n{\n    XclVals xo = (XclVals)0;\n" } else { "XclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n" });
                 h.push_str(if self.opt.wave64 { "    lane_id = WaveGetLaneIndex();\n" } else { "    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n" });
                 if self.upper.is_some() {
                     h.push_str("    xcl_hw32 = WaveGetLaneCount() < 64u;\n");
@@ -4904,7 +4920,7 @@ impl Em {
                     let _ = writeln!(h, "    uint v{v} = {init};");
                 }
                 h.push_str(body);
-                h.push_str("    return xo;\n}\n");
+                h.push_str(if vals.is_some() { "    return xcl_rows(xo);\n}\n" } else { "    return xo;\n}\n" });
             }
             Mode::Compute(cs) => {
                 let lanes = if self.opt.wave64 { 64 } else { 32 };
@@ -5171,6 +5187,7 @@ impl Em {
                 // input non-perspective centroid (or sample)
                 let conservative = ps.outputs.iter().any(|e| matches!(e.system_value, 67 | 68));
                 let pos_mode = if conservative { "noperspective centroid " } else { "" };
+                let decl_start = h.len();
                 let _ = writeln!(h, "struct XclIn {{\n    {pos_mode}float4 xcl_pos : SV_Position;");
                 for (k, e) in ranked(&ps.inputs, false).iter().enumerate() {
                     // the mode of the attribute this input is read through (none: never read)
@@ -5181,11 +5198,22 @@ impl Em {
                     }
                     let _ = writeln!(h, "    {m} {}4 a{k} : {};", hlsl_type(e), e.semantic());
                 }
+                let rows = in_rows(ps, &h[decl_start..]);
+                if let Some((plain, _, _)) = &rows {
+                    h.truncate(decl_start);
+                    h.push_str(plain);
+                }
+                let sys_start = h.len();
                 if ps.input_ena >> 12 & 1 == 1 {
                     h.push_str("    bool xcl_ff : SV_IsFrontFace;\n");
                 }
                 if ps.input_ena >> 14 & 1 == 1 {
                     h.push_str("    uint xcl_cov : SV_Coverage;\n");
+                }
+                // the system values after the inputs, in the entry's struct as well
+                let sys = h[sys_start..].to_string();
+                if let Some((_, decl, _)) = &rows {
+                    let _ = write!(h, "}};\nstruct XclInRows {{\n    {pos_mode}float4 xcl_pos : SV_Position;\n{decl}{sys}");
                 }
                 h.push_str("};\nstruct XclOut {\n");
                 for e in &ps.outputs {
@@ -5203,7 +5231,16 @@ impl Em {
                 if !self.ps_writes_mask && !ps.outputs.iter().any(|e| matches!(e.system_value, 64 | 65 | 67 | 68)) {
                     h.push_str("    float4 xcl_unused : SV_Target7;\n");
                 }
-                h.push_str("};\nXclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n");
+                match &rows {
+                    Some((_, _, copy)) => {
+                        let _ = write!(h, "}};\nXclOut main(XclInRows xr)\n{{\n    XclIn xi;\n    xi.xcl_pos = xr.xcl_pos;\n{copy}");
+                        for m in sys.lines().filter_map(|l| l.split_whitespace().nth(1)) {
+                            let _ = writeln!(h, "    xi.{m} = xr.{m};");
+                        }
+                        h.push_str("    XclOut xo = (XclOut)0;\n");
+                    }
+                    None => h.push_str("};\nXclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n"),
+                }
                 if self.ps_writes_mask {
                     h.push_str("    xo.xcl_mask = 0xFFFFFFFFu;\n");
                 }
@@ -5252,12 +5289,71 @@ impl Em {
 /// the params in `exp param` order (non-system OSG1 elements, then clip/cull distances).
 fn out_struct(h: &mut String, name: &str, outputs: &[SigElement]) {
     let _ = writeln!(h, "struct {name} {{\n    float4 pos : SV_Position;");
-    for (k, e) in ranked(outputs, true).iter().enumerate() {
+    let all = ranked(outputs, true);
+    for (k, row) in out_rows(outputs).iter().enumerate() {
+        let e = all[row[0]];
         let n = out_comps(e);
         let ty = if n == 1 { hlsl_type(e).to_string() } else { format!("{}{n}", hlsl_type(e)) };
         let _ = writeln!(h, "    {ty} p{k} : {};", e.semantic());
     }
     h.push_str("};\n");
+}
+
+/// The rows of `out_struct`, as places in `ranked(outputs, true)`: the user elements'
+/// `signature_rows`, then each clip / cull distance in a row of its own.
+fn out_rows(outputs: &[SigElement]) -> Vec<Vec<usize>> {
+    let mut rows = super::signature_rows(outputs);
+    let user = ranked(outputs, false).len();
+    rows.extend((user..ranked(outputs, true).len()).map(|j| vec![j]));
+    rows
+}
+
+/// A VS whose outputs share rows (`signature_rows`): the program writes `xo.p<j>` per element
+/// of `ranked(outputs, true)` into `XclVals` (every element at a register holds all of it), and
+/// `xcl_rows` copies each row from the element that names it into `XclOut`. None: the program
+/// writes `XclOut` itself.
+fn out_vals(outputs: &[SigElement]) -> Option<String> {
+    if !super::signature_packed(outputs) {
+        return None;
+    }
+    let all = ranked(outputs, true);
+    let mut h = String::from("struct XclVals {\n    float4 pos;\n");
+    for (j, e) in all.iter().enumerate() {
+        let n = out_comps(e);
+        let ty = if n == 1 { hlsl_type(e).to_string() } else { format!("{}{n}", hlsl_type(e)) };
+        let _ = writeln!(h, "    {ty} p{j};");
+    }
+    h.push_str("};\nXclOut xcl_rows(XclVals v)\n{\n    XclOut o;\n    o.pos = v.pos;\n");
+    for (k, row) in out_rows(outputs).iter().enumerate() {
+        let _ = writeln!(h, "    o.p{k} = v.p{};", row[0]);
+    }
+    h.push_str("    return o;\n}\n");
+    Some(h)
+}
+
+/// A PS whose inputs share rows (`signature_rows`): its entry takes `XclInRows`, each row
+/// declared as the input that names it was in `XclIn`, and copies each row into every input it
+/// carries, so the program reads `xi.a<k>` as before. `head`: the `XclIn` declaration so far,
+/// SV_Position and then one line per input of `ranked(inputs, false)`. (`XclIn` so far as a
+/// plain struct for the copies, the rows, the copies); None: the entry takes `XclIn`.
+fn in_rows(ps: &super::PsInterface, head: &str) -> Option<(String, String, String)> {
+    if !super::signature_packed(&ps.inputs) {
+        return None;
+    }
+    let user = ranked(&ps.inputs, false);
+    let lines: Vec<&str> = head.lines().skip(2).collect();
+    let mut plain = String::from("struct XclIn {\n    float4 xcl_pos;\n");
+    let (mut decl, mut copy) = (String::new(), String::new());
+    for (j, e) in user.iter().enumerate() {
+        let _ = writeln!(plain, "    {}4 a{j};", hlsl_type(e));
+    }
+    for (k, row) in super::signature_rows(&ps.inputs).iter().enumerate() {
+        let _ = writeln!(decl, "{}", lines[row[0]].replacen(&format!(" a{} : ", row[0]), &format!(" r{k} : "), 1));
+        for &j in row {
+            let _ = writeln!(copy, "    xi.a{j} = as{}(xr.r{k});", hlsl_type(user[j]));
+        }
+    }
+    Some((plain, decl, copy))
 }
 
 /// Geometry shader for the console's rect lists (IASetPrimitiveTopology 17, AMD's
@@ -5301,8 +5397,9 @@ pub fn rect_list_gs(outputs: &[SigElement]) -> String {
     h.push_str("    if (c == 3u) {\n        s.Append(v[0]);\n        s.Append(v[1]);\n        s.Append(v[2]);\n        return;\n    }\n");
     h.push_str("    XclOut k = v[c], a = v[(c + 1u) % 3u], b = v[(c + 2u) % 3u];\n    XclOut d = v[0];\n");
     h.push_str("    d.pos = a.pos + b.pos - k.pos;\n");
-    for (k, e) in ranked(outputs, true).iter().enumerate() {
-        if hlsl_type(e) == "float" {
+    let all = ranked(outputs, true);
+    for (k, row) in out_rows(outputs).iter().enumerate() {
+        if hlsl_type(all[row[0]]) == "float" {
             let _ = writeln!(h, "    d.p{k} = a.p{k} + b.p{k} - k.p{k};");
         }
     }
@@ -5319,7 +5416,9 @@ pub fn rect_list_gs(outputs: &[SigElement]) -> String {
 
 /// Second pass of the mesh mode: a mesh shader that turns the records written by the
 /// translated program (one per group, see `MsInterface::record_dwords`) into vertices and
-/// triangles. Null primitives (bit 31) and out-of-range indices are culled.
+/// triangles, or lines for a program whose PSV0 topology is lines (`MsInterface::lines`: the
+/// first two indices of each primitive). Null primitives (bit 31) and out-of-range indices
+/// are culled.
 pub fn mesh_passthrough(ms: &MsInterface) -> String {
     mesh_passthrough_for(ms, None)
 }
@@ -5338,13 +5437,15 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
     let slots = ranked(&ms.outputs, true);
     // (declaration, record slot or None = 0)
     let elems: Vec<(String, &SigElement, Option<usize>)> = match ps_inputs {
-        None => slots.iter().enumerate().map(|(k, e)| (e.semantic(), *e, Some(k))).collect(),
+        // a row of several elements reads the record slot of one of them (each holds the register)
+        None => out_rows(&ms.outputs).iter().map(|row| (slots[row[0]].semantic(), slots[row[0]], Some(row[0]))).collect(),
         Some(ins) => {
-            let mut v: Vec<(String, &SigElement, Option<usize>)> = ranked(ins, false)
+            let user = ranked(ins, false);
+            let mut v: Vec<(String, &SigElement, Option<usize>)> = super::signature_rows(ins)
                 .into_iter()
-                .map(|e| {
-                    let k = slots.iter().position(|o| o.system_value == 0 && o.name.eq_ignore_ascii_case(&e.name) && o.index == e.index);
-                    (e.semantic(), e, k)
+                .map(|row| {
+                    let k = row.iter().find_map(|&j| slots.iter().position(|o| o.system_value == 0 && o.name.eq_ignore_ascii_case(&user[j].name) && o.index == user[j].index));
+                    (user[row[0]].semantic(), user[row[0]], k)
                 })
                 .collect();
             v.extend(slots.iter().enumerate().filter(|(_, o)| matches!(o.system_value, 2 | 3)).map(|(k, o)| (o.semantic(), *o, Some(k))));
@@ -5363,8 +5464,8 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
     // one vertex from record dword address `b` into `o`
     let mut fill = String::from("        XclVert o;\n        o.pos = asfloat(res.Load4(b));\n");
     for (k, (_, e, slot)) in elems.iter().enumerate() {
-        let n = if ps_inputs.is_some() && !matches!(e.system_value, 2 | 3) { 4 } else { out_comps(e) };
-        let sw = ["x", "y", "z", "w"][..n].concat();
+        let chans = if ps_inputs.is_some() && !matches!(e.system_value, 2 | 3) { vec![0, 1, 2, 3] } else { out_channels(e) };
+        let sw: String = chans.iter().map(|&c| ["x", "y", "z", "w"][c]).collect();
         let raw = match slot {
             Some(s) => format!("res.Load4(b + {}u).{sw}", 16 * (s + 1)),
             None => format!("uint4(0u, 0u, 0u, 0u).{sw}"),
@@ -5383,10 +5484,12 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
     // with 22 float4 rows are accounted as 96: 33792 B > 32768).
     let cap = passthrough_max_vertices(16 * (1 + elems.len() as u32));
     let split = passthrough_split(ms, elems.len());
+    // vertices per primitive, and how the record's packed indices are read for them
+    let (topo, nidx, xs, zero) = if ms.lines { ("line", 2u32, ".xy", "uint2(0u, 0u)") } else { ("triangle", 3, "", "uint3(0u, 0u, 0u)") };
     if mv <= cap {
         let _ = writeln!(
             h,
-            "[outputtopology(\"triangle\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{mv}], out indices uint3 tris[{mp}])\n{{"
+            "[outputtopology(\"{topo}\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{mv}], out indices uint{nidx} tris[{mp}])\n{{"
         );
         let _ = writeln!(h, "    uint rec = gid.x * {rec}u;");
         let _ = writeln!(h, "    uint nv = min(res.Load(rec * 4u), {mv}u);\n    uint np = min(res.Load(rec * 4u + 4u), {mp}u);");
@@ -5400,31 +5503,32 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
         // RDNA2 EXP PRIM packs 9-bit vertex indices at [8:0], [18:10], [28:20] with
         // per-edge flags at [9], [19], [29] and null_prim at [31].
         h.push_str("        uint3 x = uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu);\n");
-        h.push_str("        bool bad = or((p >> 31) != 0u, any(x >= nv));\n");
-        h.push_str("        tris[j] = select(bad, uint3(0u, 0u, 0u), x);\n    }\n}\n");
+        let _ = writeln!(h, "        bool bad = or((p >> 31) != 0u, any(x{xs} >= nv));");
+        let _ = writeln!(h, "        tris[j] = select(bad, {zero}, x{xs});\n    }}\n}}");
         return h;
     }
     // over the mesh output limit: `split` mesh groups per record, each a run of its
-    // triangles with their own copies of the three vertices
+    // primitives with their own copies of their vertices
     let ppg = mp.div_ceil(split);
     let _ = writeln!(
         h,
-        "[outputtopology(\"triangle\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{}], out indices uint3 tris[{ppg}])\n{{",
-        3 * ppg
+        "[outputtopology(\"{topo}\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{}], out indices uint{nidx} tris[{ppg}])\n{{",
+        nidx * ppg
     );
     let _ = writeln!(h, "    uint rec = (gid.x / {split}u) * {rec}u;\n    uint first = (gid.x % {split}u) * {ppg}u;");
     let _ = writeln!(h, "    uint nv = min(res.Load(rec * 4u), {mv}u);\n    uint np = min(res.Load(rec * 4u + 4u), {mp}u);");
     let _ = writeln!(h, "    uint n = select(np > first, min(np - first, {ppg}u), 0u);");
-    h.push_str("    SetMeshOutputCounts(3u * n, n);\n");
+    let _ = writeln!(h, "    SetMeshOutputCounts({nidx}u * n, n);");
     let _ = writeln!(h, "    for (uint j = gi; j < n; j += {t}u) {{");
     let _ = writeln!(h, "        uint p = res.Load((rec + {tri_base}u + first + j) * 4u);");
     h.push_str("        uint3 x = uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu);\n");
-    h.push_str("        bool bad = or((p >> 31) != 0u, any(x >= nv));\n");
-    h.push_str("        [unroll] for (uint c = 0u; c < 3u; c++) {\n");
+    let _ = writeln!(h, "        bool bad = or((p >> 31) != 0u, any(x{xs} >= nv));");
+    let _ = writeln!(h, "        [unroll] for (uint c = 0u; c < {nidx}u; c++) {{");
     let _ = writeln!(h, "        uint b = (rec + {MESH_HEADER}u + select(bad, 0u, x[c]) * {vd}u) * 4u;");
     h.push_str(&fill);
-    h.push_str("        verts[3u * j + c] = o;\n        }\n");
-    h.push_str("        tris[j] = select(bad, uint3(0u, 0u, 0u), uint3(3u * j, 3u * j + 1u, 3u * j + 2u));\n    }\n}\n");
+    let _ = writeln!(h, "        verts[{nidx}u * j + c] = o;\n        }}");
+    let own = if ms.lines { "uint2(2u * j, 2u * j + 1u)" } else { "uint3(3u * j, 3u * j + 1u, 3u * j + 2u)" };
+    let _ = writeln!(h, "        tris[j] = select(bad, {zero}, {own});\n    }}\n}}");
     h
 }
 
@@ -5442,17 +5546,17 @@ fn passthrough_max_vertices(vbytes: u32) -> u32 {
 }
 
 /// Mesh groups the pass-through spends on one record: the record's vertices fit the mesh
-/// output limit as they are, or the triangles go out in runs whose own vertex copies (3 per
-/// triangle) fit. The layout choice in `mesh_passthrough_for` is by the vertex budget alone;
-/// this count is the dispatch's, and one compact group can carry a record whose whole
-/// declaration would be refused. `elements`: output elements besides SV_Position.
+/// output limit as they are, or the primitives go out in runs whose own vertex copies (3 per
+/// triangle, 2 per line) fit. The layout choice in `mesh_passthrough_for` is by the vertex
+/// budget alone; this count is the dispatch's, and one compact group can carry a record whose
+/// whole declaration would be refused. `elements`: output elements besides SV_Position.
 pub fn passthrough_split(ms: &MsInterface, elements: usize) -> u32 {
     let vbytes = 16 * (1 + elements as u32);
     let cap = passthrough_max_vertices(vbytes);
     if ms.max_vertices <= cap {
         return 1;
     }
-    let ppg = (cap / 3).max(1);
+    let ppg = (cap / if ms.lines { 2 } else { 3 }).max(1);
     ms.max_primitives.max(1).div_ceil(ppg)
 }
 
@@ -5460,9 +5564,20 @@ pub fn passthrough_split(ms: &MsInterface, elements: usize) -> u32 {
 pub fn passthrough_elements(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) -> usize {
     let slots = ranked(&ms.outputs, true);
     match ps_inputs {
-        None => slots.len(),
-        Some(ins) => ranked(ins, false).len() + slots.iter().filter(|o| matches!(o.system_value, 2 | 3)).count(),
+        None => out_rows(&ms.outputs).len(),
+        Some(ins) => super::signature_rows(ins).len() + slots.iter().filter(|o| matches!(o.system_value, 2 | 3)).count(),
     }
+}
+
+/// The pass-through of a pipeline and its mesh groups per record: with a pixel shader whose
+/// input signature is `ps_inputs`, its inputs (`mesh_passthrough_for`); without one (`None`,
+/// a depth-only pipeline) SV_Position and the clip / cull distances alone, as for a PS that
+/// reads nothing. No stage reads the other outputs there, and each would cost a signature row
+/// (over D3D12's 32 DXC refuses the shader, and the pipeline with it) and vertex output space
+/// (a record over the 32 KB mesh output limit goes out split, three vertex copies per triangle).
+pub fn pipeline_passthrough(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) -> (String, u32) {
+    let ins = Some(ps_inputs.unwrap_or(&[]));
+    (mesh_passthrough_for(ms, ins), passthrough_split(ms, passthrough_elements(ms, ins)))
 }
 
 fn hlsl_type(e: &SigElement) -> &'static str {
@@ -5473,13 +5588,20 @@ fn hlsl_type(e: &SigElement) -> &'static str {
     }
 }
 
-/// Components of an output element: clip/cull distances by their mask, the rest as 4-vectors.
-fn out_comps(e: &SigElement) -> usize {
+/// Register channels of an output element, in component order: clip/cull distances own the
+/// channels of their mask (a clip distance at .x and a cull distance at .y share a register),
+/// the rest are whole 4-vectors.
+fn out_channels(e: &SigElement) -> Vec<usize> {
     if matches!(e.system_value, 2 | 3) {
-        (8 - e.mask.leading_zeros()) as usize
+        (0..4).filter(|c| e.mask >> c & 1 == 1).collect()
     } else {
-        4
+        vec![0, 1, 2, 3]
     }
+}
+
+/// Components of an output element (see `out_channels`).
+fn out_comps(e: &SigElement) -> usize {
+    out_channels(e).len()
 }
 
 /// Interpolation modifier of every PS attribute from the I/J pair its v_interp uses.
@@ -5806,6 +5928,12 @@ fn ds_d16(name: &str) -> Option<(u32, bool, bool, u32)> {
     })
 }
 
+/// One memory window: `{t}_off + bytes <= num_records` for a raw (stride 0) buffer access,
+/// without 32-bit wrap (`raw_room` defines `{t}_in` and `{t}_room`).
+fn raw_in_range(t: &str, bytes: &str) -> String {
+    format!("and({t}_in, {bytes} <= {t}_room)")
+}
+
 /// The data a d16 store takes from VGPR `v` (half 1: the high 16 bits).
 fn d16_data(v: &str, half: u32) -> String {
     if half == 1 {
@@ -5925,14 +6053,25 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
         uint o1 = type == 0u ? 12u : (type == 3u ? 48u : 36u);
         uint o2 = type <= 1u ? 24u : (type == 2u ? 48u : 0u);
         float3 v0 = asfloat(mem.Load3(at + o0)), v1 = asfloat(mem.Load3(at + o1)), v2 = asfloat(mem.Load3(at + o2));
-        float3 e1 = v1 - v0, e2 = v2 - v0, p = cross(d, e2);
-        float det = dot(e1, p);
-        float3 sv = o - v0, q = cross(sv, e1);
-        float i = dot(sv, p), j = dot(d, q), t = dot(e2, q);
+        // `precise`: every step rounds on its own, as in the direct DXIL lowering and the CPU
+        // mirror (bvh::triangle_hit). Otherwise a driver may fuse a product of cross() into the
+        // subtraction after it (an fma) or reassociate det - i - j, a few ulps off, and a hit
+        // with det near 0 can turn into a miss.
+        precise float3 e1 = v1 - v0;
+        precise float3 e2 = v2 - v0;
+        precise float3 p = cross(d, e2);
+        precise float det = dot(e1, p);
+        precise float3 sv = o - v0;
+        precise float3 q = cross(sv, e1);
+        precise float i = dot(sv, p);
+        precise float j = dot(d, q);
+        precise float t = dot(e2, q);
+        precise float ij = i + j;
         // inside when i, j, 1 - i - j >= 0 relative to det (either winding); avoid det * det underflow/overflow
-        bool hit = det > 0.0f ? (i >= 0.0f && j >= 0.0f && i + j <= det) : (det < 0.0f && i <= 0.0f && j <= 0.0f && i + j >= det);
+        bool hit = det > 0.0f ? (i >= 0.0f && j >= 0.0f && ij <= det) : (det < 0.0f && i <= 0.0f && j <= 0.0f && ij >= det);
         // barycentrics back to the original vertex order: triangle id @60, per triangle I / J source
-        uint4 bc = asuint(float4(det - i - j, i, j, 0.0f));
+        precise float b0 = det - i - j;
+        uint4 bc = asuint(float4(b0, i, j, 0.0f));
         uint tid = mem.Load(at + 60u) >> (8u * type);
         return hit ? uint4(asuint(t), asuint(det), pick4(bc, tid & 3u), pick4(bc, (tid >> 2) & 3u)) : uint4(0x7F800000u, asuint(1.0f), 0u, 0u);
     }
@@ -6435,6 +6574,13 @@ int frexp_exp_f32(uint bits, float legacy_src, uint denorm) {
     if (fraction == 0u || denorm == 1u) return 0;
     return (int)firstbithigh(fraction) - 148;
 }
+// A NaN operand as RDNA2's VALU returns it: quiet (bit 22 set), sign and payload kept; any
+// other value unchanged. ldexp_f and frexp_mant return a NaN x as it is.
+float quiet_f(float x) {
+    uint u = asuint(x);
+    if ((u & 0x7FFFFFFFu) > 0x7F800000u) return asfloat(u | 0x00400000u);
+    return x;
+}
 // Exact f32 x * 2^n on the IEEE-754 bits: handles |n| >= 127, ±0, ±inf, NaN, and subnormals
 // without exp2() overflow/underflow or FTZ flushing.
 float ldexp_f(float x, int n) {
@@ -6488,6 +6634,13 @@ int frexp_exp_d(double x) {
 // f64 classes from the bits. DXC narrows isinf and isnan of a double to f32, so 1e300 tested as inf.
 bool isnan_d(double x) { uint l, h; asuint(x, l, h); h &= 0x7FFFFFFFu; return h > 0x7FF00000u || (h == 0x7FF00000u && l != 0u); }
 bool isinf_d(double x) { uint l, h; asuint(x, l, h); return (h & 0x7FFFFFFFu) == 0x7FF00000u && l == 0u; }
+// A NaN operand as RDNA2's VALU returns it: quiet (bit 51 set), sign and payload kept; any
+// other value unchanged. The f64 helpers below return a NaN x as it is.
+double quiet_d(double x) {
+    uint l, h; asuint(x, l, h);
+    if (isnan_d(x)) return asdouble(l, h | 0x00080000u);
+    return x;
+}
 // f64 rounding on the bits. An int64_t cast breaks at |x| >= 2^63, on inf and NaN, and on the
 // sign of zero. |x| >= 2^52, inf and NaN are already integral, and |x| < 1 gives a zero of x's sign.
 double trunc_d(double x) {
@@ -6536,12 +6689,14 @@ double sqrt_d(double x) {
     return ldexp_d(y, k);
 }
 // 1/x. DXC marks a plain divide fast (no NaN, no infinities), and a driver may then give 0 for
-// 1/NaN (RADV: v_rsq_f64 of a negative number was 0, not NaN). NaN, ±0 and ±inf are taken here.
-// The rest divides the mantissa (x scaled into [0.5, 1)), `precise`, and scales back with
-// ldexp_d, so a result below 2^-1022 is a denormal and not flushed to 0 (RADV: 1/DBL_MAX was 0).
+// 1/NaN (RADV: v_rsq_f64 of a negative number was 0, not NaN). NaN, ±0 and ±inf are taken here:
+// a NaN comes back quiet with its payload, as the hardware's divide returns it (a signalling
+// NaN gets the quiet bit). The rest divides the mantissa (x scaled into [0.5, 1)), `precise`,
+// and scales back with ldexp_d, so a result below 2^-1022 is a denormal and not flushed to 0
+// (RADV: 1/DBL_MAX was 0).
 double rcp_d(double x) {
     uint l, h; asuint(x, l, h);
-    if (isnan_d(x)) return x;
+    if (isnan_d(x)) return asdouble(l, h | 0x00080000u);
     if (x == 0.0) return asdouble(0u, (h & 0x80000000u) | 0x7FF00000u);
     if (isinf_d(x)) return asdouble(0u, h & 0x80000000u);
     int e = frexp_exp_d(x);
@@ -6603,7 +6758,21 @@ uint fclass64(double f) {
 
 #[cfg(test)]
 mod tests {
-    use super::PRELUDE_MEM;
+    use super::{PRELUDE, PRELUDE_MEM};
+
+    /// v_rcp_f64 / v_rsq_f64 (rcp_d) of a signalling NaN: the quiet NaN with the same payload,
+    /// as RDNA2's VALU and the direct DXIL path's divide return it, not the input's bits.
+    #[test]
+    fn rcp_d_quiets_a_nan_and_keeps_its_payload() {
+        assert!(PRELUDE.contains("if (isnan_d(x)) return asdouble(l, h | 0x00080000u);"), "rcp_d");
+        // the expression on the bits of the sNaN 0x7FF00000_00000001
+        let (l, h) = (1u32, 0x7FF0_0000u32);
+        let q = ((h | 0x0008_0000) as u64) << 32 | l as u64;
+        assert_eq!(q, 0x7FF8_0000_0000_0001);
+        assert!(f64::from_bits(q).is_nan());
+        // a quiet NaN is unchanged
+        assert_eq!(0x7FF8_0000u32 | 0x0008_0000, 0x7FF8_0000);
+    }
 
     #[test]
     fn format_helpers_select_uint4_components_without_runtime_indexing() {
@@ -6613,5 +6782,29 @@ mod tests {
         assert!(!PRELUDE_MEM.contains("bc[tid"), "runtime local-array index remains in bvh_intersect");
         assert!(PRELUDE_MEM.contains("uint pick4(uint4 v, uint i)"));
         assert!(PRELUDE_MEM.contains("void or_at4(inout uint4 r, uint i, uint v)"));
+    }
+
+    /// The triangle test of bvh_intersect rounds every step (no fma contraction, no
+    /// reassociation), as the direct DXIL lowering and bvh::triangle_hit do.
+    #[test]
+    fn bvh_triangle_test_is_precise() {
+        let at = PRELUDE_MEM.find("if (type <= 3u) {").expect("triangle branch");
+        let tri = &PRELUDE_MEM[at..];
+        for line in [
+            "precise float3 e1 = v1 - v0;",
+            "precise float3 e2 = v2 - v0;",
+            "precise float3 p = cross(d, e2);",
+            "precise float det = dot(e1, p);",
+            "precise float3 sv = o - v0;",
+            "precise float3 q = cross(sv, e1);",
+            "precise float i = dot(sv, p);",
+            "precise float j = dot(d, q);",
+            "precise float t = dot(e2, q);",
+            "precise float ij = i + j;",
+            "precise float b0 = det - i - j;",
+        ] {
+            assert!(tri.contains(line), "{line}");
+        }
+        assert!(!tri.contains("float3 e1 = v1 - v0, e2"), "an imprecise declaration is left");
     }
 }

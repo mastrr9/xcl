@@ -124,6 +124,12 @@ pub struct D3d12Stats {
     /// why console shaders could not be used (first messages)
     #[serde(default)]
     pub translation_errors: Vec<String>,
+    /// pipelines left without a translation (all of them, past the first messages) …
+    #[serde(default)]
+    pub pipelines_without_translation: u64,
+    /// … by reason, most first (`refusal_reason`)
+    #[serde(default)]
+    pub without_translation_by_reason: Vec<(String, u64)>,
     /// pipelines built in the background behind a stand-in: built, failed, still building
     #[serde(default)]
     pub background_pipelines: (usize, usize, usize),
@@ -387,6 +393,7 @@ pub fn stats() -> D3d12Stats {
         })
         .unwrap_or_default();
     let (presents, boundaries) = super::present::counters();
+    let refusals = REFUSALS.lock().map(|r| (r.total, r.by_count())).unwrap_or_default();
     D3d12Stats {
         backend: format!("{:?}", super::backend()).to_lowercase(),
         adapter: ADAPTER.lock().map(|a| a.clone()).unwrap_or_default(),
@@ -408,6 +415,8 @@ pub fn stats() -> D3d12Stats {
         uma_import_check: UMA_IMPORT_CHECK.lock().map(|e| e.clone()).unwrap_or_default(),
         translated_pipelines: TRANSLATED_PSO.load(Ordering::Relaxed),
         translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.clone()).unwrap_or_default(),
+        pipelines_without_translation: refusals.0,
+        without_translation_by_reason: refusals.1,
         background_pipelines: super::pso_async::counts(),
         dxil_cache: crate::gpu::recomp::dxc::cache_stats(),
     }
@@ -3849,6 +3858,223 @@ fn attempt<R>(f: impl FnOnce() -> R) -> (R, bool) {
     (r, missed)
 }
 
+/// Pipelines left without a translation, counted by reason: every one, also past the 40 texts
+/// `note_translation_error` logs one by one: a text with a shader hash in it uses one of the 40
+/// per pipeline, and one driver refusal text stands for every pipeline refused with that HRESULT,
+/// so the log could not tell how many pipelines were refused, or why. The summary goes to the
+/// log when the count reaches 32, 64, 128 …, and once more when the report is written
+/// (`log_refusal_summary`); `report.json` has the counts.
+static REFUSALS: Mutex<Refusals> = Mutex::new(Refusals::new());
+
+/// reasons counted by name; the rest are "other reasons"
+const MAX_REFUSAL_REASONS: usize = 24;
+
+struct Refusals {
+    total: u64,
+    /// (reason, count), in the order first seen
+    by_reason: Vec<(String, u64)>,
+    /// refusals of a reason past the first `MAX_REFUSAL_REASONS`
+    other: u64,
+    /// `total` in the last summary logged
+    logged: u64,
+}
+
+impl Refusals {
+    const fn new() -> Self {
+        Refusals { total: 0, by_reason: Vec::new(), other: 0, logged: 0 }
+    }
+
+    /// Count one refusal; the summary to log when the count reaches 32, 64, 128 …
+    fn note(&mut self, reason: String) -> Option<String> {
+        self.total += 1;
+        if let Some(r) = self.by_reason.iter_mut().find(|r| r.0 == reason) {
+            r.1 += 1;
+        } else if self.by_reason.len() < MAX_REFUSAL_REASONS {
+            self.by_reason.push((reason, 1));
+        } else {
+            self.other += 1;
+        }
+        (self.total >= 32 && self.total.is_power_of_two()).then(|| self.summary())
+    }
+
+    /// The summary once more, if anything was counted after the last one logged.
+    fn final_summary(&mut self) -> Option<String> {
+        (self.total > self.logged).then(|| self.summary())
+    }
+
+    /// (reason, count), most first; ties in the order first seen
+    fn by_count(&self) -> Vec<(String, u64)> {
+        let mut v = self.by_reason.clone();
+        v.sort_by_key(|r| std::cmp::Reverse(r.1));
+        if self.other > 0 {
+            v.push(("other reasons".into(), self.other));
+        }
+        v
+    }
+
+    fn summary(&mut self) -> String {
+        self.logged = self.total;
+        let reasons: Vec<String> = self.by_count().iter().map(|(r, n)| format!("{n} × {r}")).collect();
+        format!("{} console pipelines without a translation so far; by reason: {}", self.total, reasons.join(", "))
+    }
+}
+
+/// What a translation error is counted under in `REFUSALS`: short, and the same for every
+/// pipeline it stands for (no shader hashes, sizes or subobject lists; the HRESULT by name).
+/// None: not a refusal, the pipeline is built all the same (a rect list drawn as triangles).
+fn refusal_reason(e: &str) -> Option<String> {
+    if e.contains("rect list drawn as triangles") {
+        return None;
+    }
+    let two_pass = if e.contains("console GS") { "VS+GS" } else { "mesh" };
+    let r = if let Some(what) = e.strip_prefix("the driver rejected the ") {
+        let what = if what.starts_with("mesh pipeline") {
+            format!("{two_pass} pipeline")
+        } else if what.contains("compute pass") {
+            format!("{two_pass} compute pass")
+        } else if what.starts_with("compute") {
+            "compute pipeline".into()
+        } else {
+            "graphics pipeline".into()
+        };
+        format!("{what}: driver refused ({})", hresult_name(e))
+    } else if e.starts_with("mesh pipeline with its MS") {
+        "mesh: MS in the AS slot".into()
+    } else if e.starts_with("mesh pipeline with AS") {
+        "mesh: AS and MS".into()
+    } else if e.starts_with("PSO with HS/DS") {
+        "graphics: HS/DS".into()
+    } else if e.starts_with("XCL ABI root signature") {
+        "XCL ABI root signature".into()
+    } else {
+        // a stage's translation: "MS: unknown MS interface (…)", "PS: incomplete translation,
+        // missing: […]", "CS: dxc: …": its first words, a word with a digit in it as #
+        let (stage, why) = match e.split_once(": ") {
+            Some((s, w)) if ["VS", "PS", "CS", "MS", "VS+GS"].contains(&s) => (s, w),
+            _ => ("", e),
+        };
+        let head = why.split([':', '(', ',', ';', '\n']).next().unwrap_or_default();
+        let head: Vec<&str> = head.split_whitespace().map(|w| if w.bytes().any(|b| b.is_ascii_digit()) { "#" } else { w }).collect();
+        if stage.is_empty() {
+            head.join(" ")
+        } else {
+            format!("{stage}: {}", head.join(" "))
+        }
+    };
+    Some(r.chars().take(64).collect())
+}
+
+/// The HRESULT in a translation error ("… (0x80070057)"), by name if it is a common one.
+fn hresult_name(e: &str) -> String {
+    let Some(at) = e.find("0x") else { return "no HRESULT".into() };
+    let hex: String = e[at + 2..].chars().take_while(char::is_ascii_hexdigit).take(8).collect();
+    match u32::from_str_radix(&hex, 16).map(|h| h as HRESULT) {
+        Ok(E_INVALIDARG) => "E_INVALIDARG".into(),
+        Ok(E_OUTOFMEMORY) => "E_OUTOFMEMORY".into(),
+        Ok(h) if h == DXGI_ERROR_DEVICE_REMOVED.0 => "DXGI_ERROR_DEVICE_REMOVED".into(),
+        Ok(h) if h == windows::Win32::Foundation::E_FAIL.0 => "E_FAIL".into(),
+        _ => format!("0x{hex}"),
+    }
+}
+
+/// The summary of pipelines without a translation once more, if any were counted after the
+/// last one logged: the report is written (the title ends, or crashed).
+pub fn log_refusal_summary() {
+    // never waits: a crash may have left the lock held by this very thread
+    let Ok(mut g) = REFUSALS.try_lock() else { return };
+    if let Some(s) = g.final_summary() {
+        drop(g);
+        crate::xlog_warn!("D3D12.X: {s}");
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    fn as_slot(i: u64) -> String {
+        format!("mesh pipeline with its MS {:016x} in the AS slot – refused", 0x5eed_0000_0000_0001 ^ i)
+    }
+
+    #[test]
+    fn every_refusal_is_counted_past_the_forty_logged_texts() {
+        let mut r = Refusals::new();
+        let mut summaries = Vec::new();
+        for i in 0..1000 {
+            let e = if i % 4 == 0 { "the driver rejected the mesh pipeline from the console MS (0x80070057)".to_string() } else { as_slot(i) };
+            summaries.extend(r.note(refusal_reason(&e).unwrap()));
+        }
+        assert_eq!(r.total, 1000);
+        assert_eq!(r.by_count(), vec![("mesh: MS in the AS slot".to_string(), 750), ("mesh pipeline: driver refused (E_INVALIDARG)".to_string(), 250)]);
+        // at 32, 64, 128, 256, 512: a few lines for a title that refuses thousands
+        assert_eq!(summaries.len(), 5);
+        assert_eq!(summaries[0], "32 console pipelines without a translation so far; by reason: 24 × mesh: MS in the AS slot, 8 × mesh pipeline: driver refused (E_INVALIDARG)");
+        assert_eq!(r.final_summary().as_deref(), Some("1000 console pipelines without a translation so far; by reason: 750 × mesh: MS in the AS slot, 250 × mesh pipeline: driver refused (E_INVALIDARG)"));
+        assert_eq!(r.final_summary(), None, "the report is written twice (window closed, process detach): one summary");
+        r.note("mesh: AS and MS".into());
+        assert!(r.final_summary().is_some(), "a refusal after the last summary");
+    }
+
+    #[test]
+    fn reasons_are_bounded_with_an_other_bucket() {
+        let mut r = Refusals::new();
+        for i in 0..100u64 {
+            r.note(format!("reason {i}"));
+            r.note("reason 0".into());
+        }
+        assert_eq!(r.total, 200);
+        assert_eq!(r.by_reason.len(), MAX_REFUSAL_REASONS);
+        let c = r.by_count();
+        assert_eq!(c[0], ("reason 0".to_string(), 101));
+        assert_eq!(c.last(), Some(&("other reasons".to_string(), 100 - MAX_REFUSAL_REASONS as u64)));
+        assert_eq!(c.iter().map(|x| x.1).sum::<u64>(), 200);
+        assert!(r.summary().ends_with(&format!("1 × reason 23, {} × other reasons", 100 - MAX_REFUSAL_REASONS)));
+    }
+
+    #[test]
+    fn nothing_counted_no_summary() {
+        let mut r = Refusals::new();
+        assert_eq!(r.final_summary(), None);
+        assert!(r.by_count().is_empty());
+        for _ in 0..31 {
+            assert_eq!(r.note("x".into()), None);
+        }
+        assert!(r.note("x".into()).is_some());
+        assert_eq!(r.final_summary(), None, "32 were in the summary just logged");
+    }
+
+    #[test]
+    fn a_reason_has_no_hashes_sizes_or_subobject_lists() {
+        let reason = |e: &str| refusal_reason(e).unwrap();
+        assert_eq!(reason(&as_slot(7)), reason(&as_slot(8)));
+        assert_eq!(reason(&as_slot(7)), "mesh: MS in the AS slot");
+        assert_eq!(reason("mesh pipeline with AS 0123456789abcdef (MS fedcba9876543210) – not supported yet; subobjects [0, 24, 25, 2]"), "mesh: AS and MS");
+        assert_eq!(reason("the driver rejected the mesh pipeline from the console MS (0x8007000e)"), "mesh pipeline: driver refused (E_OUTOFMEMORY)");
+        assert_eq!(reason("the driver rejected the mesh pipeline from the console GS (0x80070057)"), "VS+GS pipeline: driver refused (E_INVALIDARG)");
+        assert_eq!(reason("the driver rejected the compute pass of the console MS (0x887a0005)"), "mesh compute pass: driver refused (DXGI_ERROR_DEVICE_REMOVED)");
+        assert_eq!(reason("the driver rejected the compute pass of the console GS (0x80004005)"), "VS+GS compute pass: driver refused (E_FAIL)");
+        assert_eq!(reason("the driver rejected the compute PSO with the translated CS (0x80070057)"), "compute pipeline: driver refused (E_INVALIDARG)");
+        assert_eq!(
+            reason("the driver rejected the PSO with the translated shaders (0x887a0006; topology type 3, 1 render targets, DSV format 0, HS false, GS false)"),
+            "graphics pipeline: driver refused (0x887a0006)"
+        );
+        assert_eq!(reason("MS: unknown MS interface (e.g. lines / points)"), "MS: unknown MS interface");
+        assert_eq!(reason("MS: no NGG hardware variant"), "MS: no NGG hardware variant");
+        assert_eq!(reason("PS: incomplete translation, missing: [\"image_sample_c\"]"), "PS: incomplete translation");
+        assert_eq!(reason("CS: dxc: hlsl.hlsl:12:3: error: too many"), "CS: dxc");
+        assert_eq!(reason("VS+GS: 4096 B of output over the limit"), "VS+GS: # B of output over the limit");
+        assert_eq!(reason("PSO with HS/DS – not supported yet"), "graphics: HS/DS");
+        assert_eq!(reason("XCL ABI root signature with static samplers: 0x80070057"), "XCL ABI root signature");
+        assert!(reason(&"a long unknown failure ".repeat(10)).chars().count() <= 64);
+    }
+
+    #[test]
+    fn a_rect_list_drawn_as_triangles_is_not_a_refusal() {
+        assert_eq!(refusal_reason("the driver rejected the PSO with the rect list GS (0x80070057): rect list drawn as triangles"), None);
+        assert_eq!(refusal_reason("rect list drawn as triangles: no position output"), None);
+    }
+}
+
 fn note_translation_error(e: String) {
     // a refusal `with_switch_fallback` builds again in the switch form (it says so itself)
     if HEAP_WINDOW_OOM.with(|o| o.get()) {
@@ -3857,6 +4083,9 @@ fn note_translation_error(e: String) {
     if crate::gpu::recomp::dxc::in_cached_only() {
         ATTEMPT_NOTES.with(|n| n.borrow_mut().push(e));
         return;
+    }
+    if let Some(summary) = refusal_reason(&e).and_then(|r| REFUSALS.lock().unwrap().note(r)) {
+        crate::xlog_warn!("D3D12.X: {summary}");
     }
     // each different reason once (the first five only hid a retail game's "mesh pipeline with
     // AS" behind five earlier ones)
@@ -4028,8 +4257,8 @@ fn compile_slots(bytes: usize) -> &'static Slots {
 }
 
 /// A driver compile of `bytes` of DXIL through `build`: a huge one on an `xcl-pso*` worker
-/// waits for its slot first (`big_compile_turn`; not a title thread's, nor one the title waits
-/// for). Logs its time, size and whether it was gated.
+/// waits for its slot first (`big_compile_turn`). Wanted workers bypass the commit wait within
+/// the wanted slot cap. Logs the compile time, size and whether it was gated.
 fn driver_compile<R>(kind: &str, bytes: usize, gate: bool, build: impl FnOnce() -> R) -> R {
     driver_compile_identified(kind, bytes, gate, None, build).0
 }
@@ -4046,7 +4275,8 @@ fn pso_trace() -> bool {
 fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
     let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let _slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
+    // Huge cold compiles on a title thread reserve headroom without taking a worker slot.
+    let admitted = (gate && bytes >= huge_pso_bytes()).then(|| big_compile_admission(bytes, huge));
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -4055,10 +4285,15 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
         let record = record.map_or_else(String::new, |(hash, cached)| {
             format!(", record {hash:016x}, driver blob {}", if cached { "supplied" } else { "absent" })
         });
-        crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{record}");
+        let in_flight = admitted.as_ref().map_or_else(String::new, |_| {
+            let (headroom, compiles) = COMMIT_IN_FLIGHT.in_flight();
+            format!(", {compiles} huge in flight with {} MB of headroom", headroom >> 20)
+        });
+        crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{record}{in_flight}");
     }
     let started = std::time::Instant::now();
     let r = build();
+    drop(admitted);
     let took = started.elapsed();
     if log {
         crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_pso_bytes(), huge, waited));
@@ -4082,21 +4317,23 @@ fn gate_compute_driver_compile(has_cached_blob: bool) -> bool {
 }
 
 /// Before a big driver compile in the background: its turn – unwanted builds wait for both
-/// `slots.most()` and commit headroom (`commit_free`, from `big_compile_headroom`) before taking a
-/// slot so an unwanted commit-blocked compile never starves a wanted build. When a title thread
+/// `slots.most()` and commit headroom before taking a slot. An unwanted build waiting for
+/// commit therefore leaves its slot available to wanted builds. When a title thread
 /// waits for the pipeline (`wanted`), it bypasses the commit wait and can use up to
 /// `slots.wanted_most()` (default 2 for `>= 256 KB`, 1 for `>= 4 MiB` giant shaders) so a wanted
 /// build is not stuck behind 1 background build while a burst of lazy binds still cannot spike
 /// driver compiler commit into OOM.
-fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool) -> SlotGuard {
+fn big_compile_turn<R>(slots: &'static Slots, admit: impl Fn(bool) -> Option<R>, wanted: impl Fn() -> bool) -> (SlotGuard, R) {
     const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
     let mut n = slots.n.lock().unwrap();
     loop {
         let is_wanted = wanted();
         let cap = if is_wanted { slots.wanted_most() } else { slots.most() };
-        if *n < cap && (is_wanted || commit_free()) {
-            *n += 1;
-            return SlotGuard(slots);
+        if *n < cap {
+            if let Some(reservation) = admit(is_wanted) {
+                *n += 1;
+                return (SlotGuard(slots), reservation);
+            }
         }
         n = slots.cv.wait_timeout(n, LOOK).unwrap().0;
     }
@@ -4108,15 +4345,148 @@ fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wante
 /// (#1269), and programs of ~1 MB took several GB each on an 8 GB card (same issue). The floor
 /// leaves every program up to 6 MiB of DXIL waiting for exactly what it waited for before.
 fn big_compile_headroom(dxil_len: usize) -> u64 {
-    (3u64 << 30).max(dxil_len as u64 * 512)
+    (3u64 << 30).max((dxil_len as u64).saturating_mul(512))
 }
 
-/// That much commit is free (true when that is not known).
-fn big_compile_commit_free(need: u64) -> bool {
+/// The commit free now (None when that is not known: a compile then goes on, as before).
+fn big_compile_commit_available() -> Option<u64> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPageFile >= need }
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPageFile)
+}
+
+/// The headroom (`big_compile_headroom`) of the huge cold driver compiles in flight on any
+/// thread: background workers, wanted workers, and title threads. The
+/// commit free is read before the driver has taken anything for a compile, so the compiles that
+/// look at about the same time each see all of it: one in each lane (`compile_slots`), more with
+/// `XCL_HUGE_PSO_CONCURRENCY`, and any beside title-thread or wanted compiles (which bypass the
+/// commit wait). In the model of the tests, four 2 MB programs taking 2.5 GB each all start on 8 GB
+/// free with `XCL_HUGE_PSO_CONCURRENCY=4`, and a 16 MB program in the giant lane starts on 10 GB
+/// beside a 1 MB one and a title thread's: 10 – 10.5 GB taken. A gated compile now goes when the
+/// commit free beyond the others' headroom is its own (`commit_admits`); with none in flight
+/// that is the check as it was.
+static COMMIT_IN_FLIGHT: CommitBudget = CommitBudget::new();
+
+/// Whether a compile asking for `need` of commit may start with `free` now, `reserved` by the
+/// compiles in flight and `claimed` set aside for an older waiter (`CommitBudget`).
+fn commit_admits(need: u64, free: u64, reserved: u64, claimed: u64) -> bool {
+    free.saturating_sub(reserved).saturating_sub(claimed) >= need
+}
+
+/// The commit huge driver compiles in flight asked for (`COMMIT_IN_FLIGHT`).
+struct CommitBudget(Mutex<Budget>);
+
+struct Budget {
+    /// headroom of the compiles in flight, summed
+    reserved: u64,
+    compiles: usize,
+    /// a waiting compile that would go once the ones in flight are done (its ticket, its
+    /// headroom): compiles that come after it leave it that room – a stream of 1 MB programs in
+    /// the big lane does not keep a giant one waiting until the last of them is built
+    claim: Option<(u64, u64)>,
+    tickets: u64,
+}
+
+/// A compile's headroom in flight (`CommitBudget`), until it is dropped (also in a panic).
+struct CommitReservation<'a>(&'a CommitBudget, u64);
+
+/// A compile waiting for its commit (`CommitBudget::try_reserve`); its claim goes when it is dropped.
+struct CommitWaiter<'a>(&'a CommitBudget, u64);
+
+impl CommitBudget {
+    const fn new() -> CommitBudget {
+        CommitBudget(Mutex::new(Budget { reserved: 0, compiles: 0, claim: None, tickets: 0 }))
+    }
+
+    fn budget(&self) -> std::sync::MutexGuard<'_, Budget> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn waiting(&self) -> CommitWaiter<'_> {
+        let mut b = self.budget();
+        b.tickets += 1;
+        CommitWaiter(self, b.tickets)
+    }
+
+    /// `need` of headroom in flight now, without waiting (a title thread's, or a wanted one).
+    fn reserve(&self, need: u64) -> CommitReservation<'_> {
+        let mut b = self.budget();
+        b.reserved = b.reserved.saturating_add(need);
+        b.compiles += 1;
+        CommitReservation(self, need)
+    }
+
+    /// `need` in flight if `free` (None: not known) lets it in beside the others (`commit_admits`).
+    /// Otherwise the waiter claims the room it needs when it would go once the ones in flight
+    /// are done, and gives its claim back when not even that.
+    fn try_reserve(&self, waiter: &CommitWaiter<'_>, need: u64, free: Option<u64>) -> Option<CommitReservation<'_>> {
+        let mut b = self.budget();
+        let mine = b.claim.is_some_and(|(ticket, _)| ticket == waiter.1);
+        let claimed = if mine { 0 } else { b.claim.map_or(0, |(_, n)| n) };
+        if free.is_none_or(|free| commit_admits(need, free, b.reserved, claimed)) {
+            if mine {
+                b.claim = None;
+            }
+            b.reserved = b.reserved.saturating_add(need);
+            b.compiles += 1;
+            return Some(CommitReservation(self, need));
+        }
+        let after_them = free.is_some_and(|free| free.saturating_add(b.reserved) >= need);
+        if after_them && b.claim.is_none() {
+            b.claim = Some((waiter.1, need));
+        } else if !after_them && mine {
+            b.claim = None;
+        }
+        None
+    }
+
+    /// (headroom in flight, compiles in flight)
+    fn in_flight(&self) -> (u64, usize) {
+        let b = self.budget();
+        (b.reserved, b.compiles)
+    }
+}
+
+impl Drop for CommitReservation<'_> {
+    fn drop(&mut self) {
+        let mut b = self.0.budget();
+        b.reserved = b.reserved.saturating_sub(self.1);
+        b.compiles = b.compiles.saturating_sub(1);
+    }
+}
+
+impl Drop for CommitWaiter<'_> {
+    fn drop(&mut self) {
+        let mut b = self.0.budget();
+        if b.claim.is_some_and(|(ticket, _)| ticket == self.1) {
+            b.claim = None;
+        }
+    }
+}
+
+/// A huge cold driver compile of `bytes`: a worker's waits for its turn (`wait`,
+/// `big_compile_turn`) with the commit for it beyond what the ones in flight asked for; one that
+/// bypasses the commit wait (a title thread's or a wanted one) is in flight all the same.
+fn big_compile_admission(bytes: usize, wait: bool) -> (Option<SlotGuard>, CommitReservation<'static>) {
+    let need = big_compile_headroom(bytes);
+    if !wait {
+        return (None, COMMIT_IN_FLIGHT.reserve(need));
+    }
+    big_compile_admitted(compile_slots(bytes), &COMMIT_IN_FLIGHT, need, big_compile_commit_available, super::pso_async::build_is_wanted)
+}
+
+/// `big_compile_admission` with the slots, the budget, the commit reading and `wanted` given.
+fn big_compile_admitted<'a>(slots: &'static Slots, budget: &'a CommitBudget, need: u64, free: impl Fn() -> Option<u64>, wanted: impl Fn() -> bool) -> (Option<SlotGuard>, CommitReservation<'a>) {
+    let waiter = budget.waiting();
+    let (slot, reservation) = big_compile_turn(slots, |is_wanted| {
+        if is_wanted {
+            Some(budget.reserve(need))
+        } else {
+            budget.try_reserve(&waiter, need, free())
+        }
+    }, wanted);
+    (Some(slot), reservation)
 }
 
 #[cfg(test)]
@@ -4124,6 +4494,10 @@ mod big_compile_tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
+
+    fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool) -> SlotGuard {
+        super::big_compile_turn(slots, |is_wanted| (is_wanted || commit_free()).then_some(()), wanted).0
+    }
 
     #[test]
     fn wanted_builds_bypass_commit_and_unwanted_slot_but_respect_hard_cap() {
@@ -4305,6 +4679,239 @@ mod big_compile_tests {
         drop(first);
         t.join().unwrap();
         assert_eq!(*S.n.lock().unwrap(), 0);
+    }
+
+    const GB: u64 = 1 << 30;
+
+    #[test]
+    fn with_none_in_flight_a_compile_goes_on_the_commit_free_as_before() {
+        for free in [0, 2 * GB, 3 * GB, 16 * GB] {
+            for need in [3 * GB, 8 * GB] {
+                assert_eq!(commit_admits(need, free, 0, 0), free >= need);
+                let b = CommitBudget::new();
+                assert_eq!(b.try_reserve(&b.waiting(), need, Some(free)).is_some(), free >= need);
+            }
+        }
+        // the others' headroom and an older waiter's claim come off what is free
+        assert!(!commit_admits(3 * GB, 10 * GB, 8 * GB, 0));
+        assert!(!commit_admits(3 * GB, 10 * GB, 0, 8 * GB));
+        assert!(commit_admits(3 * GB, 14 * GB, 3 * GB, 8 * GB));
+        assert!(!commit_admits(1, 0, u64::MAX, u64::MAX));
+        assert_eq!(big_compile_headroom(usize::MAX), u64::MAX, "(no overflow)");
+        // not known: on, as before – and in flight
+        let b = CommitBudget::new();
+        let r = b.try_reserve(&b.waiting(), 3 * GB, None).expect("on without a reading");
+        assert_eq!(b.in_flight(), (3 * GB, 1));
+        drop(r);
+        assert_eq!(b.in_flight(), (0, 0));
+    }
+
+    #[test]
+    fn compiles_in_both_lanes_that_read_the_same_free_commit_do_not_both_start() {
+        static BIG: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1 };
+        static GIANT: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1 };
+        static B: CommitBudget = CommitBudget::new();
+        // 10 GB free throughout (the driver has taken nothing yet): each fits, both do not
+        let free = || Some(10 * GB);
+        let (giant_need, big_need) = (big_compile_headroom(16 << 20), big_compile_headroom(1 << 20));
+        assert!(giant_need <= 10 * GB && big_need <= 10 * GB && giant_need + big_need > 10 * GB);
+        let giant = big_compile_admitted(&GIANT, &B, giant_need, free, || false);
+        assert!(giant.0.is_some());
+        let t = std::thread::spawn(move || big_compile_admitted(&BIG, &B, big_need, free, || false).0.is_some());
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!t.is_finished(), "the big lane's compile waits for the giant one's headroom");
+        assert_eq!(*BIG.n.lock().unwrap(), 0, "a commit-blocked worker leaves its slot free");
+        drop(giant);
+        assert!(t.join().unwrap());
+        assert_eq!((B.in_flight(), *BIG.n.lock().unwrap(), *GIANT.n.lock().unwrap()), ((0, 0), 0, 0));
+    }
+
+    #[test]
+    fn wanted_and_title_thread_compiles_bypass_commit_wait_but_reserve_headroom() {
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 2, wanted_most: 2 };
+        static B: CommitBudget = CommitBudget::new();
+        let t0 = Instant::now();
+        let wanted = big_compile_admitted(&S, &B, 3 * GB, || Some(0), || true);
+        assert!(wanted.0.is_some() && t0.elapsed() < Duration::from_secs(1), "wanted slot, no commit wait");
+        assert_eq!(B.in_flight(), (3 * GB, 1), "in flight all the same");
+        // a background compile beside it: 5 GB free leaves it 2 GB
+        let t = std::thread::spawn(|| big_compile_admitted(&S, &B, 3 * GB, || Some(5 * GB), || false).0.is_some());
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!t.is_finished(), "the wanted one's headroom is in flight");
+        drop(wanted);
+        assert!(t.join().unwrap(), "its turn once the wanted one is done");
+        assert_eq!(B.in_flight(), (0, 0));
+        // a title thread's huge cold compile is in flight while the driver has it
+        let seen = std::thread::spawn(|| driver_compile("test", huge_pso_bytes(), true, || COMMIT_IN_FLIGHT.in_flight().1)).join().unwrap();
+        assert!(seen >= 1);
+    }
+
+    #[test]
+    fn a_giant_compile_is_not_kept_waiting_by_later_smaller_ones() {
+        let (b, free) = (CommitBudget::new(), 10 * GB);
+        let first = b.try_reserve(&b.waiting(), 3 * GB, Some(free)).expect("a 1 MB program");
+        let giant = b.waiting();
+        assert!(b.try_reserve(&giant, 8 * GB, Some(free)).is_none(), "the first one's headroom is in flight");
+        // the next 1 MB program would fit beside the first (10 - 3 >= 3), but not before the giant one
+        let next = b.waiting();
+        assert!(b.try_reserve(&next, 3 * GB, Some(free)).is_none());
+        drop(first);
+        assert!(b.try_reserve(&next, 3 * GB, Some(free)).is_none(), "not even when it looks first");
+        let built = b.try_reserve(&giant, 8 * GB, Some(free)).expect("the giant one's turn");
+        drop(giant);
+        assert!(b.try_reserve(&next, 3 * GB, Some(free)).is_none());
+        drop(built);
+        assert!(b.try_reserve(&next, 3 * GB, Some(free)).is_some());
+    }
+
+    #[test]
+    fn a_claim_holds_back_nothing_its_compile_cannot_use_and_goes_with_it() {
+        let b = CommitBudget::new();
+        let _first = b.reserve(3 * GB);
+        // 15 GB asked for, 7 GB free and 3 GB in flight: not even once that is done – no claim
+        assert!(b.try_reserve(&b.waiting(), 15 * GB, Some(7 * GB)).is_none());
+        let w = b.waiting();
+        assert!(b.try_reserve(&w, 3 * GB, Some(7 * GB)).is_some());
+        // a claim goes when the commit falls short of it
+        let b = CommitBudget::new();
+        let _first = b.reserve(3 * GB);
+        let giant = b.waiting();
+        assert!(b.try_reserve(&giant, 8 * GB, Some(6 * GB)).is_none(), "6 + 3 >= 8: it claims");
+        let small = b.waiting();
+        assert!(b.try_reserve(&small, GB, Some(6 * GB)).is_none());
+        assert!(b.try_reserve(&giant, 8 * GB, Some(4 * GB)).is_none(), "4 + 3 < 8: the claim goes");
+        assert!(b.try_reserve(&small, GB, Some(4 * GB)).is_some());
+        // … and with its waiter, a turn and a reservation with their compile, also in a panic
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1 };
+        static B: CommitBudget = CommitBudget::new();
+        let held = B.reserve(3 * GB);
+        let failed = std::thread::spawn(|| {
+            let w = B.waiting();
+            assert!(B.try_reserve(&w, 8 * GB, Some(6 * GB)).is_none());
+            panic!("a build that fails while it waits");
+        });
+        assert!(failed.join().is_err());
+        assert!(B.try_reserve(&B.waiting(), GB, Some(6 * GB)).is_some(), "the claim went with its waiter");
+        let failed = std::thread::spawn(|| {
+            let _turn = big_compile_admitted(&S, &B, 3 * GB, || Some(6 * GB), || false);
+            panic!("a driver compile that panics");
+        });
+        assert!(failed.join().is_err());
+        drop(held);
+        assert_eq!((B.in_flight(), *S.n.lock().unwrap()), ((0, 0), 0));
+    }
+
+    #[test]
+    fn more_slots_still_keep_the_headroom_in_flight_within_the_commit_free() {
+        use std::sync::atomic::AtomicUsize;
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 8, wanted_most: 8 };
+        static B: CommitBudget = CommitBudget::new();
+        static IN: AtomicUsize = AtomicUsize::new(0);
+        static PEAK: AtomicUsize = AtomicUsize::new(0);
+        static PEAK_HEADROOM: AtomicU64 = AtomicU64::new(0);
+        let t: Vec<_> = (0..12)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let _turn = big_compile_admitted(&S, &B, 3 * GB, || Some(10 * GB), || false);
+                    PEAK.fetch_max(IN.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                    PEAK_HEADROOM.fetch_max(B.in_flight().0, Ordering::SeqCst);
+                    // three at once fit in 10 GB: the first ones wait (a while at most) for the third
+                    let t0 = Instant::now();
+                    while PEAK.load(Ordering::SeqCst) < 3 && t0.elapsed() < Duration::from_secs(2) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                    IN.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        let t0 = Instant::now();
+        t.into_iter().for_each(|t| t.join().unwrap());
+        assert!(t0.elapsed() < Duration::from_secs(30), "no deadlock");
+        assert_eq!(PEAK.load(Ordering::SeqCst), 3, "8 slots, 10 GB: three of 3 GB at once");
+        assert!(PEAK_HEADROOM.load(Ordering::SeqCst) <= 10 * GB);
+        assert_eq!((B.in_flight(), *S.n.lock().unwrap()), ((0, 0), 0));
+    }
+
+    /// A huge compile in `commit_model`: asked for at tick `at`, `bytes` of DXIL (its headroom and
+    /// its lane), `takes` of commit in the driver – reached over the first quarter of the `ticks`
+    /// it runs, none yet when it starts – and a worker's (`gated`), or one that takes no turn (a
+    /// title thread's, or wanted).
+    struct Compile { at: u32, bytes: usize, takes: u64, ticks: u32, gated: bool }
+
+    /// `compiles` on `free` commit (what the title leaves), `most` at once in the big lane and one
+    /// in the giant one, each waiting for its commit in its turn: as before (`reserve` false: the
+    /// commit free alone) or with a `CommitBudget`. Every compile that looks in a tick reads the
+    /// same commit free. Returns the most commit the compiles took at once, the ticks until all
+    /// were built, and the tick each started.
+    fn commit_model(compiles: &[Compile], free: u64, most: usize, reserve: bool) -> (u64, u32, Vec<u32>) {
+        let budget = CommitBudget::new();
+        let n = compiles.len();
+        let (mut started, mut turn) = (vec![None::<u32>; n], vec![false; n]);
+        let mut held: Vec<Option<CommitReservation<'_>>> = (0..n).map(|_| None).collect();
+        let mut waiting: Vec<Option<CommitWaiter<'_>>> = (0..n).map(|_| None).collect();
+        let taken = |t: u32, started: &[Option<u32>]| -> u64 {
+            let ramp = |c: &Compile| (c.ticks / 4).max(1);
+            compiles.iter().zip(started).filter_map(|(c, s)| s.filter(|&s| t < s + c.ticks).map(|s| c.takes / ramp(c) as u64 * (t - s).min(ramp(c)) as u64)).sum()
+        };
+        let (mut peak, mut t) = (0, 0);
+        while started.iter().zip(compiles).any(|(s, c)| s.is_none_or(|s| t < s + c.ticks)) {
+            for (i, c) in compiles.iter().enumerate() {
+                if started[i].is_some_and(|s| t >= s + c.ticks) {
+                    (held[i], turn[i]) = (None, false);
+                }
+            }
+            let now = free.saturating_sub(taken(t, &started));
+            for (i, c) in compiles.iter().enumerate() {
+                if started[i].is_some() || c.at > t {
+                    continue;
+                }
+                let need = big_compile_headroom(c.bytes);
+                if !c.gated {
+                    (started[i], held[i]) = (Some(t), reserve.then(|| budget.reserve(need)));
+                    continue;
+                }
+                let giant = c.bytes >= GIANT_DRIVER_COMPILE;
+                let lane = (0..n).filter(|&j| turn[j] && (compiles[j].bytes >= GIANT_DRIVER_COMPILE) == giant).count();
+                if !turn[i] && lane >= if giant { 1 } else { most } {
+                    continue;
+                }
+                turn[i] = true;
+                held[i] = if reserve { budget.try_reserve(waiting[i].get_or_insert_with(|| budget.waiting()), need, Some(now)) } else { None };
+                if held[i].is_some() || (!reserve && now >= need) {
+                    (started[i], waiting[i]) = (Some(t), None);
+                }
+            }
+            peak = peak.max(taken(t, &started));
+            t += 1;
+        }
+        (peak, t, started.into_iter().map(Option::unwrap).collect())
+    }
+
+    /// A CPU-only model of the commit huge driver compiles take, before and with the budget
+    /// (`cargo test -p xcl --lib commit_model -- --nocapture` prints both).
+    #[test]
+    fn the_commit_model_stays_within_the_commit_free_with_the_budget() {
+        const MB: usize = 1 << 20;
+        // 1 MB programs (3 GB of headroom) taking 1.5 GB in the driver, a title thread's among them,
+        // and a 16 MB one (8 GB) taking 7.5 GB asked for just after the first started
+        let big = |gated| Compile { at: 0, bytes: MB, takes: 3 * GB / 2, ticks: 40, gated };
+        let lanes = [big(true), big(true), big(true), big(false), Compile { at: 5, bytes: 16 * MB, takes: 15 * GB / 2, ticks: 120, gated: true }];
+        // XCL_HUGE_PSO_CONCURRENCY=4: eight 2 MB programs (3 GB) taking 2.5 GB each
+        let burst: Vec<_> = (0..8).map(|_| Compile { at: 0, bytes: 2 * MB, takes: 5 * GB / 2, ticks: 40, gated: true }).collect();
+        for (name, compiles, free, most) in [("both lanes, 10 GB", &lanes[..], 10 * GB, 1), ("4 at once, 8 GB", &burst[..], 8 * GB, 4)] {
+            let (before, before_ticks, _) = commit_model(compiles, free, most, false);
+            let (with, with_ticks, starts) = commit_model(compiles, free, most, true);
+            println!("commit model, {name}: before {} MB at most in {before_ticks} ticks, with the budget {} MB in {with_ticks} ticks", before >> 20, with >> 20);
+            assert!(before > free, "{name}: compiles that read the same commit together took more than was free");
+            assert!(with <= free, "{name}: {} MB of {} MB", with >> 20, free >> 20);
+            if name.starts_with("both") {
+                assert!(starts[4] < starts[1] && starts[4] < starts[2], "the giant one goes before the 1 MB programs asked for after it: {starts:?}");
+            }
+        }
+        // commit enough for all of them: as before, tick for tick
+        assert_eq!(commit_model(&lanes, 32 * GB, 1, false).1, commit_model(&lanes, 32 * GB, 1, true).1);
+        assert_eq!(commit_model(&burst, 32 * GB, 4, false).1, commit_model(&burst, 32 * GB, 4, true).1);
     }
 }
 
@@ -5725,7 +6332,7 @@ pub(super) fn register_two_pass_for_test(pso: usize, kind: &'static str) {
                 compute: 0,
                 compute_rs: 0,
                 mesh_rs: 0,
-                record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 64, max_vertices: 64, max_primitives: 64 },
+                record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 64, max_vertices: 64, max_primitives: 64, ..Default::default() },
                 mesh_groups_per_record: 1,
                 kind,
             }),
@@ -5813,12 +6420,34 @@ fn known_subobjects(buf: &[u8]) -> Vec<(u32, &[u8])> {
     out
 }
 
+/// A stream `stream_subobjects` cannot read to its end (a subobject type XCL does not know, or
+/// one cut by SizeInBytes) with a console AS or MS before that point: why it is refused. None:
+/// no console AS / MS in the part that is read.
+unsafe fn unread_console_mesh(buf: &[u8]) -> Option<String> {
+    let known = known_subobjects(buf);
+    let (ty, code) = known.iter().filter(|s| matches!(s.0, 24 | 25)).find_map(|s| payload_shader(s.1).filter(|c| crate::gpu::recomp::pso::is_console(c)).map(|c| (s.0, c)))?;
+    // where reading stopped: the end of the last subobject read
+    let end = known.last().map_or(0, |(_, p)| (p.as_ptr() as usize - buf.as_ptr() as usize + p.len() + 7) & !7);
+    let next = buf.get(end..end + 4).map_or("the end of the stream".into(), |t| format!("type {}", u32::from_le_bytes(t.try_into().unwrap())));
+    Some(format!(
+        "mesh pipeline stream not read past {end:#x} of {:#x} ({next}) – its console {} {:016x} refused",
+        buf.len(),
+        if ty == 24 { "AS" } else { "MS" },
+        crate::gpu::shader::fnv64(code)
+    ))
+}
+
+#[cfg(test)]
+mod console_mesh_refusal;
+
 unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
     let b = D3D12_SHADER_BYTECODE { pShaderBytecode: u64::from_le_bytes(p[0..8].try_into().ok()?) as usize as *const c_void, BytecodeLength: u64::from_le_bytes(p[8..16].try_into().ok()?) as usize };
     shader_bytes(&b)
 }
 
-/// The passthrough mesh shader emits triangles for both translated MS and GS pipelines.
+/// The passthrough mesh shader emits triangles for translated GS pipelines and for a console
+/// MS whose output topology is triangles, lines for one whose output topology is lines: the
+/// topology type is the one the mesh shader declares (its PSV0).
 fn two_pass_mesh_stream(rs: *mut c_void, ms: &[u8], ps: Option<&[u8]>) -> StreamOut {
     let mut out = StreamOut::default();
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
@@ -5826,8 +6455,35 @@ fn two_pass_mesh_stream(rs: *mut c_void, ms: &[u8], ps: Option<&[u8]>) -> Stream
     if let Some(ps) = ps {
         out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps);
     }
-    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+    let lines = crate::gpu::dxbc::psv(ms).is_some_and(|p| p.kind == Some(13) && p.ms_topology == 1);
+    let topology = if lines { D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE } else { D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE };
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &topology);
     out
+}
+
+/// A pass-through mesh shader that outputs lines gets a line topology type, triangles (and
+/// a mesh shader without PSV0) the triangle one.
+#[cfg(test)]
+#[test]
+fn passthrough_mesh_stream_topology_follows_the_mesh_shader() {
+    let ms_with = |topology: u8| {
+        let mut r = vec![0u8; 48];
+        r[24] = 13; // mesh
+        r[27] = topology;
+        let mut part = 48u32.to_le_bytes().to_vec();
+        part.extend_from_slice(&r);
+        part.extend_from_slice(&0u32.to_le_bytes()); // resources
+        crate::gpu::xbox::tests::container(&[(b"PSV0", &part)])
+    };
+    let of = |ms: &[u8]| {
+        let out = two_pass_mesh_stream(std::ptr::null_mut(), ms, None);
+        let subs = stream_subobjects(&out.0).expect("readable stream");
+        let t = subs.iter().find(|(kind, _)| *kind == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY.0 as u32).expect("a topology type");
+        i32::from_le_bytes(t.1[..4].try_into().unwrap())
+    };
+    assert_eq!(of(&ms_with(1)), D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE.0);
+    assert_eq!(of(&ms_with(2)), D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0);
+    assert_eq!(of(&[0u8; 16]), D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0);
 }
 
 #[cfg(test)]
@@ -5886,6 +6542,9 @@ fn passthrough_mesh_stream_accepts_a_triangle_driver_blob() {
 #[allow(dead_code)] // Consumed by the stacked driver-cache integration.
 mod two_pass_identity;
 
+#[cfg(test)]
+mod mesh_stream_matrix;
+
 /// The console PS of a two-pass pipeline (a PC PS passes as it is).
 /// The PS of a two-pass pipeline (DXIL, static samplers – a PC PS passes as it is).
 fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>, Vec<crate::gpu::recomp::pso::StaticSampler>), String> {
@@ -5908,7 +6567,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let bytes = stream.shader_bytes() + tp.cs.len();
     let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
+    let admission = (bytes >= huge_pso_bytes()).then(|| big_compile_admission(bytes, gate));
     if gate {
         crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated, waited {} ms", waited.elapsed().as_millis());
     }
@@ -5961,7 +6620,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     } else if creused && cfrom_disk {
         driver_cache::note(true, None);
     }
-    drop(_slot);
+    drop(admission);
     if hc < 0 || compute.is_null() {
         note_translation_error(format!("the driver rejected the compute pass of the console {kind} ({hc:#x})"));
         let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(mesh_pso as *const *const usize)).add(2));
@@ -5993,7 +6652,14 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     if !crate::gpu::shader::readable(base, size) {
         return None;
     }
-    let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))?;
+    let buf = std::slice::from_raw_parts(base as *const u8, size);
+    let Some(subs) = stream_subobjects(buf) else {
+        // a stream not read to its end: a console AS / MS in the part that is read must not
+        // reach the driver (the caller's next step hands it the stream as it is)
+        let e = unread_console_mesh(buf)?;
+        note_translation_error(e);
+        return Some(E_INVALIDARG);
+    };
     let as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1));
     let ms_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1));
     // A console MS container in the AS slot and no MS subobject (a retail game's minimap
@@ -6006,7 +6672,15 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             return Some(E_INVALIDARG);
         }
     }
-    let ms = ms_slot?;
+    let Some(ms) = ms_slot else {
+        // an AS and no MS: nothing XCL translates (and no pipeline D3D12 takes); a console AS
+        // must not reach the driver as it is either
+        if let Some(a) = as_slot.filter(|a| is_console(a)) {
+            note_translation_error(format!("pipeline stream with the console AS {:016x} and no MS – refused", crate::gpu::shader::fnv64(a)));
+            return Some(E_INVALIDARG);
+        }
+        return None;
+    };
     if !is_console(ms) {
         return None;
     }
@@ -6160,7 +6834,51 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     hr
 }
 
-/// Rewrite a pipeline state stream with stand-in shaders. None if not possible.
+/// The stand-in for a pipeline stream with a mesh shader: a mesh pipeline by D3D12's rules
+/// whatever the title's stream holds. `ms` (and `ps` when the title's stream has a pixel shader)
+/// under the title's root signature, triangles (what `ms` emits; `two_pass_mesh_stream` states
+/// the same for the real pipeline), and of the title's state only its targets: render target and
+/// depth formats as the PC's (as `translated_mesh_stream_once` converts them), sample desc,
+/// sample mask and node mask, the first of each. A VS, input layout, stream output or strip cut
+/// has no place in a mesh pipeline, and the title's blend, rasterizer, depth-stencil, flags and
+/// view instancing could only make the driver refuse a pipeline that draws nothing (blending an
+/// integer target, conservative rasterisation or depth bounds the GPU does not have).
+fn mesh_standin_stream(subs: &[(u32, &[u8])], ms: &[u8], ps: &[u8]) -> StreamOut {
+    let mut out = StreamOut::default();
+    // ROOT_SIGNATURE, SAMPLE_MASK, RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT, SAMPLE_DESC, NODE_MASK
+    for ty in [0u32, 9, 15, 16, 17, 18] {
+        let Some((_, payload)) = subs.iter().find(|s| s.0 == ty) else { continue };
+        let Some((psize, palign)) = super::null::subobject_payload(ty) else { continue };
+        if payload.len() < psize {
+            continue;
+        }
+        let mut p = payload[..psize].to_vec();
+        if ty == 15 || ty == 16 {
+            for k in 0..if ty == 15 { 8 } else { 1 } {
+                let f = super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()));
+                p[4 * k..4 * k + 4].copy_from_slice(&f.to_le_bytes());
+            }
+        }
+        out.raw(ty, &p, palign == 8);
+    }
+    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
+    if has_shader(subs, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps);
+    }
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+    out
+}
+
+/// The first `ty` subobject of `subs` holds a shader (pointer and length; a null one is none).
+fn has_shader(subs: &[(u32, &[u8])], ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) -> bool {
+    subs.iter().find(|s| s.0 == ty.0 as u32).is_some_and(|s| s.1.len() >= 16 && s.1[0..8] != [0; 8] && s.1[8..16] != [0; 8])
+}
+
+#[cfg(test)]
+mod mesh_standin;
+
+/// Rewrite a pipeline state stream with stand-in shaders (a mesh pipeline's: `mesh_standin_stream`).
+/// None if not possible.
 unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     let size = *(desc as *const usize);
     let base = *(desc.add(8) as *const usize);
@@ -6186,6 +6904,15 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
         (mesh, rt_count, rt_formats)
     };
     let dm = if mesh { Some(dummy_mesh()?) } else { None };
+    if let Some((ms, ps)) = dm {
+        let subs = stream_subobjects(&buf)?;
+        // (a null MS slot keeps the rewrite below, as before)
+        if has_shader(&subs, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) {
+            let out = mesh_standin_stream(&subs, ms, ps).0;
+            let n = out.len();
+            return Some((out, [n, 0]));
+        }
+    }
     let mut off = 0usize;
     while off + 8 <= size {
         let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
@@ -8330,7 +9057,7 @@ mod mesh_stream_tests {
         let make_tp = || crate::gpu::recomp::pso::TwoPass {
             cs: vec![0; 16],
             ms: vec![0; 16],
-            record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 32, max_vertices: 3, max_primitives: 1 },
+            record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 32, max_vertices: 3, max_primitives: 1, ..Default::default() },
             mesh_groups_per_record: 1,
             samplers: vec![sampler],
         };

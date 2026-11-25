@@ -42,8 +42,17 @@ pub const TRANSLATOR_VERSION: u32 = 9;
 
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
+/// `=covered` too, for the compute programs of the covered set only ([`covered_only`]).
 pub fn enabled() -> bool {
-    std::env::var("XCL_DIRECT_DXIL").is_ok_and(|v| v == "1" || v == "all")
+    std::env::var("XCL_DIRECT_DXIL").is_ok_and(|v| v == "1" || v == "all" || v == "covered")
+}
+
+/// `XCL_DIRECT_DXIL=covered`: only console compute programs whose every instruction is in the
+/// covered set (`covered::check`), and the compute passes of console MS and GS programs in it
+/// with their record writes (`covered::check_mesh`, `covered::check_geometry`), go through this
+/// translator; the others and the kernel tests stay on the HLSL path.
+pub fn covered_only() -> bool {
+    std::env::var("XCL_DIRECT_DXIL").is_ok_and(|v| v == "covered")
 }
 
 /// `XCL_DIRECT_DXIL=all`: console vertex and pixel shaders too (each stage falls back to
@@ -125,6 +134,11 @@ pub fn translate_pixel(code: &[u8], o: KernelOptions, ps: &PsInterface) -> Resul
 pub fn translate_geometry(code: &[u8], o: KernelOptions, g: &GsInterface) -> Result<Kernel, String> {
     translate_entry(code, KernelOptions { wave64: true, ..o }, Entry::Geometry(g.clone()), None, None, 0)
 }
+
+/// `setup_vertex` / `setup_pixel` declare one signature row per element; a signature the HLSL
+/// path packs a register to a row (`recomp::signature_rows`) goes there, so that the VS and the
+/// PS of a pipeline declare the same rows whichever path each takes.
+const PACKED_ROWS: &str = "more signature elements than rows: registers packed in the HLSL path";
 
 /// The entry ABI.
 #[derive(Clone)]
@@ -244,6 +258,9 @@ fn translate_on_this_thread(
             [64, 1, 1]
         }
         Entry::Vertex(vs) => {
+            if crate::gpu::recomp::signature_packed(&vs.outputs) {
+                return Err(PACKED_ROWS.into());
+            }
             lw.setup_lanes_gfx();
             let used: BTreeSet<u64> = cfg.insts.iter().flat_map(|d| {
                 let (r, w) = crate::gpu::rdna2::vgpr_uses(d);
@@ -253,6 +270,9 @@ fn translate_on_this_thread(
             [1, 1, 1]
         }
         Entry::Pixel(ps) => {
+            if crate::gpu::recomp::signature_packed(&ps.inputs) {
+                return Err(PACKED_ROWS.into());
+            }
             lw.setup_lanes_gfx();
             let modes = crate::gpu::recomp::emit::ps_attr_modes(&cfg.insts, ps.input_ena);
             lw.setup_pixel(ps, &modes);

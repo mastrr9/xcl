@@ -155,6 +155,11 @@ A gamepad is recommended ([Controls](#controls)). The game folder is never modif
 | **Ray tracing** | ✅ | BLAS / TLAS built on the GPU by the game's own XboxBvhBuilder; RDNA2 BVH node format; BVH intersection instructions emulated in shaders | GPU traversal = brute force reference; the game's builder output checked on the GPU |
 | **Upscaling** | ✅ | the game's AMD FSR 4 console DLL (`amd_fidelityfx_upscaler_xbox.dll`): context, the 29 pipelines in the console driver's own container (FSPX) translated, a frame's 20 passes recorded and run on the GPU | end-to-end with the real DLL: a 1280×720 → 1920×1080 frame on an RX 9070, the input's gradient in the output |
 
+Mesh shaders can emit lines or triangles.
+Depth-only mesh passes forward position and clip and cull distances.
+Wide packed shader signatures can share one HLSL row per console register.
+Background mesh builds use a mesh-compatible stand-in.
+
 Far-jump address calculations are resolved to fixed targets only when branches enter at the start of the calculation.
 An entry partway through it keeps the jump indirect and subject to the recompiler's existing indirect-branch limits.
 
@@ -257,6 +262,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     default.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
+- `XCL_DIRECT_DXIL=covered` opts compute shaders and the compute passes for mesh and geometry shaders
+  into direct DXIL when all their instructions are covered. Other programs use HLSL.
 - Direct compute dispatches can split large programs into pipelines built in parallel.
   `XCL_DIRECT_SPLIT_INSTRUCTIONS` sets the target instructions per piece (default 12500,
   zero disables splitting). Loops stay in one piece. A strongly connected component over the
@@ -264,10 +271,12 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   dispatches use the whole pipeline.
 - Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
   background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
-  at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so
-  they cannot occupy the ordinary huge-pipeline slot; one of them can therefore run next to the
-  ordinary ones, and each gated compile starts only with 3 GB of commit free. Smaller pipelines
-  and those a game thread waits for never wait. `xcl.log` shows each huge one as a numbered
+  at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane.
+  A background compile starts when its commit headroom, at least 3 GiB, fits after reservations
+  for other huge compiles in flight. Wanted workers bypass the commit wait within
+  `XCL_HUGE_PSO_WANTED_CONCURRENCY` (default at least 2 for ordinary huge compiles and 1 in the
+  giant lane). Synchronous huge compiles reserve headroom without taking a worker slot.
+  `xcl.log` shows each huge compile as a numbered
   `driver compile start #K` / `driver compile finish #K: … PSO, N B DXIL, M ms` pair (compute
   ones with `record HASH`, the console record's hash that `--measure-pso` and
   `--export-hlsl --record-hash` take), with whether it was gated and how long it waited;
@@ -284,6 +293,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
+  `d3d12.pipelines_without_translation` counts the pipelines left without a translation.
+  `d3d12.without_translation_by_reason` groups the counts by reason.
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
   the existing optional frame dumps also set `d3d12.last_frame_dump`: the latest sampled frame's
   zero-based index, source dimensions, DXGI format, sample step, sample count and `non_dark_samples`

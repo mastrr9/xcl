@@ -67,6 +67,7 @@ fn kernel_wave(code: &[u8], wave64: bool) -> (Vec<u8>, Vec<u32>) {
     let t = translate(code, &Options { wave64, ..Default::default() }).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    super::diff_kernel::pair(&dxil, code, wave64, || runner::direct_kernel_full(code, wave64));
     (dxil, code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
 }
 
@@ -75,7 +76,10 @@ fn kernel_wave(code: &[u8], wave64: bool) -> (Vec<u8>, Vec<u32>) {
 fn direct_or(code: &[u8], opt: &Options, hlsl: Vec<u8>) -> Vec<u8> {
     use crate::gpu::dxil::kernel::{translate, translate_compute, KernelOptions};
     let windows = opt.mem_windows <= 4 && (opt.hw_wave == 0 || (opt.hw_wave == 32 && !opt.wave64));
-    if !runner::direct_dxil() || !windows {
+    // `XCL_DXIL_DIFF=1`: a kernel or compute program is paired with its direct translation
+    // (`diff_kernel::pair`)
+    let diff = super::diff_kernel::enabled() && matches!(opt.mode, Mode::Kernel | Mode::Compute(_)) && !hlsl.is_empty();
+    if !(runner::direct_dxil() || diff) || !windows {
         return hlsl;
     }
     let split = opt.wave64 && (opt.split_wave64 || runner::split_wave64());
@@ -83,6 +87,14 @@ fn direct_or(code: &[u8], opt: &Options, hlsl: Vec<u8>) -> Vec<u8> {
     let mem_windows = if opt.heap_windows && opt.mem_windows > 1 { opt.mem_windows | super::HEAP_WINDOWS } else { opt.mem_windows };
     let o = KernelOptions { wave64: opt.wave64, split, mem_windows, sampler_base: opt.static_sampler_base };
     match &opt.mode {
+        Mode::Kernel if diff => {
+            super::diff_kernel::pair(&hlsl, code, opt.wave64, || crate::gpu::dxil::kernel::translate_full(code, o));
+            hlsl
+        }
+        Mode::Compute(cs) if diff => {
+            super::diff_kernel::pair(&hlsl, code, opt.wave64, || translate_compute(code, o, cs));
+            hlsl
+        }
         Mode::Kernel => translate(code, o).unwrap_or_else(|e| panic!("direct DXIL: {e}")),
         Mode::Compute(cs) => translate_compute(code, o, cs).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
         Mode::Mesh(ms) => crate::gpu::dxil::kernel::translate_mesh(code, o, ms).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
@@ -96,6 +108,13 @@ fn direct_or(code: &[u8], opt: &Options, hlsl: Vec<u8>) -> Vec<u8> {
 /// through the direct DXIL translator (and its validator check).
 fn direct_check(code: &[u8], opt: &Options) {
     let _ = direct_or(code, opt, Vec::new());
+}
+
+/// `XCL_DXIL_DIFF=1`: a container the test compiled itself is paired as `direct_or` pairs it.
+fn diff_pair(code: &[u8], opt: &Options, hlsl: &[u8]) {
+    if super::diff_kernel::enabled() {
+        let _ = direct_or(code, opt, hlsl.to_vec());
+    }
 }
 
 /// `runner::run_program` as a wave64 or wave32 program, with the number of lanes that ran.
@@ -434,7 +453,7 @@ fn atomic_fcmpswap_x2_uses_ieee_64_bit_cas() {
     assert!(t.hlsl.contains("_cmp = (uint64_t)v26 | ((uint64_t)v27 << 32);"), "{}", t.hlsl);
     // 8-byte alignment of all three cells; the buffer form's bounds check reads records in dwords
     assert_eq!(t.hlsl.matches("& ~7u;").count(), 3, "{}", t.hlsl);
-    assert!(t.hlsl.contains("_off + 8u <= s10"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("_room = s10 - t") && t.hlsl.contains("8u <= t"), "{}", t.hlsl);
     // GLC returns the old u64 as a low / high dword pair – in place in VDATA for the buffer
     // form, into VDST for flat / global
     assert_eq!(t.hlsl.matches("_old >> 32").count(), 3, "{}", t.hlsl);
@@ -485,6 +504,104 @@ fn atomic_fmin_fmax_x2_are_native_64_bit_atomics() {
         super::dxc::compile(&w.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", w.hlsl));
         direct_check(&code, &Options { mem_windows: 2, ..Default::default() });
         direct_check(&code, &Options { mem_windows: 2, heap_windows: true, ..Default::default() });
+    }
+}
+
+/// Raw buffer accesses (stride 0) with one memory window: `voff + OFFSET` is a 32-bit sum, but
+/// RDNA2 adds without wrapping (as the 64-bit sum of several windows does), so a sum past 2^32
+/// is past num_records. Every form checks that the sum did not wrap and compares the bytes it
+/// accesses with what is left to num_records (`off + bytes` cannot wrap either).
+#[test]
+fn raw_buffer_range_checks_do_not_wrap() {
+    let names: &[(&str, &str, &[(&str, u64)])] = &[
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[]),
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", &[]),
+        ("BUFFER_STORE_DWORDX3", "ENC_MUBUF", &[]),
+        ("BUFFER_LOAD_SBYTE", "ENC_MUBUF", &[]),
+        ("BUFFER_STORE_SHORT", "ENC_MUBUF", &[]),
+        ("BUFFER_LOAD_SHORT_D16", "ENC_MUBUF", &[]),
+        ("BUFFER_LOAD_UBYTE_D16_HI", "ENC_MUBUF", &[]),
+        ("BUFFER_STORE_BYTE_D16_HI", "ENC_MUBUF", &[]),
+        ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[]),
+        ("BUFFER_STORE_FORMAT_X", "ENC_MUBUF", &[]),
+        ("BUFFER_LOAD_FORMAT_D16_XY", "ENC_MUBUF", &[]),
+        ("BUFFER_STORE_FORMAT_D16_HI_X", "ENC_MUBUF", &[]),
+        ("TBUFFER_LOAD_FORMAT_X", "ENC_MTBUF", &[("FORMAT", 20)]),
+        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("GLC", 1)]),
+        ("BUFFER_ATOMIC_CMPSWAP_X2", "ENC_MUBUF", &[("GLC", 1)]),
+        ("BUFFER_ATOMIC_UMAX_X2", "ENC_MUBUF", &[]),
+    ];
+    for &(name, enc, extra) in names {
+        let mut fields = vec![("VDATA", 4), ("VADDR", 2), ("SRSRC", 2), ("SOFFSET", 128), ("OFFSET", 0x208), ("OFFEN", 1)];
+        fields.extend_from_slice(extra);
+        let code = prog(&[(name, enc, fields.as_slice(), None)]);
+        let t = translate(&code, &Options::default()).unwrap();
+        assert!(t.complete(), "{name}: {:?}\n{}", t.unsupported_why, t.hlsl);
+        // the sum's carry (voff = v2) and num_records (s10) bound the access, not a 32-bit
+        // `off + bytes <= num_records`
+        assert!(t.hlsl.contains("_off = v2 + 520u;"), "{name}:\n{}", t.hlsl);
+        assert!(t.hlsl.contains("_off >= v2, t") && t.hlsl.contains("_room = s10 - t"), "{name}:\n{}", t.hlsl);
+        assert!(t.hlsl.contains("_in, ") && t.hlsl.contains("<= t") && !t.hlsl.contains("<= s10,"), "{name}:\n{}", t.hlsl);
+        // several windows already sum in 64 bits
+        let w = translate(&code, &Options { mem_windows: 2, ..Default::default() }).unwrap();
+        assert!(w.hlsl.contains("<= (uint64_t)s10") && !w.hlsl.contains("_room"), "{name}:\n{}", w.hlsl);
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{name}: {e}\n{}", t.hlsl));
+        }
+    }
+}
+
+/// The GPU side of `raw_buffer_range_checks_do_not_wrap`: a load, a d16 load, a store and a
+/// returning atomic whose `voff + OFFSET` wraps past 2^32 to an offset inside the buffer read 0,
+/// write nothing and return 0, as does a load whose `off + 4` wraps past num_records 0xFFFF_FFFF;
+/// an in-range lane behaves as usual (the direct DXIL backend too, with `XCL_DIRECT_DXIL=1`).
+#[test]
+fn gpu_raw_buffer_offsets_that_wrap_are_out_of_range() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 3), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("OFFSET", 0x208), ("OFFEN", 1)], None),
+        ("BUFFER_LOAD_SHORT_D16", "ENC_MUBUF", &[("VDATA", 7), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("OFFSET", 0x208), ("OFFEN", 1)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 5), ("VADDR", 2), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("OFFSET", 0x208), ("OFFEN", 1)], None),
+        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 6), ("VADDR", 1), ("SRSRC", 2), ("SOFFSET", 128), ("OFFSET", 0x208), ("OFFEN", 1), ("GLC", 1)], None),
+    ]);
+    let mut mem = vec![0u32; 1024];
+    for (i, m) in mem.iter_mut().enumerate() {
+        *m = 0x1000 + i as u32;
+    }
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&[0x40, 0, 0x400, 0]); // V#: base 0x40, stride 0, 0x400 bytes
+    st.sgpr[12..16].copy_from_slice(&[0x40, 0, 0xFFFF_FFFF, 0]); // V#: base 0x40, stride 0, 0xFFFF_FFFF bytes
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        // lane 0 wraps (voff + 0x208 = 0x200 and 0x1F8 in 32 bits; 0xFFFF_FFFE + 4 = 2),
+        // lane 1 is in range, the others are past the end
+        r[0] = [0xFFFF_FFF8, 4].get(l).copied().unwrap_or(0x1000);
+        r[1] = [0xFFFF_FFF0, 0x10].get(l).copied().unwrap_or(0x1000);
+        r[2] = [0xFFFF_FFFE, 8].get(l).copied().unwrap_or(8);
+        r[3] = 0xDEAD;
+        r[4] = 0xC0DE_0000 | l as u32;
+        r[5] = 0xDEAD;
+        r[6] = 5;
+        r[7] = 0xDEAD_BEEF;
+    }
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    for (l, v) in r.vgpr.iter().enumerate().take(64) {
+        let lane1 = l == 1;
+        assert_eq!(v[3], if lane1 { 0x1000 + (0x40 + 4 + 0x208) / 4 } else { 0 }, "lane {l} load");
+        assert_eq!(v[7], if lane1 { 0xDEAD_0000 | (0x1000 + (0x40 + 4 + 0x208) / 4) } else { 0xDEAD_0000 }, "lane {l} d16 load");
+        assert_eq!(v[5], if l == 0 { 0 } else { 0x1000 + (0x40 + 8) / 4 }, "lane {l} load near num_records 0xFFFF_FFFF");
+        assert_eq!(v[6], if lane1 { 0x1000 + (0x40 + 0x10 + 0x208) / 4 } else { 0 }, "lane {l} atomic returns");
+    }
+    // only lane 1's store and atomic write memory
+    for (i, &m) in r.mem.iter().enumerate().take(mem.len()) {
+        let want = match i * 4 {
+            0x24C => 0xC0DE_0001,
+            0x258 => mem[i] + 5,
+            _ => mem[i],
+        };
+        assert_eq!(m, want, "memory at byte {:#x}", i * 4);
     }
 }
 
@@ -1117,6 +1234,38 @@ fn f64_roots(wave64: bool) {
     bad.sort();
     bad.dedup();
     assert!(bad.is_empty(), "wave{lanes}:\n{}", bad.join("\n"));
+}
+
+/// v_rcp_f64 and v_rsq_f64 of a NaN: RDNA2 returns it quiet with its payload (a signalling NaN
+/// gets the quiet bit), on the HLSL path (rcp_d) and the direct one (a divide) alike.
+#[test]
+fn gpu_f64_rcp_rsq_quiet_a_signalling_nan() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = prog(&[
+        ("V_RCP_F64", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)], None),
+        ("V_RSQ_F64", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None),
+    ]);
+    // (input, result): signalling NaNs of either sign get bit 51, quiet ones stay as they are
+    let cases: [(u64, u64); 4] = [
+        (0x7FF0_0000_0000_0001, 0x7FF8_0000_0000_0001),
+        (0xFFF4_0000_1234_5678, 0xFFFC_0000_1234_5678),
+        (0x7FF8_0000_0000_0000, 0x7FF8_0000_0000_0000),
+        (0x7FFC_0000_0000_00AB, 0x7FFC_0000_0000_00AB),
+    ];
+    let mut st = KernelState::default();
+    for (l, v) in st.vgpr.iter_mut().enumerate() {
+        let x = cases[l % cases.len()].0;
+        (v[0], v[1]) = (x as u32, (x >> 32) as u32);
+    }
+    let (r, lanes) = run_wave(&p, &st, false);
+    for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+        let (x, want) = cases[l % cases.len()];
+        let bits = |i: usize| v[i] as u64 | (v[i + 1] as u64) << 32;
+        assert_eq!(bits(2), want, "lane {l}: v_rcp_f64({x:#018x})");
+        assert_eq!(bits(4), want, "lane {l}: v_rsq_f64({x:#018x})");
+    }
 }
 
 /// v_ldexp_f64 = x · 2^n, rounded once, for every i32 n: results that over- or underflow,
@@ -1956,6 +2105,188 @@ fn ps_exp_vm_hlsl_and_direct_dxil_codegen() {
     }
 }
 
+/// A console signature with 36 user elements in 18 registers: two TEXCOORDs per register in
+/// .xy and .zw (the .zw one listed first), then a register with a uint in .x and a float3 in
+/// .yzw. One float4 row per element is 37 rows with SV_Position, over D3D12's 32.
+fn packed_signature() -> Vec<crate::gpu::dxbc::SigElement> {
+    let mut s = vec![el("SV_Position", 0, 1, 3, 0, 0xF)];
+    for r in 0..17u32 {
+        s.push(el("TEXCOORD", 2 * r + 1, 0, 3, 1 + r, 0xC));
+        s.push(el("TEXCOORD", 2 * r, 0, 3, 1 + r, 0x3));
+    }
+    s.push(el("TEXCOORD", 34, 0, 3, 18, 0xE));
+    s.push(el("BLENDINDICES", 0, 0, 1, 18, 0x1));
+    s
+}
+
+/// The members of `struct <name>` in `h` after SV_Position, as (type, semantic): what D3D12
+/// links a VS output to a PS input by (one row each, in order).
+fn signature_members(h: &str, name: &str) -> Vec<(String, String)> {
+    let start = h.find(&format!("struct {name} {{\n")).unwrap_or_else(|| panic!("no struct {name}:\n{h}"));
+    let body = &h[start..start + h[start..].find("};").unwrap()];
+    body.lines()
+        .skip(1)
+        .filter(|l| l.contains(" : ") && !l.contains(": SV_"))
+        .map(|l| {
+            let w: Vec<&str> = l.trim_end_matches(';').split_whitespace().collect();
+            (w[w.len() - 4].to_string(), w[w.len() - 1].to_string())
+        })
+        .collect()
+}
+
+/// A console signature with more elements than D3D12 has signature rows, packed two to a
+/// register: the VS output, the PS input, the mesh pass-through and the rect-list GS declare
+/// one row per register (and kind: the uint at .x and the float3 at .yzw of one register are
+/// two rows), named by the element at the lowest component, the same rows on every side. The
+/// programs still write and read their elements (`xo.p<j>`, `xi.a<k>`), copied to / from the
+/// rows. Declared one float4 row per element, as before, each stage had 37 rows and DXC
+/// refused it. Under the limit nothing changes; the direct DXIL path leaves such signatures to
+/// the HLSL path.
+#[test]
+fn packed_console_signature_shares_rows_in_every_stage() {
+    use super::emit::{mesh_passthrough, mesh_passthrough_for, passthrough_elements, rect_list_gs};
+    use super::{signature_packed, signature_rows, MsInterface, PsInterface, VsInterface, SIGNATURE_ROWS};
+    use crate::gpu::dxil::kernel::{translate_pixel, translate_vertex, KernelOptions};
+    let sig = packed_signature();
+    let mut rows: Vec<Vec<usize>> = (0..17).map(|r| vec![2 * r + 1, 2 * r]).collect();
+    rows.push(vec![35]);
+    rows.push(vec![34]);
+    assert_eq!(signature_rows(&sig), rows);
+    assert!(signature_packed(&sig));
+    let mut want: Vec<(String, String)> = (0..17).map(|r| ("float4".to_string(), format!("TEXCOORD{}", 2 * r))).collect();
+    want.push(("uint4".into(), "BLENDINDICES0".into()));
+    want.push(("float4".into(), "TEXCOORD34".into()));
+    assert!(1 + want.len() <= SIGNATURE_ROWS);
+
+    // VS: params 0 and 8 (registers 1 and 9) from COLOR
+    let vs_code = prog(&[
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 40), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11)], None),
+    ]);
+    let vsi = VsInterface { inputs: vec![el("POSITION", 0, 0, 3, 0, 0xF), el("COLOR", 0, 0, 3, 1, 0xF)], outputs: sig.clone(), attr_base: 4, params: None };
+    let vo = Options { mode: Mode::Vertex(vsi.clone()), wave64: true, ..Default::default() };
+    let vt = translate(&vs_code, &vo).unwrap();
+    assert!(vt.complete(), "{:?}", vt.unsupported);
+    let vs = vt.hlsl;
+    assert_eq!(signature_members(&vs, "XclOut"), want, "{vs}");
+    assert!(vs.contains("XclVals xo = (XclVals)0;") && vs.contains("    return xcl_rows(xo);\n}"), "{vs}");
+    // each row from the element that names it; the program writes every element of a register
+    assert!(vs.contains("    o.p0 = v.p1;\n") && vs.contains("    o.p8 = v.p17;\n") && vs.contains("    o.p17 = v.p35;\n") && vs.contains("    o.p18 = v.p34;\n"), "{vs}");
+    assert!(vs.contains("xo.p16[2] = asfloat(v10);") && vs.contains("xo.p17[0] = asfloat(v8);"), "{vs}");
+
+    // PS: reads register 9 (attribute 8): .xy of TEXCOORD16, .z of TEXCOORD17
+    let ps_code = prog(&[
+        ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 0), ("ATTR", 8), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 1), ("ATTR", 8), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 5), ("VSRC", 1), ("ATTR", 8), ("ATTRCHAN", 1)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 6), ("VSRC", 1), ("ATTR", 8), ("ATTRCHAN", 2)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let psi = PsInterface { inputs: sig.clone(), outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x1302, attrs: None };
+    let po = Options { mode: Mode::Pixel(psi.clone()), wave64: true, ..Default::default() };
+    let pt = translate(&ps_code, &po).unwrap();
+    assert!(pt.complete(), "{:?}", pt.unsupported);
+    let ps = pt.hlsl;
+    assert_eq!(signature_members(&ps, "XclInRows"), want, "{ps}");
+    assert!(ps.contains("XclOut main(XclInRows xr)\n{\n    XclIn xi;\n    xi.xcl_pos = xr.xcl_pos;\n"), "{ps}");
+    assert!(ps.contains("struct XclIn {\n    float4 xcl_pos;\n    float4 a0;\n") && ps.contains("    uint4 a35;\n    bool xcl_ff : SV_IsFrontFace;\n};\nstruct XclInRows {"), "{ps}");
+    assert!(ps.contains("     float4 r18 : TEXCOORD34;\n    bool xcl_ff : SV_IsFrontFace;\n};") && ps.contains("    xi.xcl_ff = xr.xcl_ff;\n    XclOut xo = (XclOut)0;\n"), "{ps}");
+    assert!(ps.contains("    nointerpolation uint4 r17 : BLENDINDICES0;\n") && ps.contains("     float4 r8 : TEXCOORD16;\n"), "{ps}");
+    assert!(ps.contains("    xi.a16 = asfloat(xr.r8);\n") && ps.contains("    xi.a17 = asfloat(xr.r8);\n") && ps.contains("    xi.a35 = asuint(xr.r17);\n"), "{ps}");
+    assert!(ps.contains("xi.a17[0]") && ps.contains("xi.a16[2]"), "{ps}");
+
+    // the mesh pass-through for that PS, and without one; the rect-list GS
+    let ms = MsInterface { outputs: sig.clone(), threads: 64, max_vertices: 64, max_primitives: 64, ..Default::default() };
+    let pass = mesh_passthrough_for(&ms, Some(&sig));
+    assert_eq!(signature_members(&pass, "XclVert"), want, "{pass}");
+    assert_eq!(passthrough_elements(&ms, Some(&sig)), want.len());
+    assert!(pass.contains("o.p0 = asfloat(res.Load4(b + 32u).xyzw);") && pass.contains("o.p17 = res.Load4(b + 576u).xyzw;"), "{pass}");
+    let all = mesh_passthrough(&ms);
+    assert_eq!(signature_members(&all, "XclVert"), want, "{all}");
+    assert_eq!(passthrough_elements(&ms, None), want.len());
+    let gs = rect_list_gs(&sig);
+    assert_eq!(signature_members(&gs, "XclOut"), want, "{gs}");
+    assert!(gs.contains("d.p18 = a.p18 + b.p18 - k.p18;") && !gs.contains("d.p17 ="), "{gs}");
+
+    // the direct DXIL path declares a row per element: these go to the HLSL path
+    let ko = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    assert!(translate_vertex(&vs_code, ko, &vsi).is_err_and(|e| e.contains("rows")));
+    assert!(translate_pixel(&ps_code, ko, &psi).is_err_and(|e| e.contains("rows")));
+
+    // under the limit (31 elements, still two to a register): one row per element, as before
+    let few: Vec<_> = sig[..32].to_vec();
+    assert!(!signature_packed(&few) && signature_rows(&few) == (0..31).map(|j| vec![j]).collect::<Vec<_>>());
+    let vf = translate(&vs_code, &Options { mode: Mode::Vertex(VsInterface { outputs: few.clone(), ..vsi.clone() }), wave64: true, ..Default::default() }).unwrap().hlsl;
+    assert!(vf.contains("XclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n") && vf.contains("    float4 p0 : TEXCOORD1;\n") && !vf.contains("XclVals"), "{vf}");
+    let pf = translate(&ps_code, &Options { mode: Mode::Pixel(PsInterface { inputs: few.clone(), ..psi.clone() }), wave64: true, ..Default::default() }).unwrap().hlsl;
+    assert!(pf.contains("XclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n") && !pf.contains("XclInRows"), "{pf}");
+
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&vs, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{vs}"));
+        super::dxc::compile(&ps, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{ps}"));
+        super::dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+        super::dxc::compile(&all, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{all}"));
+        super::dxc::compile(&gs, "main", "gs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{gs}"));
+        // the root cause: the same elements one float4 row each are refused
+        let mut rowwise = String::from("struct O {\n    float4 pos : SV_Position;\n");
+        for (j, e) in super::ranked(&sig, false).iter().enumerate() {
+            let _ = std::fmt::Write::write_fmt(&mut rowwise, format_args!("    {}4 p{j} : {};\n", if e.component_type == 3 { "float" } else { "uint" }, e.semantic()));
+        }
+        rowwise.push_str("};\nO main() { O o = (O)0; return o; }\n");
+        assert!(super::dxc::compile(&rowwise, "main", "vs_6_6", &[]).is_err(), "37 signature rows accepted:\n{rowwise}");
+    }
+}
+
+/// `packed_console_signature_shares_rows_in_every_stage` drawn: a VS and a PS with that
+/// signature link (D3D12 creates the pipeline) and the PS reads what the VS wrote to register
+/// 9 from its row.
+#[test]
+fn gpu_packed_console_signature_links_vs_ps() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{PsInterface, VsInterface};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32_FLOAT};
+    let sig = packed_signature();
+    let vs_code = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V + 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 5)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0xF), ("VSRC0", 2), ("VSRC1", 2), ("VSRC2", 2), ("VSRC3", 2)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 40), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 41), ("EN", 0xF), ("VSRC0", 3), ("VSRC1", 3), ("VSRC2", 3), ("VSRC3", 3)], None),
+    ]);
+    let vsi = VsInterface { inputs: vec![el("POSITION", 0, 0, 3, 0, 3), el("COLOR", 0, 0, 3, 1, 0xF)], outputs: sig.clone(), attr_base: 4, params: None };
+    let ps_code = prog(&[
+        ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 0), ("ATTR", 8), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 1), ("ATTR", 8), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 5), ("VSRC", 1), ("ATTR", 8), ("ATTRCHAN", 1)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 6), ("VSRC", 1), ("ATTR", 8), ("ATTRCHAN", 2)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let psi = PsInterface { inputs: sig, outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None };
+    let vt = translate(&vs_code, &Options { mode: Mode::Vertex(vsi), wave64: true, ..Default::default() }).unwrap();
+    let pt = translate(&ps_code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
+    assert!(vt.complete() && pt.complete(), "{:?} {:?}", vt.unsupported, pt.unsupported);
+    let vs = super::dxc::compile(&vt.hlsl, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", vt.hlsl));
+    let ps = super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
+    let c = [0.8f32, 0.6, 0.4, 1.0];
+    let verts: Vec<f32> = [[-1.0f32, -1.0], [-1.0, 3.0], [3.0, -1.0]].iter().flat_map(|p| [p[0], p[1], c[0], c[1], c[2], c[3]]).collect();
+    let layout = [
+        runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 },
+        runner::VertexElement { semantic: "COLOR", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 8 },
+    ];
+    let px = runner::draw(&vs, &ps, &layout, &verts, 24, &[], &[], 16, [0.0, 0.0, 1.0, 1.0]).unwrap_or_else(|e| panic!("{e}\n{}\n{}", vt.hlsl, pt.hlsl));
+    for (i, got) in px.iter().enumerate() {
+        assert!(got.iter().zip(c).all(|(a, b)| (a - b).abs() < 1e-5), "pixel {i} = {got:?}, expected {c:?}");
+    }
+}
+
 /// GPU draw regression for XCL-BT-012 (#1488): verifies all four `EXP` `VM` pixel-survival
 /// cases on the GPU through both the HLSL and Direct DXIL pixel-shader backends.
 #[test]
@@ -2021,6 +2352,55 @@ fn rect_list_gs_outputs() {
     assert!(h.contains("d.p0 = a.p0 + b.p0 - k.p0;") && h.contains("d.p2 = a.p2 + b.p2 - k.p2;") && !h.contains("d.p1 ="), "{h}");
     if super::dxc::location().is_ok() {
         super::dxc::compile(&h, "main", "gs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{h}"));
+    }
+}
+
+/// A clip distance at .x and a cull distance at .y of one output register: each element is
+/// declared with the components of its own mask and takes its own channel, in the VS and in the
+/// mesh pass-through. Counting components up to the mask's highest bit declared the cull
+/// distance as float2 holding (clip, cull).
+#[test]
+fn clip_and_cull_sharing_a_register_keep_their_channels() {
+    use super::emit::mesh_passthrough;
+    use super::{MsInterface, VsInterface};
+    let outputs = vec![el("SV_Position", 0, 1, 3, 0, 0xF), el("SV_ClipDistance", 0, 2, 3, 1, 0x1), el("SV_CullDistance", 0, 3, 3, 1, 0x2)];
+    let vs_code = prog(&[
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0x3), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 0), ("VSRC3", 0)], None),
+    ]);
+    let vsi = VsInterface { inputs: vec![], outputs: outputs.clone(), attr_base: 4, params: None };
+    let vs = translate(&vs_code, &Options { mode: Mode::Vertex(vsi), wave64: true, ..Default::default() }).unwrap().hlsl;
+    assert!(vs.contains("float p0 : SV_ClipDistance0;") && vs.contains("float p1 : SV_CullDistance0;"), "{vs}");
+    assert!(vs.contains("xo.p0 = asfloat(v8);") && vs.contains("xo.p1 = asfloat(v9);"), "{vs}");
+    let ms = MsInterface { outputs, threads: 32, max_vertices: 64, max_primitives: 64, ..Default::default() };
+    let pass = mesh_passthrough(&ms);
+    assert!(pass.contains("float p0 : SV_ClipDistance0;") && pass.contains("float p1 : SV_CullDistance0;"), "{pass}");
+    assert!(pass.contains("o.p0 = asfloat(res.Load4(b + 16u).x);") && pass.contains("o.p1 = asfloat(res.Load4(b + 32u).y);"), "{pass}");
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&vs, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{vs}"));
+        super::dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+    }
+}
+
+/// Five clip distances and two cull distances, the cull pair in .zw after two clip distances
+/// in .xy: 4 + 2 + 2 components, the D3D12 limit of 8. Counting up to each mask's highest bit
+/// gave the cull pair 4 (10 in all), which DXC refuses.
+#[test]
+fn clip_and_cull_count_only_their_mask() {
+    use super::emit::mesh_passthrough;
+    use super::MsInterface;
+    let outputs = vec![
+        el("SV_Position", 0, 1, 3, 0, 0xF),
+        el("SV_ClipDistance", 0, 2, 3, 1, 0xF),
+        el("SV_ClipDistance", 1, 2, 3, 2, 0x3),
+        el("SV_CullDistance", 0, 3, 3, 2, 0xC),
+    ];
+    let ms = MsInterface { outputs, threads: 32, max_vertices: 64, max_primitives: 64, ..Default::default() };
+    let pass = mesh_passthrough(&ms);
+    assert!(pass.contains("float4 p0 : SV_ClipDistance0;") && pass.contains("float2 p1 : SV_ClipDistance1;") && pass.contains("float2 p2 : SV_CullDistance0;"), "{pass}");
+    assert!(pass.contains("o.p1 = asfloat(res.Load4(b + 32u).xy);") && pass.contains("o.p2 = asfloat(res.Load4(b + 48u).zw);"), "{pass}");
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
     }
 }
 
@@ -3242,7 +3622,20 @@ fn gpu_format_stores_atomics_global_lds() {
         r[27] = 0;
         r[28] = 1;
     }
+    // buffer_atomic_umax's old values depend on the order the lanes ran in (up to the host, so
+    // `XCL_DXIL_DIFF=1` leaves them to this check): one lane sees 0, every other lane the value
+    // of a lane before it (ds_add_rtn's olds are a multiset: the harness compares them so)
+    let umax_olds = |r: &runner::KernelResult| {
+        let olds: Vec<u32> = r.vgpr.iter().take(64).map(|v| v[16]).collect();
+        assert_eq!(olds.iter().filter(|&&v| v == 0).count(), 1, "umax: one lane sees the initial 0: {olds:?}");
+        for (l, &v) in olds.iter().enumerate() {
+            assert!(v == 0 || (100..164).contains(&v) && v != 100 + l as u32, "lane {l} umax old value {v}");
+        }
+    };
+    let unordered = super::diff_kernel::Unordered { vgprs: vec![16..17], mem: Vec::new(), check: Box::new(umax_olds) };
+    let _relaxed = super::diff_kernel::relax(super::diff_kernel::Relax { unordered: Some(unordered), ..Default::default() });
     let r = runner::run_code(&code, &st, &vec![0u32; 1024]).unwrap();
+    umax_olds(&r);
     let byte = |a: usize| (r.mem[a / 4] >> (8 * (a % 4))) & 0xFF;
     for l in 0..64usize {
         let px = [byte(0x100 + 4 * l), byte(0x100 + 4 * l + 1), byte(0x100 + 4 * l + 2), byte(0x100 + 4 * l + 3)];
@@ -3258,7 +3651,6 @@ fn gpu_format_stores_atomics_global_lds() {
             assert_eq!(v[25], l as u32 + 1, "lane {l} ds_read2 (second; LDS is not zeroed past the written area)");
         }
         assert_eq!(v[29], 63 - l as u32, "lane {l} ds_bpermute");
-        assert!(v[16] < 164, "lane {l} umax old value");
     }
     assert_eq!(r.mem[0x400 / 4], 64, "buffer_atomic_add");
     assert_eq!(r.mem[0x404 / 4], 163, "buffer_atomic_umax");
@@ -3563,7 +3955,7 @@ fn gpu_mesh_mode_two_passes() {
         rw_mask: 0xF,
         stream: 0,
     };
-    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128 };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128, ..Default::default() };
     let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
         ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
     };
@@ -3659,6 +4051,7 @@ fn mesh_passthrough_strips_rdna2_edge_flag_bits() {
         threads: 128,
         max_vertices: 128,
         max_primitives: 128,
+        ..Default::default()
     };
     let unsplit = mesh_passthrough(&ms);
     assert!(unsplit.contains("uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu)"), "{unsplit}");
@@ -3700,7 +4093,7 @@ fn mesh_split_accounts_vertex_chunks() {
         outputs.push(sig("TEXCOORD", 0, k + 1, k));
     }
     outputs.push(sig("SV_ClipDistance", 2, 21, 0));
-    let ms = MsInterface { outputs, threads: 128, max_vertices: 128, max_primitives: 128 };
+    let ms = MsInterface { outputs, threads: 128, max_vertices: 128, max_primitives: 128, ..Default::default() };
     let elems = passthrough_elements(&ms, None);
     assert_eq!(elems, 21);
     // 22 rows * 16 B = 352 B/vertex: 64 accounted vertices fit (96 would be 33792 B), so at
@@ -3725,6 +4118,53 @@ fn mesh_split_accounts_vertex_chunks() {
     let pass8 = mesh_passthrough(&ms8);
     assert!(pass8.contains("verts[128]"), "whole record:\n{pass8}");
     super::dxc::compile(&pass8, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass8}"));
+}
+
+/// A pipeline without a pixel shader (depth only) gets a pass-through with SV_Position and the
+/// clip / cull distances alone, as for a PS that reads nothing. Declared with every output of
+/// the program, as before, 12 attributes on 256 vertices went out in 7 split groups per record
+/// (three vertex copies per triangle), and 34 attributes (two to a register, as a console
+/// signature packs them) with a clip distance were 36 signature rows, over D3D12's 32: DXC
+/// refused the pass-through and the pipeline with it.
+#[test]
+fn mesh_passthrough_without_a_pixel_shader_keeps_position_and_clip_alone() {
+    use super::emit::{mesh_passthrough, mesh_passthrough_for, passthrough_elements, passthrough_split, pipeline_passthrough};
+    use super::MsInterface;
+    let mut outputs = vec![el("SV_Position", 0, 1, 3, 0, 0xF)];
+    for k in 0..34u32 {
+        outputs.push(el("TEXCOORD", k, 0, 3, 1 + k / 2, if k % 2 == 0 { 0x3 } else { 0xC }));
+    }
+    outputs.push(el("SV_ClipDistance", 0, 2, 3, 18, 0xF));
+    let ms = MsInterface { outputs, threads: 128, max_vertices: 256, max_primitives: 256, ..Default::default() };
+    assert_eq!(passthrough_elements(&ms, None), 35, "every output: 36 rows with SV_Position");
+    let (pass, split) = pipeline_passthrough(&ms, None);
+    assert_eq!(split, 1, "{pass}");
+    assert!(!pass.contains("TEXCOORD"), "{pass}");
+    assert!(pass.contains("struct XclVert {\n    float4 pos : SV_Position;\n    float4 p0 : SV_ClipDistance0;\n};"), "{pass}");
+    // the clip distance keeps its record slot (35th of the program's outputs)
+    assert!(pass.contains("o.p0 = asfloat(res.Load4(b + 560u).xyzw);"), "{pass}");
+    assert!(pass.contains("out vertices XclVert verts[256]"), "{pass}");
+    // 12 attributes, no clip: whole records instead of 7 split groups
+    let mut ms12 = ms.clone();
+    ms12.outputs.truncate(13);
+    assert_eq!(passthrough_split(&ms12, passthrough_elements(&ms12, None)), 7);
+    let (pass12, split12) = pipeline_passthrough(&ms12, None);
+    assert_eq!(split12, 1, "{pass12}");
+    assert!(pass12.contains("struct XclVert {\n    float4 pos : SV_Position;\n};") && pass12.contains("verts[256]"), "{pass12}");
+    // with a pixel shader: its inputs, as `mesh_passthrough_for` declares them
+    let ins = vec![el("SV_Position", 0, 1, 3, 0, 0xF), el("TEXCOORD", 3, 0, 3, 1, 0xF)];
+    let (with_ps, split_ps) = pipeline_passthrough(&ms, Some(&ins));
+    assert_eq!(with_ps, mesh_passthrough_for(&ms, Some(&ins)));
+    assert_eq!(split_ps, passthrough_split(&ms, passthrough_elements(&ms, Some(&ins))));
+    assert!(with_ps.contains("float4 p0 : TEXCOORD3;") && with_ps.contains("float4 p1 : SV_ClipDistance0;"), "{with_ps}");
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+        super::dxc::compile(&pass12, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass12}"));
+        super::dxc::compile(&with_ps, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{with_ps}"));
+        // what a pipeline without a PS compiled before: every output, 36 rows
+        let all = mesh_passthrough(&ms);
+        assert!(super::dxc::compile(&all, "main", "ms_6_6", &[]).is_err(), "36 signature rows accepted:\n{all}");
+    }
 }
 
 /// The layout and the dispatch count are chosen separately: a record of 80 vertices with 22
@@ -3757,7 +4197,7 @@ fn mesh_layout_independent_of_group_count() {
     }
     outputs.push(sig("SV_ClipDistance", 2, 21, 0));
     // 22 rows * 16 B = 352 B/vertex: 64 accounted vertices fit; 80 declared do not
-    let ms = MsInterface { outputs, threads: 128, max_vertices: 80, max_primitives: 1 };
+    let ms = MsInterface { outputs, threads: 128, max_vertices: 80, max_primitives: 1, ..Default::default() };
     let elems = passthrough_elements(&ms, None);
     assert_eq!(elems, 21);
     // one triangle: its 3 copies fit one compact group, so the dispatch count is 1
@@ -3770,6 +4210,133 @@ fn mesh_layout_independent_of_group_count() {
     let whole = pass.replace("verts[3]", "verts[80]");
     assert!(whole.contains("verts[80]"), "the whole-record declaration for the refusal check:\n{whole}");
     assert!(super::dxc::compile(&whole, "main", "ms_6_6", &[]).is_err(), "DXC refuses 96 accounted vertices of 352 B");
+}
+
+/// A console MS whose PSV0 output topology is lines draws through a line pass-through: two
+/// indices per primitive (the first two of the record's packed three), `outputtopology("line")`
+/// and `uint2` indices, also in the split form, where each line gets its own two vertex copies
+/// and a group carries more lines than triangles. Triangle records keep the triangle form.
+#[test]
+fn mesh_passthrough_draws_line_records_as_lines() {
+    use super::emit::{mesh_passthrough, passthrough_elements, passthrough_split};
+    use super::MsInterface;
+    let sig = |name: &str, sv: u32, reg: u32, index: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let tri = MsInterface { outputs: vec![sig("SV_Position", 1, 0, 0), sig("TEXCOORD", 0, 1, 0)], threads: 128, max_vertices: 128, max_primitives: 128, lines: false };
+    let line = MsInterface { lines: true, ..tri.clone() };
+    let pass = mesh_passthrough(&line);
+    assert!(pass.contains("[outputtopology(\"line\")]"), "{pass}");
+    assert!(pass.contains("out vertices XclVert verts[128], out indices uint2 tris[128])"), "{pass}");
+    assert!(pass.contains("bool bad = or((p >> 31) != 0u, any(x.xy >= nv));"), "{pass}");
+    assert!(pass.contains("tris[j] = select(bad, uint2(0u, 0u), x.xy);"), "{pass}");
+    assert!(!pass.contains("triangle") && !pass.contains("uint3 tris"), "{pass}");
+    let tpass = mesh_passthrough(&tri);
+    assert!(tpass.contains("[outputtopology(\"triangle\")]") && tpass.contains("out indices uint3 tris[128])"), "{tpass}");
+    assert!(tpass.contains("tris[j] = select(bad, uint3(0u, 0u, 0u), x);"), "{tpass}");
+
+    // 22 float4 rows: 64 vertices per group – 21 triangles (7 groups) or 32 lines (4 groups)
+    let mut wide = vec![sig("SV_Position", 1, 0, 0)];
+    for k in 0..21u32 {
+        wide.push(sig("TEXCOORD", 0, k + 1, k));
+    }
+    let wtri = MsInterface { outputs: wide, ..tri.clone() };
+    let wline = MsInterface { lines: true, ..wtri.clone() };
+    assert_eq!(passthrough_split(&wtri, passthrough_elements(&wtri, None)), 7);
+    assert_eq!(passthrough_split(&wline, passthrough_elements(&wline, None)), 4);
+    let split = mesh_passthrough(&wline);
+    assert!(split.contains("[outputtopology(\"line\")]"), "{split}");
+    assert!(split.contains("out vertices XclVert verts[64], out indices uint2 tris[32])"), "{split}");
+    assert!(split.contains("SetMeshOutputCounts(2u * n, n);") && split.contains("c < 2u; c++"), "{split}");
+    assert!(split.contains("verts[2u * j + c] = o;"), "{split}");
+    assert!(split.contains("tris[j] = select(bad, uint2(0u, 0u), uint2(2u * j, 2u * j + 1u));"), "{split}");
+    assert!(!split.contains("triangle") && !split.contains("3u * j"), "{split}");
+    let tsplit = mesh_passthrough(&wtri);
+    assert!(tsplit.contains("verts[57], out indices uint3 tris[19])") && tsplit.contains("SetMeshOutputCounts(3u * n, n);"), "{tsplit}");
+
+    if super::dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    for p in [&pass, &split] {
+        super::dxc::compile(p, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{p}"));
+    }
+}
+
+/// `gpu_mesh_mode_two_passes` with a line: the program exports one primitive whose first
+/// two indices are a horizontal line through the pixel centres of row 16, the line pass-
+/// through rasterises it, and only that row is drawn.
+#[test]
+fn gpu_mesh_mode_two_passes_line() {
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    use super::{dxc, mesh_passthrough, MsInterface, MESH_HEADER};
+    let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index: 0,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128, lines: true };
+    let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
+    };
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
+        ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None), // thread
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 124), ("SSRC0", 255)], Some(1 << 12 | 2)), // 1 primitive, 2 vertices
+        ("S_SENDMSG", "ENC_SOPP", vec![("SIMM16", 9)], None),
+        ("V_CMPX_GT_U32", "ENC_VOPC", vec![("SRC0", 130), ("VSRC1", 0)], None), // threads 0..1
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", vec![("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 14), ("SRC0", 242)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 15), ("SRC0", 128)], None),
+    ];
+    list.push(exp(12, 0xF, [10, 11, 12, 13], 1));
+    list.push(exp(32, 0xF, [14, 15, 15, 14], 0));
+    list.push(("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None));
+    list.push(("V_CMPX_EQ_U32", "ENC_VOPC", vec![("SRC0", 128), ("VSRC1", 0)], None)); // thread 0
+    list.push(("V_MOV_B32", "ENC_VOP1", vec![("VDST", 21), ("SRC0", 255)], Some(1 << 10)));
+    list.push(exp(20, 1, [21, 0, 0, 0], 1));
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+    let opt = on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() });
+    let t = translate(&code, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let cs = direct_or(&code, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap());
+    let pass = mesh_passthrough(&ms);
+    assert!(pass.contains("[outputtopology(\"line\")]"), "{pass}");
+    let msb = dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+    let ps = dxc::compile("struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return v.p0; }\n", "main", "ps_6_6", &[]).unwrap();
+    // vertex table at byte 0x100, V# in s[16:19] (stride 16, 2 records): (-1, y) and (1, y),
+    // y the centre of pixel row 16 of 32
+    let y = 1.0f32 - 16.5 / 16.0;
+    let mut mem = vec![0u32; 256];
+    for (i, x) in [-1.0f32, 1.0].iter().enumerate() {
+        mem[0x40 + 4 * i..0x40 + 4 * i + 4].copy_from_slice(&[f(*x), f(y), f(0.0), f(1.0)]);
+    }
+    let mut sg = vec![0u32; 128];
+    sg[16..20].copy_from_slice(&[0x100, 16 << 16, 2, 0]);
+    let (px, rec) = runner::mesh_draw(&cs, &msb, &ps, 1, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+    assert_eq!((rec[0], rec[1]), (2, 1), "GS_ALLOC_REQ counts");
+    assert_eq!(rec[MESH_HEADER + 128 * ms.vert_dwords()], 1 << 10, "the line primitive");
+    let at = |x: usize, y: usize| px[y * 32 + x];
+    for x in [4usize, 16, 27] {
+        assert_eq!(at(x, 16), [1.0, 0.0, 0.0, 1.0], "pixel {x} on the line");
+        assert_eq!(at(x, 13), [-1.0; 4], "pixel {x} above the line");
+        assert_eq!(at(x, 19), [-1.0; 4], "pixel {x} below the line");
+    }
 }
 
 /// DXC optimisation levels on a saved HLSL file (`XCL_TIME_HLSL=path`, profile in `XCL_TIME_PROFILE`).
@@ -4013,7 +4580,7 @@ fn gpu_mesh_mode_reads_memory_windows() {
         rw_mask: 0xF,
         stream: 0,
     };
-    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0)], threads: 64, max_vertices: 64, max_primitives: 64 };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0)], threads: 64, max_vertices: 64, max_primitives: 64, ..Default::default() };
     let list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
         ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
         ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None), // thread
@@ -5422,6 +5989,44 @@ fn gpu_triangle_pair_and_box16_nodes() {
     assert!(checked > 5, "{checked} triangle hits");
 }
 
+/// bvh_intersect's triangle test rounds every step, as the CPU mirror does: a triangle whose
+/// det is 0 that way (a miss) but 2^-46 when a driver fuses d.y * e2.z into the subtraction
+/// after it (a hit; bvh::tests::triangle_hit_rounds_every_step). Both paths, bit for bit.
+#[test]
+fn gpu_bvh_triangle_rounds_every_step() {
+    use crate::gpu::bvh;
+    if !gpu_ready() {
+        return;
+    }
+    let (a, c) = (1.0 + f32::EPSILON, 1.0 + 2.0 * f32::EPSILON);
+    let base = 0x1000usize;
+    let mut mem = vec![0u32; 0x2000 / 4];
+    // triangle node type 0 at the base: v0 = 0, v1 = (1, 0, 0), v2 = (0, 1, a); id word 0
+    for (k, x) in [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, a].iter().enumerate() {
+        mem[base / 4 + k] = x.to_bits();
+    }
+    let node = 0u32;
+    let mut code = encode("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 100), ("VADDR", 0), ("SRSRC", 2), ("DMASK", 15)], None).unwrap();
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&[(base >> 8) as u32, 1 << 31, u32::MAX, 0]);
+    let (o, d) = ([0.5f32, 0.0, 0.0], [0.0f32, a, c]);
+    let inv = d.map(|x| 1.0 / x);
+    for v in st.vgpr.iter_mut() {
+        v[0] = node;
+        for (k, x) in [100.0f32, o[0], o[1], o[2], d[0], d[1], d[2], inv[0], inv[1], inv[2]].iter().enumerate() {
+            v[1 + k] = x.to_bits();
+        }
+    }
+    let res = runner::run_code(&code, &st, &mem).unwrap();
+    let data: Vec<u8> = mem[base / 4..].iter().flat_map(|x| x.to_le_bytes()).collect();
+    let cpu = bvh::intersect_node(&data, node, 100.0, o, d, inv, true);
+    assert_eq!(cpu, [f32::INFINITY.to_bits(), 1.0f32.to_bits(), 0, 0], "the CPU mirror misses");
+    for (l, v) in res.vgpr.iter().enumerate() {
+        assert_eq!(&v[100..104], &cpu[..], "lane {l}");
+    }
+}
+
 /// Multi-window `image_bvh64_intersect_ray` (full 64-bit node pointer into UMA window 1 with
 /// base = 0, plus 48-bit base in window 1) and axis-aligned grazing ray / NaN-disabled box.
 #[test]
@@ -5808,8 +6413,24 @@ fn gpu_atomic_fcmpswap_x2() {
         mem[a / 4] = INIT as u32;
         mem[a / 4 + 1] = (INIT >> 32) as u32;
     }
-    let r = runner::run_code(&code, &st, &mem).unwrap();
     let old = |v: &[u32], at: usize| v[at] as u64 | (v[at + 1] as u64) << 32;
+    // shared cells: exactly one lane sees INIT (the winner); the cell holds its value. Which
+    // lane wins is up to the host, so `XCL_DXIL_DIFF=1` leaves these values to this check.
+    let shared = move |r: &runner::KernelResult| {
+        let cell = |a: usize| r.mem[a / 4] as u64 | (r.mem[a / 4 + 1] as u64) << 32;
+        for (i, (dst, a, tag)) in [(30, 0xC00usize, 0x5B00u64), (40, 0xE00, 0x5F00), (44, 0x1200, 0x5A00)].iter().enumerate() {
+            let winners: Vec<usize> = r.vgpr.iter().enumerate().filter(|(_, v)| old(v, *dst) == INIT).map(|(l, _)| l).collect();
+            assert_eq!(winners.len(), 1, "shared cell {i}: exactly one lane wins the swap");
+            assert_eq!(cell(*a), newv(*tag, winners[0] as u64), "shared cell {i}: the winner's value landed");
+        }
+    };
+    let unordered = super::diff_kernel::Unordered {
+        vgprs: vec![30..32, 40..42, 44..46],
+        mem: vec![0xC00 / 4..0xC08 / 4, 0xE00 / 4..0xE08 / 4, 0x1200 / 4..0x1208 / 4],
+        check: Box::new(shared),
+    };
+    let _relaxed = super::diff_kernel::relax(super::diff_kernel::Relax { unordered: Some(unordered), ..Default::default() });
+    let r = runner::run_code(&code, &st, &mem).unwrap();
     let cell = |a: usize| r.mem[a / 4] as u64 | (r.mem[a / 4 + 1] as u64) << 32;
     for l in 0..64usize {
         let v = &r.vgpr[l];
@@ -5826,12 +6447,7 @@ fn gpu_atomic_fcmpswap_x2() {
         // the compare register half is untouched
         assert_eq!(old(v, 6), cmp, "lane {l}: buffer cmp regs");
     }
-    // shared cells: exactly one lane sees INIT (the winner); the cell holds its value
-    for (i, (dst, a, tag)) in [(30, 0xC00usize, 0x5B00u64), (40, 0xE00, 0x5F00), (44, 0x1200, 0x5A00)].iter().enumerate() {
-        let winners: Vec<usize> = r.vgpr.iter().enumerate().filter(|(_, v)| old(v, *dst) == INIT).map(|(l, _)| l).collect();
-        assert_eq!(winners.len(), 1, "shared cell {i}: exactly one lane wins the swap");
-        assert_eq!(cell(*a), newv(*tag, winners[0] as u64), "shared cell {i}: the winner's value landed");
-    }
+    shared(&r);
 }
 
 /// Float compare-and-swap atomics across LDS (`ds_cmpst_rtn_f32`), buffer/global/flat 32-bit and
@@ -6882,7 +7498,7 @@ fn far_jumps_are_direct_branches() {
 /// programs with cross-half operations included; native wave64 and wave32 programs unchanged.
 #[test]
 fn mesh_split_wave64_form() {
-    let ms = super::MsInterface { threads: 128, max_vertices: 64, max_primitives: 64, outputs: vec![] };
+    let ms = super::MsInterface { threads: 128, max_vertices: 64, max_primitives: 64, outputs: vec![], ..Default::default() };
     let lane = prog(&[("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V)], None)]);
     let branch = prog(&[("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)], None)]);
     for code in [&lane, &branch] {
@@ -7775,6 +8391,103 @@ fn f64_math_random(wave64: bool) {
     assert!(bad.is_empty());
 }
 
+/// (NaN operand, the result RDNA2's VALU returns for it): quiet, sign and payload kept.
+/// Signalling and quiet NaNs of both signs.
+const NAN_F64: [(u64, u64); 4] = [
+    (0x7FF0_0000_0000_0001, 0x7FF8_0000_0000_0001),
+    (0xFFF4_0000_1234_5678, 0xFFFC_0000_1234_5678),
+    (0x7FF8_0000_0000_00AB, 0x7FF8_0000_0000_00AB),
+    (0xFFFC_0000_0000_1234, 0xFFFC_0000_0000_1234),
+];
+const NAN_F32: [(u32, u32); 4] = [(0x7F80_0001, 0x7FC0_0001), (0xFFA0_0123, 0xFFE0_0123), (0x7FC0_00AB, 0x7FC0_00AB), (0xFFC0_1234, 0xFFC0_1234)];
+
+/// The tables of `gpu_nan_operands_come_back_quiet`: each result is its operand with the
+/// quiet bit set and nothing else changed.
+#[test]
+fn nan_tables_set_only_the_quiet_bit() {
+    for (x, want) in NAN_F64 {
+        assert!(f64::from_bits(x).is_nan() && want == x | 1 << 51, "{x:#018x}");
+    }
+    for (x, want) in NAN_F32 {
+        assert!(f32::from_bits(x).is_nan() && want == x | 1 << 22, "{x:#010x}");
+    }
+    // two of each are signalling, of either sign
+    assert_eq!(NAN_F64.iter().filter(|c| c.0 & 1 << 51 == 0).map(|c| c.0 >> 63).collect::<Vec<_>>(), [0, 1]);
+    assert_eq!(NAN_F32.iter().filter(|c| c.0 & 1 << 22 == 0).map(|c| c.0 >> 31).collect::<Vec<_>>(), [0, 1]);
+}
+
+/// The ops whose HLSL helpers return a NaN x as it is (`trunc_d`, `sqrt_d`, `ldexp_f`, …)
+/// pass their operand through `quiet_d` / `quiet_f` first.
+#[test]
+fn nan_operands_are_quieted_before_the_hlsl_helpers() {
+    let vop3: &[(&str, u64)] = &[("VDST", 2), ("SRC0", V), ("SRC1", V + 20)];
+    let vop1: &[(&str, u64)] = &[("VDST", 2), ("SRC0", V)];
+    let ops = [
+        ("V_TRUNC_F64", "ENC_VOP1", vop1, "trunc_d(quiet_d("),
+        ("V_FLOOR_F64", "ENC_VOP1", vop1, "floor_d(quiet_d("),
+        ("V_CEIL_F64", "ENC_VOP1", vop1, "ceil_d(quiet_d("),
+        ("V_FRACT_F64", "ENC_VOP1", vop1, "fract_d(quiet_d("),
+        ("V_RNDNE_F64", "ENC_VOP1", vop1, "round_ne_d(quiet_d("),
+        ("V_FREXP_MANT_F64", "ENC_VOP1", vop1, "frexp_mant_d(quiet_d("),
+        ("V_SQRT_F64", "ENC_VOP1", vop1, "sqrt_d(quiet_d("),
+        ("V_RSQ_F64", "ENC_VOP1", vop1, "sqrt_d(quiet_d("),
+        ("V_LDEXP_F64", "ENC_VOP3", vop3, "ldexp_d(quiet_d("),
+        ("V_LDEXP_F32", "ENC_VOP3", vop3, "ldexp_f(quiet_f("),
+        ("V_FREXP_MANT_F32", "ENC_VOP1", vop1, "frexp_mant(quiet_f("),
+    ];
+    for (name, enc, fields, call) in ops {
+        let t = translate(&prog(&[(name, enc, fields, None)]), &Options::default()).unwrap();
+        assert!(t.complete(), "{name}: {:?}", t.unsupported_why);
+        assert!(t.hlsl.contains("    if (isnan_d(x)) return asdouble(l, h | 0x00080000u);\n    return x;\n}"), "quiet_d");
+        assert!(t.hlsl.contains("if ((u & 0x7FFFFFFFu) > 0x7F800000u) return asfloat(u | 0x00400000u);"), "quiet_f");
+        let main = t.hlsl.split("void main(").nth(1).unwrap_or(&t.hlsl);
+        assert!(main.contains(call), "{name}: no {call} in\n{main}");
+    }
+}
+
+/// A NaN operand comes back quiet with its sign and payload, a signalling NaN with the quiet
+/// bit set, as RDNA2's VALU returns it, from the f64 and f32 ops whose helpers keep a NaN as
+/// it is, on either path (XCL_DIRECT_DXIL=1 for the direct one).
+#[test]
+fn gpu_nan_operands_come_back_quiet() {
+    let f64_ops = [("TRUNC", 22), ("FLOOR", 24), ("CEIL", 26), ("FRACT", 28), ("RNDNE", 30), ("FREXP_MANT", 32), ("SQRT", 34), ("RSQ", 36)];
+    let names: Vec<String> = f64_ops.iter().map(|(op, _)| format!("V_{op}_F64")).collect();
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>)> =
+        f64_ops.iter().zip(&names).map(|(&(_, d), n)| (n.as_str(), "ENC_VOP1", vec![("VDST", d), ("SRC0", V)])).collect();
+    list.push(("V_LDEXP_F64", "ENC_VOP3", vec![("VDST", 38), ("SRC0", V), ("SRC1", V + 20)]));
+    list.push(("V_LDEXP_F32", "ENC_VOP3", vec![("VDST", 40), ("SRC0", V + 21), ("SRC1", V + 20)]));
+    list.push(("V_FREXP_MANT_F32", "ENC_VOP1", vec![("VDST", 41), ("SRC0", V + 21)]));
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(n, e, f)| (*n, *e, f.as_slice(), None)).collect();
+    let p = prog(&refs);
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        for (l, v) in st.vgpr.iter_mut().enumerate() {
+            let x = NAN_F64[l % NAN_F64.len()].0;
+            (v[0], v[1], v[20], v[21]) = (x as u32, (x >> 32) as u32, 3, NAN_F32[l % NAN_F32.len()].0);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        let mut bad = Vec::new();
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (x, want) = NAN_F64[l % NAN_F64.len()];
+            for (name, d) in f64_ops.iter().copied().chain([("LDEXP", 38)]) {
+                let got = v[d as usize] as u64 | (v[d as usize + 1] as u64) << 32;
+                if got != want {
+                    bad.push(format!("v_{}_f64({x:#018x}) = {got:#018x}, want {want:#018x}", name.to_lowercase()));
+                }
+            }
+            let (x, want) = NAN_F32[l % NAN_F32.len()];
+            for (name, d) in [("ldexp", 40), ("frexp_mant", 41)] {
+                if v[d] != want {
+                    bad.push(format!("v_{name}_f32({x:#010x}) = {:#010x}, want {want:#010x}", v[d]));
+                }
+            }
+        }
+        bad.sort();
+        bad.dedup();
+        assert!(bad.is_empty(), "wave{lanes}:\n{}", bad.join("\n"));
+    }
+}
+
 fn f16_to_f64(h: u16) -> f64 {
     let s = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
     let e = (h >> 10) & 0x1F;
@@ -8083,6 +8796,93 @@ fn gpu_nonfused_mad_and_mac_prevent_fma_contraction() {
     assert_eq!(v1[13], 0x0000_0000, "v_madmk_f32 cancellation must not fuse");
     assert_eq!(v1[15], 0x0000_0000, "v_madak_f32 cancellation must not fuse");
     assert_eq!(v1[16], 0x2880_0000, "v_fma_f32 cancellation control should stay fused");
+}
+
+/// A v_mul whose result a following v_add / v_sub / v_subrev takes, and a v_add whose
+/// addend the next v_sub takes away again: RDNA2 rounds each instruction, so the result must
+/// be the separately rounded one, not that of a multiply-add fused across the two
+/// instructions or of a reassociated sum. Even lanes: a = f32::MAX, b = 1 + 2^-23,
+/// c = -f32::MAX (separate +inf, fused 0x73FFFFFF); odd lanes: a = b = 1 + 2^-23,
+/// c = -(1 + 2^-22) (separate +0, fused 2^-46); and the same for f64. (1 + 2^24) - 2^24 is 0,
+/// not 1. v_fma controls show that the vectors tell fused from separate. Collects every
+/// difference first, so one run shows which pairs the compiler or the driver fused on which
+/// path (XCL_DIRECT_DXIL=1 for the direct one).
+#[test]
+fn gpu_mul_then_add_rounds_each_instruction() {
+    let p = prog(&[
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V), ("VSRC1", 1)], None),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 10), ("SRC0", V + 2), ("VSRC1", 4)], None),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 11), ("SRC0", V + 4), ("VSRC1", 2)], None),
+        ("V_SUB_F32", "ENC_VOP2", &[("VDST", 12), ("SRC0", V + 2), ("VSRC1", 5)], None),
+        ("V_SUBREV_F32", "ENC_VOP2", &[("VDST", 13), ("SRC0", V + 5), ("VSRC1", 2)], None),
+        ("V_SUB_F32", "ENC_VOP2", &[("VDST", 14), ("SRC0", V + 5), ("VSRC1", 2)], None),
+        ("V_FMA_F32", "ENC_VOP3", &[("VDST", 15), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 4)], None),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 7), ("VSRC1", 8)], None),
+        ("V_SUB_F32", "ENC_VOP2", &[("VDST", 16), ("SRC0", V + 6), ("VSRC1", 8)], None),
+        ("V_MUL_F64", "ENC_VOP3", &[("VDST", 18), ("SRC0", V + 20), ("SRC1", V + 22)], None),
+        ("V_ADD_F64", "ENC_VOP3", &[("VDST", 24), ("SRC0", V + 18), ("SRC1", V + 26)], None),
+        ("V_FMA_F64", "ENC_VOP3", &[("VDST", 28), ("SRC0", V + 20), ("SRC1", V + 22), ("SRC2", V + 26)], None),
+    ]);
+    // (a, b, c) and the f64 (a, b, c): overflow, cancellation
+    let f32s = [(0x7F7F_FFFFu32, 0x3F80_0001u32, 0xFF7F_FFFFu32), (0x3F80_0001, 0x3F80_0001, 0xBF80_0002)];
+    let f64s = [
+        (0x7FEF_FFFF_FFFF_FFFFu64, 0x3FF0_0000_0000_0001u64, 0xFFEF_FFFF_FFFF_FFFFu64),
+        (0x3FF0_0000_0000_0001, 0x3FF0_0000_0000_0001, 0xBFF0_0000_0000_0002),
+    ];
+    // (what, register, separately rounded, fused or reassociated) per vector; d >= 18: f64
+    let want: [[(&str, usize, u64, u64); 11]; 2] = [
+        [
+            ("v_mul_f32", 2, 0x7F80_0000, 0x7F80_0000),
+            ("v_mul_f32 -> v_add_f32 (product first)", 10, 0x7F80_0000, 0x73FF_FFFF),
+            ("v_mul_f32 -> v_add_f32 (product second)", 11, 0x7F80_0000, 0x73FF_FFFF),
+            ("v_mul_f32 -> v_sub_f32 (p - -c)", 12, 0x7F80_0000, 0x73FF_FFFF),
+            ("v_mul_f32 -> v_subrev_f32 (p - -c)", 13, 0x7F80_0000, 0x73FF_FFFF),
+            ("v_mul_f32 -> v_sub_f32 (-c - p)", 14, 0xFF80_0000, 0xF3FF_FFFF),
+            ("v_fma_f32 (control)", 15, 0x73FF_FFFF, 0x73FF_FFFF),
+            ("v_add_f32 -> v_sub_f32 ((x + y) - y)", 16, 0, 0x3F80_0000),
+            ("v_mul_f64", 18, 0x7FF0_0000_0000_0000, 0x7FF0_0000_0000_0000),
+            ("v_mul_f64 -> v_add_f64", 24, 0x7FF0_0000_0000_0000, 0x7CAF_FFFF_FFFF_FFFF),
+            ("v_fma_f64 (control)", 28, 0x7CAF_FFFF_FFFF_FFFF, 0x7CAF_FFFF_FFFF_FFFF),
+        ],
+        [
+            ("v_mul_f32", 2, 0x3F80_0002, 0x3F80_0002),
+            ("v_mul_f32 -> v_add_f32 (product first)", 10, 0, 0x2880_0000),
+            ("v_mul_f32 -> v_add_f32 (product second)", 11, 0, 0x2880_0000),
+            ("v_mul_f32 -> v_sub_f32 (p - -c)", 12, 0, 0x2880_0000),
+            ("v_mul_f32 -> v_subrev_f32 (p - -c)", 13, 0, 0x2880_0000),
+            ("v_mul_f32 -> v_sub_f32 (-c - p)", 14, 0, 0xA880_0000),
+            ("v_fma_f32 (control)", 15, 0x2880_0000, 0x2880_0000),
+            ("v_add_f32 -> v_sub_f32 ((x + y) - y)", 16, 0, 0x3F80_0000),
+            ("v_mul_f64", 18, 0x3FF0_0000_0000_0002, 0x3FF0_0000_0000_0002),
+            ("v_mul_f64 -> v_add_f64", 24, 0, 0x3970_0000_0000_0000),
+            ("v_fma_f64 (control)", 28, 0x3970_0000_0000_0000, 0x3970_0000_0000_0000),
+        ],
+    ];
+    let path = if runner::direct_dxil() { "direct" } else { "HLSL" };
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        for (l, v) in st.vgpr.iter_mut().enumerate() {
+            let ((a, b, c), (da, db, dc)) = (f32s[l % 2], f64s[l % 2]);
+            (v[0], v[1], v[4], v[5], v[7], v[8]) = (a, b, c, c ^ 0x8000_0000, 0x3F80_0000, 0x4B80_0000);
+            for (r, x) in [(20, da), (22, db), (26, dc)] {
+                (v[r], v[r + 1]) = (x as u32, (x >> 32) as u32);
+            }
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        let mut bad = Vec::new();
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            for &(what, d, sep, fused) in &want[l % 2] {
+                let got = if d >= 18 { v[d] as u64 | (v[d + 1] as u64) << 32 } else { v[d] as u64 };
+                if got != sep {
+                    let how = if got == fused { "the fused or reassociated result" } else { "neither" };
+                    bad.push(format!("{path} wave{lanes}, {} vector: {what} = {got:#x}, want {sep:#x} ({how})", ["overflow", "cancellation"][l % 2]));
+                }
+            }
+        }
+        bad.sort();
+        bad.dedup();
+        assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+    }
 }
 
 #[test]
@@ -8911,12 +9711,14 @@ fn gpu_safe_s_barrier_multi_warp_and_early_endpgm() {
     let mut io = vec![0u32; 128];
     io[0] = base as u32;
     for wave64 in [true, false] {
-        let t = translate(&p_all, &on_gpu(Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() })).unwrap();
+        let opt = on_gpu(Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() });
+        let t = translate(&p_all, &opt).unwrap();
         assert!(t.complete(), "wave64={wave64}: {:?}", t.unsupported_why);
         if std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0") {
             assert!(t.hlsl.contains("xcl_s_barrier();"), "wave64={wave64}: expected xcl_s_barrier()");
         }
         let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        diff_pair(&p_all, &opt, &dxil);
         let out = runner::dispatch(&dxil, [1, 1, 1], &io, &vec![0u32; (base + 128 * 4) / 4]).unwrap();
         for tid in 0..128usize {
             let want = ((tid ^ 96) + 0x101) as u32;

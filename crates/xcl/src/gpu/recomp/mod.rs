@@ -64,6 +64,8 @@ pub mod partition;
 pub mod x64_masks;
 pub mod pso;
 pub use emit::mesh_passthrough;
+pub mod diff_kernel;
+pub mod diff_table;
 pub mod runner;
 pub mod ssa;
 #[cfg(test)]
@@ -162,6 +164,9 @@ pub struct MsInterface {
     pub threads: u32,
     pub max_vertices: u32,
     pub max_primitives: u32,
+    /// PSV0 output topology is lines (2 vertex indices per primitive, `outputtopology("line")`);
+    /// false: triangles
+    pub lines: bool,
 }
 
 /// dwords before the vertices of a mesh record: vertex count, primitive count, 2 spare
@@ -228,6 +233,7 @@ impl GsInterface {
             threads: 64,
             max_vertices: (GS_PRIMS_PER_GROUP * mvc).clamp(1, 256),
             max_primitives: (GS_PRIMS_PER_GROUP * mvc.saturating_sub(2).max(1)).clamp(1, 256),
+            lines: false,
         }
     }
 }
@@ -304,6 +310,46 @@ pub fn geometry_program(es_blob: &[u8], gs_blob: &[u8]) -> Result<(Vec<u8>, GsIn
     let mut code = es;
     code.extend_from_slice(&gs);
     Ok((code, g))
+}
+
+/// Signature rows D3D12 has for a vertex shader's outputs and a pixel shader's inputs
+/// (`D3D12_VS_OUTPUT_REGISTER_COUNT`, `D3D12_PS_INPUT_REGISTER_COUNT`), SV_Position's included.
+pub const SIGNATURE_ROWS: usize = 32;
+
+/// The PC signature rows of a console signature's user elements (`ranked(sig, false)`), each
+/// the places there of the elements it carries; the first names the row (its semantic, type
+/// and, in a PS, interpolation). One row per element, as XCL declares them, while that fits
+/// next to SV_Position. A console signature packs elements two or more to a register (each in
+/// the components of its mask), so it can hold more elements than D3D12 has rows: then the
+/// elements of one register share its row, one row per register and kind (float /
+/// integer: an integer input is not interpolated), named by the element at the lowest
+/// component. The VS output, the PS input and the mesh pass-through all take their rows from
+/// here, so a VS and a PS with the same signature declare the same rows (D3D12 links them by
+/// register). A row carries the whole register: what `exp param N` writes to every element
+/// there (`emit::export_graphics`) and what `v_interp` reads from one.
+pub fn signature_rows(sig: &[SigElement]) -> Vec<Vec<usize>> {
+    let user = ranked(sig, false);
+    if user.len() < SIGNATURE_ROWS {
+        return (0..user.len()).map(|j| vec![j]).collect();
+    }
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    for (j, e) in user.iter().enumerate() {
+        let float = e.component_type == 3;
+        match rows.iter_mut().find(|r| user[r[0]].register == e.register && (user[r[0]].component_type == 3) == float) {
+            Some(r) => r.push(j),
+            None => rows.push(vec![j]),
+        }
+    }
+    for r in &mut rows {
+        r.sort_by_key(|&j| user[j].mask.trailing_zeros());
+    }
+    rows.sort_by_key(|r| (user[r[0]].register, user[r[0]].mask.trailing_zeros()));
+    rows
+}
+
+/// Whether `signature_rows` puts two elements of `sig` in one row (else it is one per element).
+pub fn signature_packed(sig: &[SigElement]) -> bool {
+    signature_rows(sig).iter().any(|r| r.len() > 1)
 }
 
 /// Non-system elements in register order – the order of `exp param N` / `v_interp attrN`.
@@ -481,14 +527,16 @@ pub fn interface(blob: &[u8], sh: &super::xbox::XboxShader, f: &super::xbox::Fss
         ("MS", 7) => {
             let p = super::dxbc::psv(blob)?;
             let threads = p.numthreads.map(|t| t[0] * t[1].max(1) * t[2].max(1)).filter(|&t| t > 0).unwrap_or(128);
-            if p.ms_topology != 2 {
-                return None; // lines / points: not yet
+            // DXIL's mesh output topologies: 1 line, 2 triangle (D3D12 has no point form)
+            if !matches!(p.ms_topology, 1 | 2) {
+                return None;
             }
             Some(Mode::Mesh(MsInterface {
                 outputs,
                 threads,
                 max_vertices: (p.ms_max_vertices as u32).clamp(1, 256),
                 max_primitives: (p.ms_max_primitives as u32).clamp(1, 256),
+                lines: p.ms_topology == 1,
             }))
         }
         _ => None,

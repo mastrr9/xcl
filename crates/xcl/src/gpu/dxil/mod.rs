@@ -16,6 +16,7 @@ pub mod cfg;
 mod compact;
 pub mod container;
 pub mod coverage;
+pub mod covered;
 pub mod graphics;
 pub mod kernel;
 mod lanes;
@@ -45,6 +46,8 @@ mod core_tests;
 mod tests;
 #[cfg(test)]
 mod ops_tests;
+#[cfg(test)]
+mod covered_tests;
 #[cfg(test)]
 mod bitreader_tests;
 #[cfg(test)]
