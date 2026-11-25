@@ -341,7 +341,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     }
 }
 
-/// XCL's own buffer for `fresh_indirect_arguments` (device, buffer): COMMON between its uses
+/// XCL's own buffer for `fresh_indirect_arguments` (device, buffer): COMMON between a list's
+/// barriers
 static ARGUMENT_ORDER: Mutex<Option<(usize, ID3D12Resource)>> = Mutex::new(None);
 
 /// `op` (an ExecuteIndirect on `list`) reading the arguments and count the list wrote before it.
@@ -356,16 +357,18 @@ static ARGUMENT_ORDER: Mutex<Option<(usize, ID3D12Resource)>> = Mutex::new(None)
 /// whatever count the memory held before. A transition to INDIRECT_ARGUMENT makes the driver
 /// wait for the writes – of any buffer, as measured there. The title's buffer is in the title's
 /// state (its transitions reach the PC list), so a buffer of XCL's own takes it, COMMON ->
-/// INDIRECT_ARGUMENT before and back after. Only on a list XCL made (`list_x::on_create`) and
-/// not a bundle, which cannot hold barriers; its type comes from XCL's state, not a call to it.
+/// INDIRECT_ARGUMENT before. Only on a list XCL made (`list_x::on_create`) and not a bundle,
+/// which cannot hold barriers; its type comes from XCL's state, not a call to it.
+///
+/// The buffer stays in INDIRECT_ARGUMENT until the list's next barrier (`list_x::in_state_left`):
+/// writes that a later ExecuteIndirect reads reach it through a barrier, which takes the buffer
+/// back to COMMON in its own call, and that ExecuteIndirect's transition waits for them again.
+/// The ExecuteIndirects in a row between two barriers wait once, not each twice (before and after).
 unsafe fn fresh_indirect_arguments(list: *mut c_void, op: impl FnOnce()) {
     let tracked = super::list_x::tracked_list_type(list).is_some_and(|t| t != D3D12_COMMAND_LIST_TYPE_BUNDLE);
     let buffer = if tracked { ID3D12GraphicsCommandList::from_raw_borrowed(&list).and_then(|l| argument_order_buffer(l)) } else { None };
     let Some(buffer) = buffer else { return op() };
-    let b = buffer.as_raw() as usize;
-    super::list_x::transition(list, b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-    op();
-    super::list_x::transition(list, b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
+    super::list_x::in_state_left(list, buffer.as_raw() as usize, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, op);
 }
 
 /// The device's buffer for `fresh_indirect_arguments` (made on first use)
@@ -1268,6 +1271,7 @@ void main(uint t : SV_GroupIndex) {
                 type Close = unsafe extern "system" fn(*mut c_void) -> windows::core::HRESULT;
                 let ei: Ei = std::mem::transmute(real::orig_fn(raw, 59));
                 fresh_indirect_arguments(raw, || ei(raw, sig.as_raw() as usize, 1, args.as_raw() as usize, 0, 0, 0));
+                list_x::before_close(raw);
                 let close: Close = std::mem::transmute(real::orig_fn(raw, 9));
                 run(&list, &|| close(raw).unwrap());
                 let ran = std::ptr::read_volatile(count);
