@@ -56,6 +56,17 @@ pub const MESH_TABLE: &[(&str, bool, &str)] = &[
     ("mesh-alloc", true, "s_sendmsg GS_ALLOC_REQ: the vertex and primitive counts into the record header"),
 ];
 
+/// The classes of the compute pass of a console GS (ES + GS, `check_geometry`): what that pass
+/// does with the GS's own messages and barrier, which both paths lower alike (`lower_geom.rs`
+/// `geom_inst`, `lower.rs` `sopp`; `emit.rs` `sopp`). Elsewhere these are `system` and
+/// `barrier`. The ESGS ring and the GS output vertices are LDS reads and writes (`lds`): in the
+/// GS code both paths also keep the lowest address each lane wrote, where its vertices are.
+pub const GEOM_TABLE: &[(&str, bool, &str)] = &[
+    ("gs-emit", true, "s_sendmsg MSG_GS of stream 0: emit (a strip vertex and triangle) and cut; the record has stream 0 only"),
+    ("gs-done", true, "s_sendmsg MSG_GS_DONE: nothing to do, the record is written at the end"),
+    ("gs-barrier", true, "s_barrier: the group is one wave64 (in the split form the GS code runs in one hardware wave and skips it)"),
+];
+
 /// Whether `class` is in the covered set (a class missing from `TABLE` is not).
 pub fn covered(class: &str) -> bool {
     TABLE.iter().any(|&(c, on, _)| c == class && on)
@@ -64,6 +75,11 @@ pub fn covered(class: &str) -> bool {
 /// `covered` in the compute pass of a console MS: `MESH_TABLE`'s classes too.
 pub fn covered_mesh(class: &str) -> bool {
     covered(class) || MESH_TABLE.iter().any(|&(c, on, _)| c == class && on)
+}
+
+/// `covered` in the compute pass of a console GS: `GEOM_TABLE`'s classes too.
+pub fn covered_geometry(class: &str) -> bool {
+    covered(class) || GEOM_TABLE.iter().any(|&(c, on, _)| c == class && on)
 }
 
 /// The class of an instruction: its spec name (`Inst::name`), its encoding (`Encoding::name`)
@@ -194,21 +210,38 @@ pub fn mesh_class(d: &rdna2::Decoded) -> &'static str {
     }
 }
 
+/// The class of a decoded instruction in the compute pass of a console GS: MSG_GS of stream
+/// 0 is `gs-emit`, MSG_GS_DONE `gs-done`, `s_barrier` `gs-barrier`, the rest as `class`.
+pub fn geom_class(d: &rdna2::Decoded) -> &'static str {
+    let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0);
+    match (d.inst.name, d.enc.name) {
+        ("S_SENDMSG", "ENC_SOPP") if simm & 0xF == 2 && (simm >> 8) & 3 == 0 => "gs-emit",
+        ("S_SENDMSG", "ENC_SOPP") if simm & 0xF == 3 => "gs-done",
+        ("S_BARRIER", "ENC_SOPP") => "gs-barrier",
+        _ => class(d),
+    }
+}
+
 /// `Ok` when every instruction the direct translator would lower (those of the blocks reachable
 /// from the entry, as `kernel` builds its CFG) is in the covered set; else the first one that is
 /// not, as `"<mnemonic>: outside the covered set (class <class>)"` (`coverage::reason_key` keeps
 /// the mnemonic and the class), or the CFG's own error.
 pub fn check(code: &[u8]) -> Result<(), String> {
-    check_with(code, class, covered)
+    check_with(&Cfg::build(code)?, class, covered)
 }
 
 /// `check` for the compute pass of a console MS (`mesh_class`, `covered_mesh`).
 pub fn check_mesh(code: &[u8]) -> Result<(), String> {
-    check_with(code, mesh_class, covered_mesh)
+    check_with(&Cfg::build(code)?, mesh_class, covered_mesh)
 }
 
-fn check_with(code: &[u8], classify: fn(&rdna2::Decoded) -> &'static str, in_set: fn(&str) -> bool) -> Result<(), String> {
-    let cfg = Cfg::build(code)?;
+/// `check` for the compute pass of a console GS (`geom_class`, `covered_geometry`): the ES
+/// code, then the GS code from `gs_start` on, as `kernel::translate_geometry` builds its CFG.
+pub fn check_geometry(code: &[u8], gs_start: Option<u64>) -> Result<(), String> {
+    check_with(&Cfg::build_geometry(code, gs_start)?, geom_class, covered_geometry)
+}
+
+fn check_with(cfg: &Cfg, classify: fn(&rdna2::Decoded) -> &'static str, in_set: fn(&str) -> bool) -> Result<(), String> {
     for &b in &cfg.rpo {
         let block = &cfg.blocks[b];
         let branch = match block.term {
@@ -359,5 +392,58 @@ mod tests {
         assert_eq!(check_mesh(&waits).unwrap_err(), "s_barrier: outside the covered set (class barrier)");
         let mrt: Vec<u8> = [&m0, &exp(0), &end].into_iter().flatten().copied().collect();
         assert_eq!(check_mesh(&mrt).unwrap_err(), "exp: outside the covered set (class export)");
+    }
+
+    /// The compute pass of a console GS: MSG_GS of stream 0, MSG_GS_DONE and `s_barrier` are
+    /// its own classes, covered there only; the GS code counts from `gs_start` on, as the
+    /// translator reaches it through the ES's `s_setpc_b64`.
+    #[test]
+    fn geometry_pass_classes() {
+        let msg = |simm: u64| i("S_SENDMSG", "ENC_SOPP", &[("SIMM16", simm)]);
+        let d = |b: &[u8]| rdna2::decode(b, 0).unwrap();
+        // emit, cut, emit + cut, nop of stream 0
+        for simm in [0x22, 0x12, 0x32, 0x02] {
+            assert_eq!(geom_class(&d(&msg(simm))), "gs-emit", "{simm:#x}");
+            assert_eq!(class(&d(&msg(simm))), "system", "{simm:#x} outside the GS pass");
+        }
+        assert_eq!(geom_class(&d(&msg(0x03))), "gs-done");
+        assert_eq!(geom_class(&d(&msg(0x122))), "system", "an emit to stream 1: no record of it");
+        assert_eq!(geom_class(&d(&msg(9))), "system", "GS_ALLOC_REQ is the mesh pass's");
+        assert_eq!(mesh_class(&d(&msg(0x03))), "system");
+        let bar = i("S_BARRIER", "ENC_SOPP", &[]);
+        assert_eq!(geom_class(&d(&bar)), "gs-barrier");
+        assert_eq!(class(&d(&bar)), "barrier");
+        assert!(GEOM_TABLE.iter().all(|&(c, _, _)| !TABLE.iter().chain(MESH_TABLE).any(|r| r.0 == c)), "the GS classes are their own");
+        assert!(covered_geometry("gs-emit") && covered_geometry("lds") && !covered("gs-barrier") && !covered_mesh("gs-emit"));
+        assert!(!covered_geometry("mesh-export") && !covered_geometry("barrier"));
+
+        // ES: its vertex to LDS, the barrier, the jump into the GS; GS: a vertex from LDS, emit, done
+        const V: u64 = 256;
+        let end = i("S_ENDPGM", "ENC_SOPP", &[]);
+        let es: Vec<u8> = [
+            i("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 5)]),
+            i("S_WAITCNT", "ENC_SOPP", &[]),
+            bar.clone(),
+            i("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)]),
+        ]
+        .concat();
+        let gs_start = Some(es.len() as u64);
+        let read = i("DS_READ_B32", "ENC_DS", &[("ADDR", 0), ("VDST", 2)]);
+        let write = i("DS_WRITE_B32", "ENC_DS", &[("ADDR", 3), ("DATA0", 2)]);
+        let rcp = i("V_RCP_F32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V + 2)]);
+        let gs = |middle: &[u8], emit: u64| [&read[..], middle, &write, &msg(emit), &msg(0x03), &end].concat();
+        let ok = [es.clone(), gs(&[], 0x22)].concat();
+        assert_eq!(check_geometry(&ok, gs_start), Ok(()));
+        assert_eq!(check(&ok).unwrap_err(), "s_barrier: outside the covered set (class barrier)", "not a compute program");
+        assert_eq!(check_mesh(&ok).unwrap_err(), "s_barrier: outside the covered set (class barrier)", "not an MS program");
+        let slow = [es.clone(), gs(&rcp, 0x22)].concat();
+        assert_eq!(check_geometry(&slow, gs_start).unwrap_err(), "v_rcp_f32: outside the covered set (class transcendental)");
+        // ES alone: its s_setpc_b64 ends the program, the GS code is not reached
+        assert_eq!(check_geometry(&slow, None), Ok(()));
+        let streamed = [es.clone(), gs(&[], 0x122)].concat();
+        assert_eq!(check_geometry(&streamed, gs_start).unwrap_err(), "s_sendmsg: outside the covered set (class system)");
+        let exp = i("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 1), ("VSRC1", 1), ("VSRC2", 1), ("VSRC3", 1)]);
+        let exported = [es, gs(&exp, 0x22)].concat();
+        assert_eq!(check_geometry(&exported, gs_start).unwrap_err(), "exp: outside the covered set (class export)");
     }
 }

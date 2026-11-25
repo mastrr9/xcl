@@ -223,10 +223,11 @@ mod translated {
 
     /// `XCL_DIRECT_DXIL=covered`: the programs outside the covered set stay on the HLSL path,
     /// so its entries are another output than `=1`'s (the set itself is in the direct sources'
-    /// hash, `direct_version`). The tag names the passes it routes (compute, the mesh compute
-    /// pass): this file is not in that hash, so a pass that moves needs a new tag.
+    /// hash, `direct_version`). The tag names the passes it routes (compute, the mesh and the
+    /// geometry compute passes): this file is not in that hash, so a pass that moves needs a
+    /// new tag.
     pub(super) fn with_covered(id: u64, covered: bool) -> u64 {
-        if covered { identity_for(&id.to_string(), "xcl-direct-covered-cs-ms") } else { id }
+        if covered { identity_for(&id.to_string(), "xcl-direct-covered-cs-ms-gs") } else { id }
     }
 
     /// `identity_for` of `backend`: unchanged for the HLSL path (its entries stay valid),
@@ -1238,14 +1239,26 @@ pub fn graphics_wave32_for_device(device: &ID3D12Device) -> bool {
     split_wave64_forced() || wave_range(device).is_none_or(|(min, max)| graphics_wave32(min, max))
 }
 
+/// `XCL_DIRECT_DXIL=covered` (`covered`): a console GS program (ES + GS code, the GS from
+/// `gs_start`) with an instruction outside the covered set of its compute pass
+/// (`covered::check_geometry`) stays on the HLSL path, the refusal being its fallback reason.
+/// Any program otherwise (`=1`).
+fn covered_geometry(code: &[u8], gs_start: Option<u64>, covered: bool) -> Result<(), String> {
+    if covered {
+        crate::gpu::dxil::covered::check_geometry(code, gs_start)?;
+    }
+    Ok(())
+}
+
 /// A legacy GS pipeline: the ES variant of a console VS + the GS as one program.
 pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
     let (code, g) = super::geometry_program(vs, gs)?;
     let record = g.record();
-    // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
-    if crate::gpu::dxil::kernel::enabled() && !crate::gpu::dxil::kernel::covered_only() {
+    // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback);
+    // `=covered`: only a program in the covered set (the pass-through stays HLSL)
+    if crate::gpu::dxil::kernel::enabled() {
         let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: split_wave64, mem_windows: mem_windows(), sampler_base: 0 };
-        match crate::gpu::dxil::kernel::translate_geometry(&code, o, &g) {
+        match covered_geometry(&code, g.gs_start, crate::gpu::dxil::kernel::covered_only()).and_then(|()| crate::gpu::dxil::kernel::translate_geometry(&code, o, &g)) {
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("GS");
                 let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
@@ -1606,6 +1619,59 @@ pub(crate) mod shader_cache_tests {
         assert_eq!(covered_mesh(&barrier, false), Ok(()), "=1 takes it");
         let rcp = program(&[e("V_RCP_F32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 257)], None)]);
         assert_eq!(covered_mesh(&rcp, true), Err("v_rcp_f32: outside the covered set (class transcendental)".into()));
+    }
+
+    /// With the geometry compute pass in `=covered` too, its entries are neither those of the
+    /// compute-only nor those of the compute + mesh routing; off, the identity is unchanged.
+    #[test]
+    fn covered_geometry_routing_has_its_own_identity() {
+        use translated::{identity_for, identity_with, with_covered, Backend};
+        let compute = identity_with("s", "t", Backend::DirectCompute, 1);
+        let covered = with_covered(compute, true);
+        for earlier in ["xcl-direct-covered", "xcl-direct-covered-cs-ms"] {
+            assert_ne!(covered, identity_for(&compute.to_string(), earlier), "{earlier}");
+        }
+        let hlsl = identity_with("s", "t", Backend::Hlsl, 1);
+        assert_eq!(hlsl, identity_for("s", "t"));
+        assert_eq!(with_covered(compute, false), compute);
+        assert!(covered != hlsl && covered != compute && covered != identity_with("s", "t", Backend::DirectAll, 1));
+    }
+
+    /// `=covered` sends the compute pass of a console GS to the direct translator only when
+    /// every instruction it reaches (ES, then GS from `gs_start`) is in the covered set or the
+    /// GS pass's own messages and barrier; `=1` sends every program, as before.
+    #[test]
+    fn covered_geometry_routes_only_covered_programs() {
+        use crate::gpu::rdna2::encode;
+        let e = |n: &str, enc: &str, f: &[(&str, u64)]| encode(n, enc, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+        let es = [
+            e("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 5)]),
+            e("S_BARRIER", "ENC_SOPP", &[]),
+            e("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)]),
+        ]
+        .concat();
+        let gs_start = Some(es.len() as u64);
+        let program = |middle: &[Vec<u8>], emit: u64| -> Vec<u8> {
+            let mut p = es.clone();
+            p.extend(e("DS_READ_B32", "ENC_DS", &[("ADDR", 0), ("VDST", 2)]));
+            middle.iter().for_each(|m| p.extend(m));
+            p.extend(e("DS_WRITE_B32", "ENC_DS", &[("ADDR", 3), ("DATA0", 2)]));
+            p.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", emit)]));
+            p.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 3)]));
+            p.extend(e("S_ENDPGM", "ENC_SOPP", &[]));
+            p
+        };
+        let covered = program(&[], 0x22);
+        assert_eq!(covered_geometry(&covered, gs_start, true), Ok(()));
+        assert_eq!(covered_geometry(&covered, gs_start, false), Ok(()));
+        let rcp = program(&[e("V_RCP_F32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 258)])], 0x22);
+        assert_eq!(covered_geometry(&rcp, gs_start, true), Err("v_rcp_f32: outside the covered set (class transcendental)".into()));
+        assert_eq!(covered_geometry(&rcp, gs_start, false), Ok(()), "=1 takes it");
+        assert_eq!(covered_geometry(&rcp, None, true), Ok(()), "ES alone: the GS code is not reached");
+        let stream1 = program(&[], 0x122);
+        assert_eq!(covered_geometry(&stream1, gs_start, true), Err("s_sendmsg: outside the covered set (class system)".into()));
+        let lane = program(&[e("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 258)])], 0x22);
+        assert_eq!(covered_geometry(&lane, gs_start, true), Err("v_readfirstlane_b32: outside the covered set (class cross-lane)".into()));
     }
 
     /// Hit / miss through a temp cache dir: a direct entry is reused by the same identity and
