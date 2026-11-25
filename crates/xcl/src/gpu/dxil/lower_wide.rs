@@ -922,39 +922,48 @@ impl Lw {
                     }
                     "v_floor_f64" => {
                         let a = f64v(self, 0);
+                        let a = self.quiet_d(a);
                         self.floor_d(a)
                     }
                     "v_ceil_f64" => {
                         let a = f64v(self, 0);
+                        let a = self.quiet_d(a);
                         self.ceil_d(a)
                     }
                     "v_fract_f64" => {
                         let a = f64v(self, 0);
+                        let a = self.quiet_d(a);
                         self.fract_d(a)
                     }
                     "v_rndne_f64" => {
                         let a = f64v(self, 0);
+                        let a = self.quiet_d(a);
                         self.round_ne_d(a)
                     }
                     "v_frexp_mant_f64" => {
                         let a = f64v(self, 0);
+                        let a = self.quiet_d(a);
                         self.frexp_mant_d(a)
                     }
                     "v_sqrt_f64" => {
                         let a = f64v(self, 0);
+                        let a = self.quiet_d(a);
                         self.sqrt_d(a)
                     }
                     "v_rsq_f64" => {
                         let a = f64v(self, 0);
+                        let a = self.quiet_d(a);
                         let r = self.sqrt_d(a);
                         self.rcp_d(r)
                     }
                     "v_trunc_f64" => {
                         let a = f64v(self, 0);
+                        let a = self.quiet_d(a);
                         self.trunc_d(a)
                     }
                     "v_ldexp_f64" => {
                         let a = f64v(self, 0);
+                        let a = self.quiet_d(a);
                         self.ldexp_d(a, lh[1].0)
                     }
                     "v_cvt_f32_f64" => {
@@ -1095,6 +1104,15 @@ impl Lw {
         self.fdiv(a, b)
     }
 
+    /// A NaN operand as RDNA2's VALU returns it: quiet (bit 51 set), sign and payload kept;
+    /// any other value unchanged. The f64 helpers below return a NaN x as it is.
+    pub fn quiet_d(&mut self, x: Value) -> Value {
+        let n = self.isnan_d(x);
+        let (l, h) = self.s.split_double(x);
+        let h = self.orc(h, 0x8_0000);
+        let q = self.mkd(l, h);
+        self.sel(n, q, x)
+    }
     pub fn trunc_d(&mut self, x: Value) -> Value {
         let (l, h) = self.s.split_double(x);
         let e = self.lshrc(h, 20);

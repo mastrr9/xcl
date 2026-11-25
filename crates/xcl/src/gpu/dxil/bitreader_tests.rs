@@ -129,6 +129,63 @@ fn reader_round_trips_block_structure() {
     assert!(root.find(BLOCK_FUNCTION).is_some(), "function block");
 }
 
+const BLOCK_CONSTANTS: u32 = 11;
+const CST_CODE_INTEGER: u32 = 4;
+
+/// The integer constants (any type) of a container's module.
+fn int_constants(container: &[u8]) -> Vec<i64> {
+    let word = |o: usize| u32::from_le_bytes(container[o..o + 4].try_into().unwrap()) as usize;
+    let part = (0..word(28)).map(|i| word(32 + 4 * i)).find(|&o| &container[o..o + 4] == b"DXIL").expect("DXIL part");
+    // the part: its fourcc and size, the program header (24 bytes, the bitcode size last), the bitcode
+    let bc = &container[part + 32..part + 32 + word(part + 28)];
+    fn walk(b: &Block, out: &mut Vec<i64>) {
+        if b.id == BLOCK_CONSTANTS {
+            // signed VBR: the magnitude shifted left by one, the sign in bit 0
+            out.extend(b.records_with(CST_CODE_INTEGER).iter().map(|r| if r[0] & 1 == 0 { (r[0] >> 1) as i64 } else { -((r[0] >> 1) as i64) }));
+        }
+        b.blocks.iter().for_each(|c| walk(c, out));
+    }
+    let mut out = Vec::new();
+    walk(&parse(bc), &mut out);
+    out
+}
+
+/// The direct translator quiets a NaN operand before the f64 and f32 helpers that return a
+/// NaN x as it is (`trunc_d`, `sqrt_d`, `ldexp_f`, …): the quiet bit (f64: 0x80000 of the
+/// high dword, f32: 0x400000) is a constant of each kernel, and of none that only moves the
+/// operand.
+#[test]
+fn nan_operands_are_quieted_before_the_direct_helpers() {
+    use super::kernel::{translate, KernelOptions};
+    use crate::gpu::rdna2::encode;
+    const V: u64 = 256;
+    let consts = |name: &str, enc: &str, fields: &[(&str, u64)]| {
+        let mut code = encode(name, enc, fields, None).unwrap_or_else(|e| panic!("{name}: {e}"));
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let k = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        int_constants(&translate(&code, k).unwrap_or_else(|e| panic!("{name}: {e}")))
+    };
+    let (vop1, vop3): (&[(&str, u64)], &[(&str, u64)]) = (&[("VDST", 2), ("SRC0", V)], &[("VDST", 2), ("SRC0", V), ("SRC1", V + 4)]);
+    let base = consts("V_MOV_B32", "ENC_VOP1", vop1);
+    assert!(!base.contains(&0x8_0000) && !base.contains(&0x40_0000), "the kernel ABI alone: {base:#x?}");
+    for (name, enc, fields, quiet) in [
+        ("V_TRUNC_F64", "ENC_VOP1", vop1, 0x8_0000),
+        ("V_FLOOR_F64", "ENC_VOP1", vop1, 0x8_0000),
+        ("V_CEIL_F64", "ENC_VOP1", vop1, 0x8_0000),
+        ("V_FRACT_F64", "ENC_VOP1", vop1, 0x8_0000),
+        ("V_RNDNE_F64", "ENC_VOP1", vop1, 0x8_0000),
+        ("V_FREXP_MANT_F64", "ENC_VOP1", vop1, 0x8_0000),
+        ("V_SQRT_F64", "ENC_VOP1", vop1, 0x8_0000),
+        ("V_RSQ_F64", "ENC_VOP1", vop1, 0x8_0000),
+        ("V_LDEXP_F64", "ENC_VOP3", vop3, 0x8_0000),
+        ("V_LDEXP_F32", "ENC_VOP3", vop3, 0x40_0000),
+        ("V_FREXP_MANT_F32", "ENC_VOP1", vop1, 0x40_0000),
+    ] {
+        let c = consts(name, enc, fields);
+        assert!(c.contains(&quiet), "{name}: no {quiet:#x} among {c:#x?}");
+    }
+}
+
 #[test]
 fn a_shorter_binop_record_has_only_its_own_operands() {
     let mut m = Module::new();

@@ -3724,15 +3724,16 @@ impl Em {
                     "v_cvt_f64_f32" => format!("(double)asfloat({})", lo_hi[0].0),
                     "v_cvt_f64_i32" => format!("(double)(int){}", lo_hi[0].0),
                     "v_cvt_f64_u32" => format!("(double){}", lo_hi[0].0),
-                    "v_floor_f64" => format!("floor_d({})", f64v(0)),
-                    "v_ceil_f64" => format!("ceil_d({})", f64v(0)),
-                    "v_fract_f64" => format!("fract_d({})", f64v(0)),
-                    "v_rndne_f64" => format!("round_ne_d({})", f64v(0)),
-                    "v_frexp_mant_f64" => format!("frexp_mant_d({})", f64v(0)),
-                    "v_sqrt_f64" => format!("sqrt_d({})", f64v(0)),
-                    "v_rsq_f64" => format!("rcp_d(sqrt_d({}))", f64v(0)),
-                    "v_trunc_f64" => format!("trunc_d({})", f64v(0)),
-                    "v_ldexp_f64" => format!("ldexp_d({}, (int){})", f64v(0), lo_hi[1].0),
+                    // the helpers return a NaN x unchanged; the hardware returns it quiet
+                    "v_floor_f64" => format!("floor_d(quiet_d({}))", f64v(0)),
+                    "v_ceil_f64" => format!("ceil_d(quiet_d({}))", f64v(0)),
+                    "v_fract_f64" => format!("fract_d(quiet_d({}))", f64v(0)),
+                    "v_rndne_f64" => format!("round_ne_d(quiet_d({}))", f64v(0)),
+                    "v_frexp_mant_f64" => format!("frexp_mant_d(quiet_d({}))", f64v(0)),
+                    "v_sqrt_f64" => format!("sqrt_d(quiet_d({}))", f64v(0)),
+                    "v_rsq_f64" => format!("rcp_d(sqrt_d(quiet_d({})))", f64v(0)),
+                    "v_trunc_f64" => format!("trunc_d(quiet_d({}))", f64v(0)),
+                    "v_ldexp_f64" => format!("ldexp_d(quiet_d({}), (int){})", f64v(0), lo_hi[1].0),
                     "v_cvt_f32_f64" => {
                         self.line(&format!("uint {t} = {};", Self::fres(&m, &format!("(float){}", f64v(0)))));
                         self.write32(&dst, &t);
@@ -3930,12 +3931,12 @@ impl Em {
             "v_floor_f32" => fr(format!("floor({})", fs(0))),
             "v_ceil_f32" => fr(format!("ceil({})", fs(0))),
             "v_rndne_f32" => fr(format!("round({})", fs(0))),
-            "v_frexp_mant_f32" => fr(format!("frexp_mant({})", fs(0))),
+            "v_frexp_mant_f32" => fr(format!("frexp_mant(quiet_f({}))", fs(0))),
             "v_frexp_exp_i32_f32" if self.track_frexp_denorm => {
                 format!("(uint)frexp_exp_f32({a}, {}, xcl_frexp_f32_denorm)", fs(0))
             }
             "v_frexp_exp_i32_f32" => format!("(uint)frexp_exp({})", fs(0)),
-            "v_ldexp_f32" => fr(format!("ldexp_f({}, (int){b})", fs(0))),
+            "v_ldexp_f32" => fr(format!("ldexp_f(quiet_f({}), (int){b})", fs(0))),
             "v_add_f32" => fr(format!("{} + {}", fs(0), fs(1))),
             "v_sub_f32" => fr(format!("{} - {}", fs(0), fs(1))),
             "v_subrev_f32" => fr(format!("{} - {}", fs(1), fs(0))),
@@ -6527,6 +6528,13 @@ int frexp_exp_f32(uint bits, float legacy_src, uint denorm) {
     if (fraction == 0u || denorm == 1u) return 0;
     return (int)firstbithigh(fraction) - 148;
 }
+// A NaN operand as RDNA2's VALU returns it: quiet (bit 22 set), sign and payload kept; any
+// other value unchanged. ldexp_f and frexp_mant return a NaN x as it is.
+float quiet_f(float x) {
+    uint u = asuint(x);
+    if ((u & 0x7FFFFFFFu) > 0x7F800000u) return asfloat(u | 0x00400000u);
+    return x;
+}
 // Exact f32 x * 2^n on the IEEE-754 bits: handles |n| >= 127, ±0, ±inf, NaN, and subnormals
 // without exp2() overflow/underflow or FTZ flushing.
 float ldexp_f(float x, int n) {
@@ -6580,6 +6588,13 @@ int frexp_exp_d(double x) {
 // f64 classes from the bits. DXC narrows isinf and isnan of a double to f32, so 1e300 tested as inf.
 bool isnan_d(double x) { uint l, h; asuint(x, l, h); h &= 0x7FFFFFFFu; return h > 0x7FF00000u || (h == 0x7FF00000u && l != 0u); }
 bool isinf_d(double x) { uint l, h; asuint(x, l, h); return (h & 0x7FFFFFFFu) == 0x7FF00000u && l == 0u; }
+// A NaN operand as RDNA2's VALU returns it: quiet (bit 51 set), sign and payload kept; any
+// other value unchanged. The f64 helpers below return a NaN x as it is.
+double quiet_d(double x) {
+    uint l, h; asuint(x, l, h);
+    if (isnan_d(x)) return asdouble(l, h | 0x00080000u);
+    return x;
+}
 // f64 rounding on the bits. An int64_t cast breaks at |x| >= 2^63, on inf and NaN, and on the
 // sign of zero. |x| >= 2^52, inf and NaN are already integral, and |x| < 1 gives a zero of x's sign.
 double trunc_d(double x) {

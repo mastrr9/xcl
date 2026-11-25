@@ -7937,6 +7937,103 @@ fn f64_math_random(wave64: bool) {
     assert!(bad.is_empty());
 }
 
+/// (NaN operand, the result RDNA2's VALU returns for it): quiet, sign and payload kept.
+/// Signalling and quiet NaNs of both signs.
+const NAN_F64: [(u64, u64); 4] = [
+    (0x7FF0_0000_0000_0001, 0x7FF8_0000_0000_0001),
+    (0xFFF4_0000_1234_5678, 0xFFFC_0000_1234_5678),
+    (0x7FF8_0000_0000_00AB, 0x7FF8_0000_0000_00AB),
+    (0xFFFC_0000_0000_1234, 0xFFFC_0000_0000_1234),
+];
+const NAN_F32: [(u32, u32); 4] = [(0x7F80_0001, 0x7FC0_0001), (0xFFA0_0123, 0xFFE0_0123), (0x7FC0_00AB, 0x7FC0_00AB), (0xFFC0_1234, 0xFFC0_1234)];
+
+/// The tables of `gpu_nan_operands_come_back_quiet`: each result is its operand with the
+/// quiet bit set and nothing else changed.
+#[test]
+fn nan_tables_set_only_the_quiet_bit() {
+    for (x, want) in NAN_F64 {
+        assert!(f64::from_bits(x).is_nan() && want == x | 1 << 51, "{x:#018x}");
+    }
+    for (x, want) in NAN_F32 {
+        assert!(f32::from_bits(x).is_nan() && want == x | 1 << 22, "{x:#010x}");
+    }
+    // two of each are signalling, of either sign
+    assert_eq!(NAN_F64.iter().filter(|c| c.0 & 1 << 51 == 0).map(|c| c.0 >> 63).collect::<Vec<_>>(), [0, 1]);
+    assert_eq!(NAN_F32.iter().filter(|c| c.0 & 1 << 22 == 0).map(|c| c.0 >> 31).collect::<Vec<_>>(), [0, 1]);
+}
+
+/// The ops whose HLSL helpers return a NaN x as it is (`trunc_d`, `sqrt_d`, `ldexp_f`, …)
+/// pass their operand through `quiet_d` / `quiet_f` first.
+#[test]
+fn nan_operands_are_quieted_before_the_hlsl_helpers() {
+    let vop3: &[(&str, u64)] = &[("VDST", 2), ("SRC0", V), ("SRC1", V + 20)];
+    let vop1: &[(&str, u64)] = &[("VDST", 2), ("SRC0", V)];
+    let ops = [
+        ("V_TRUNC_F64", "ENC_VOP1", vop1, "trunc_d(quiet_d("),
+        ("V_FLOOR_F64", "ENC_VOP1", vop1, "floor_d(quiet_d("),
+        ("V_CEIL_F64", "ENC_VOP1", vop1, "ceil_d(quiet_d("),
+        ("V_FRACT_F64", "ENC_VOP1", vop1, "fract_d(quiet_d("),
+        ("V_RNDNE_F64", "ENC_VOP1", vop1, "round_ne_d(quiet_d("),
+        ("V_FREXP_MANT_F64", "ENC_VOP1", vop1, "frexp_mant_d(quiet_d("),
+        ("V_SQRT_F64", "ENC_VOP1", vop1, "sqrt_d(quiet_d("),
+        ("V_RSQ_F64", "ENC_VOP1", vop1, "sqrt_d(quiet_d("),
+        ("V_LDEXP_F64", "ENC_VOP3", vop3, "ldexp_d(quiet_d("),
+        ("V_LDEXP_F32", "ENC_VOP3", vop3, "ldexp_f(quiet_f("),
+        ("V_FREXP_MANT_F32", "ENC_VOP1", vop1, "frexp_mant(quiet_f("),
+    ];
+    for (name, enc, fields, call) in ops {
+        let t = translate(&prog(&[(name, enc, fields, None)]), &Options::default()).unwrap();
+        assert!(t.complete(), "{name}: {:?}", t.unsupported_why);
+        assert!(t.hlsl.contains("    if (isnan_d(x)) return asdouble(l, h | 0x00080000u);\n    return x;\n}"), "quiet_d");
+        assert!(t.hlsl.contains("if ((u & 0x7FFFFFFFu) > 0x7F800000u) return asfloat(u | 0x00400000u);"), "quiet_f");
+        let main = t.hlsl.split("void main(").nth(1).unwrap_or(&t.hlsl);
+        assert!(main.contains(call), "{name}: no {call} in\n{main}");
+    }
+}
+
+/// A NaN operand comes back quiet with its sign and payload, a signalling NaN with the quiet
+/// bit set, as RDNA2's VALU returns it, from the f64 and f32 ops whose helpers keep a NaN as
+/// it is, on either path (XCL_DIRECT_DXIL=1 for the direct one).
+#[test]
+fn gpu_nan_operands_come_back_quiet() {
+    let f64_ops = [("TRUNC", 22), ("FLOOR", 24), ("CEIL", 26), ("FRACT", 28), ("RNDNE", 30), ("FREXP_MANT", 32), ("SQRT", 34), ("RSQ", 36)];
+    let names: Vec<String> = f64_ops.iter().map(|(op, _)| format!("V_{op}_F64")).collect();
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>)> =
+        f64_ops.iter().zip(&names).map(|(&(_, d), n)| (n.as_str(), "ENC_VOP1", vec![("VDST", d), ("SRC0", V)])).collect();
+    list.push(("V_LDEXP_F64", "ENC_VOP3", vec![("VDST", 38), ("SRC0", V), ("SRC1", V + 20)]));
+    list.push(("V_LDEXP_F32", "ENC_VOP3", vec![("VDST", 40), ("SRC0", V + 21), ("SRC1", V + 20)]));
+    list.push(("V_FREXP_MANT_F32", "ENC_VOP1", vec![("VDST", 41), ("SRC0", V + 21)]));
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(n, e, f)| (*n, *e, f.as_slice(), None)).collect();
+    let p = prog(&refs);
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        for (l, v) in st.vgpr.iter_mut().enumerate() {
+            let x = NAN_F64[l % NAN_F64.len()].0;
+            (v[0], v[1], v[20], v[21]) = (x as u32, (x >> 32) as u32, 3, NAN_F32[l % NAN_F32.len()].0);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        let mut bad = Vec::new();
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (x, want) = NAN_F64[l % NAN_F64.len()];
+            for (name, d) in f64_ops.iter().copied().chain([("LDEXP", 38)]) {
+                let got = v[d as usize] as u64 | (v[d as usize + 1] as u64) << 32;
+                if got != want {
+                    bad.push(format!("v_{}_f64({x:#018x}) = {got:#018x}, want {want:#018x}", name.to_lowercase()));
+                }
+            }
+            let (x, want) = NAN_F32[l % NAN_F32.len()];
+            for (name, d) in [("ldexp", 40), ("frexp_mant", 41)] {
+                if v[d] != want {
+                    bad.push(format!("v_{name}_f32({x:#010x}) = {:#010x}, want {want:#010x}", v[d]));
+                }
+            }
+        }
+        bad.sort();
+        bad.dedup();
+        assert!(bad.is_empty(), "wave{lanes}:\n{}", bad.join("\n"));
+    }
+}
+
 fn f16_to_f64(h: u16) -> f64 {
     let s = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
     let e = (h >> 10) & 0x1F;
