@@ -1913,6 +1913,167 @@ fn gpu_grouped_loads_bounds_and_inactive_lanes() {
     }
 }
 
+#[test]
+fn multi_dword_loads_and_stores_use_vector_accessors() {
+    let glbl = |n: &'static str, f: &'static [(&'static str, u64)]| (n, "ENC_FLAT_GLBL", f, None);
+    let code = prog(&[
+        ("S_LOAD_DWORDX8", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)], None),
+        ("S_LOAD_DWORDX16", "ENC_SMEM", &[("SDATA", 32), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 48), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 52), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX8", "ENC_SMEM", &[("SDATA", 56), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX16", "ENC_SMEM", &[("SDATA", 64), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)], None),
+        ("BUFFER_LOAD_DWORDX2", "ENC_MUBUF", &[("VDATA", 0), ("VADDR", 1), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_DWORDX3", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 1), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", &[("VDATA", 8), ("VADDR", 1), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        glbl("GLOBAL_LOAD_DWORDX2", &[("VDST", 12), ("ADDR", 16), ("SADDR", 0x7D), ("OFFSET", 0)]),
+        glbl("GLOBAL_LOAD_DWORDX3", &[("VDST", 16), ("ADDR", 16), ("SADDR", 0x7D), ("OFFSET", 0)]),
+        glbl("GLOBAL_LOAD_DWORDX4", &[("VDST", 20), ("ADDR", 16), ("SADDR", 0x7D), ("OFFSET", 0)]),
+        glbl("GLOBAL_STORE_DWORDX2", &[("ADDR", 16), ("DATA", 12), ("SADDR", 0x7D), ("OFFSET", 0)]),
+        glbl("GLOBAL_STORE_DWORDX3", &[("ADDR", 16), ("DATA", 16), ("SADDR", 0x7D), ("OFFSET", 0)]),
+        glbl("GLOBAL_STORE_DWORDX4", &[("ADDR", 16), ("DATA", 20), ("SADDR", 0x7D), ("OFFSET", 0)]),
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 24), ("SRSRC", 2), ("SOFFSET", 128)], None),
+    ]);
+
+    for (windows, heap) in [(1u32, false), (4, false), (4, true)] {
+        let t = translate(&code, &Options { mem_windows: windows, heap_windows: heap, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+        assert!(!t.hlsl.contains("xcl_loadx4"), "windows={windows} heap={heap}:\n{}", t.hlsl);
+        assert!(t.hlsl.contains("xcl_load5(b, w, w4);"), "ld_raw windows={windows} heap={heap}:\n{}", t.hlsl);
+        if windows > 1 {
+            assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap, "windows={windows} heap={heap}:\n{}", t.hlsl);
+            assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex("), heap, "windows={windows} heap={heap}:\n{}", t.hlsl);
+        }
+        let body = &t.hlsl[t.hlsl.find("void main").unwrap()..];
+        assert_eq!(body.matches("xcl_load4x2(").count(), 2, "windows={windows} heap={heap}:\n{body}");
+        assert_eq!(body.matches("xcl_load4x4(").count(), 2, "windows={windows} heap={heap}:\n{body}");
+        let (ld_prefix, st_prefix) = if windows == 1 { ("mem.Load", "mem.Store") } else { ("xcl_mLoad", "xcl_mStore") };
+        assert_eq!(body.matches(&format!("{ld_prefix}2(")).count(), 3, "windows={windows} heap={heap}:\n{body}");
+        assert_eq!(body.matches(&format!("{ld_prefix}3(")).count(), 2, "windows={windows} heap={heap}:\n{body}");
+        assert_eq!(body.matches(&format!("{ld_prefix}4(")).count(), 3, "windows={windows} heap={heap}:\n{body}");
+        assert_eq!(body.matches(&format!("{st_prefix}2(")).count(), 1, "windows={windows} heap={heap}:\n{body}");
+        assert_eq!(body.matches(&format!("{st_prefix}3(")).count(), 1, "windows={windows} heap={heap}:\n{body}");
+        assert_eq!(body.matches(&format!("{st_prefix}4(")).count(), 1, "windows={windows} heap={heap}:\n{body}");
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        }
+    }
+}
+
+/// Vectorized Load2/Load3/Load4 and global Load/Store at the end of a 64-dword (256-byte) D3D12
+/// `mem` buffer: partially out-of-range buffer loads still recover the in-range prefix dwords
+/// while zeroing only the OOB components, and inactive lanes preserve their registers.
+#[test]
+fn gpu_vectorized_loads_partial_oob_at_buffer_end_and_global_rw() {
+    if !gpu_ready() {
+        return;
+    }
+    let glbl = |n: &'static str, f: &'static [(&'static str, u64)]| (n, "ENC_FLAT_GLBL", f, None);
+    let code = prog(&[
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 126)], None),
+        // Lanes 0..3: global vector stores and readbacks (with unaligned low address bits)
+        ("V_CMPX_GT_U32", "ENC_VOPC", &[("SRC0", 128 + 4), ("VSRC1", 1)], None),
+        glbl("GLOBAL_STORE_DWORDX2", &[("ADDR", 30), ("DATA", 20), ("SADDR", 0x7D), ("OFFSET", 0)]),
+        glbl("GLOBAL_STORE_DWORDX3", &[("ADDR", 32), ("DATA", 22), ("SADDR", 0x7D), ("OFFSET", 0)]),
+        glbl("GLOBAL_STORE_DWORDX4", &[("ADDR", 34), ("DATA", 25), ("SADDR", 0x7D), ("OFFSET", 0)]),
+        glbl("GLOBAL_LOAD_DWORDX2", &[("VDST", 40), ("ADDR", 30), ("SADDR", 0x7D), ("OFFSET", 0)]),
+        glbl("GLOBAL_LOAD_DWORDX3", &[("VDST", 42), ("ADDR", 32), ("SADDR", 0x7D), ("OFFSET", 0)]),
+        glbl("GLOBAL_LOAD_DWORDX4", &[("VDST", 45), ("ADDR", 34), ("SADDR", 0x7D), ("OFFSET", 0)]),
+        // Restore EXEC, then keep lanes 0..47 active for buffer partial-OOB loads
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 0)], None),
+        ("V_CMPX_GT_U32", "ENC_VOPC", &[("SRC0", 128 + 48), ("VSRC1", 1)], None),
+        // Partial & complete OOB right at the end of the 256-byte `mem` resource
+        ("S_BUFFER_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 10), ("SBASE", 4), ("OFFSET", 252), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 4), ("OFFSET", 248), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX8", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 4), ("OFFSET", 244), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX16", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 4), ("OFFSET", 236), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 40), ("SBASE", 4), ("OFFSET", 512), ("SOFFSET", 125)], None),
+        ("BUFFER_LOAD_DWORDX2", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 2), ("SRSRC", 2), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        ("BUFFER_LOAD_DWORDX3", "ENC_MUBUF", &[("VDATA", 12), ("VADDR", 3), ("SRSRC", 2), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", &[("VDATA", 15), ("VADDR", 4), ("SRSRC", 2), ("SOFFSET", 128), ("OFFEN", 1)], None),
+    ]);
+
+    let mem: Vec<u32> = (0..64u32).map(|i| 0x2000 + i).collect();
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&[0, 0, 256, 0]); // V# s[8:11]: base 0, num_records = 256 bytes
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let lu = l as u32;
+        r[1] = lu;
+        r[2] = match l % 3 { 0 => 252, 1 => 248, _ => 256 };
+        r[3] = match l % 3 { 0 => 248, 1 => 244, _ => 0x8000_0000 };
+        r[4] = match l % 4 { 0 => 244, 1 => 248, 2 => 252, _ => 512 };
+        for k in 10..20 {
+            r[k] = 0xDEAD;
+        }
+        for k in 0..9 {
+            r[20 + k] = 0xA000 + lu * 16 + k as u32;
+        }
+        r[30] = 0x20 + (lu & 3) * 8 + 3; // unaligned; aligned to 0x20..0x38
+        r[31] = 0; // high 32 bits for 64-bit global ADDR v[30:31]
+        r[32] = 0x40 + (lu & 3) * 12 + 1;
+        r[33] = 0;
+        r[34] = 0x70 + (lu & 3) * 16 + 2;
+        r[35] = 0;
+        for k in 40..49 {
+            r[k] = 0xDEAD;
+        }
+    }
+
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    for i in 0..2usize {
+        assert_eq!(r.sgpr[10 + i], if i < 1 { 0x203F } else { 0 }, "s_buffer_load_dwordx2 partial OOB [{i}]");
+    }
+    for i in 0..4usize {
+        assert_eq!(r.sgpr[12 + i], if i < 2 { 0x203E + i as u32 } else { 0 }, "s_buffer_load_dwordx4 partial OOB [{i}]");
+    }
+    for i in 0..8usize {
+        assert_eq!(r.sgpr[16 + i], if i < 3 { 0x203D + i as u32 } else { 0 }, "s_buffer_load_dwordx8 partial OOB [{i}]");
+    }
+    for i in 0..16usize {
+        assert_eq!(r.sgpr[24 + i], if i < 5 { 0x203B + i as u32 } else { 0 }, "s_buffer_load_dwordx16 partial OOB [{i}]");
+    }
+    assert_eq!(&r.sgpr[40..44], &[0, 0, 0, 0], "s_buffer_load_dwordx4 fully OOB");
+
+    for l in 0..64usize {
+        for (k, base_dw, reg, data_off) in [(2, 0x20 / 4 + l * 2, 40, 0u32), (3, 0x40 / 4 + l * 3, 42, 2), (4, 0x70 / 4 + l * 4, 45, 5)] {
+            for j in 0..k {
+                let want = if l < 4 { 0xA000 + l as u32 * 16 + data_off + j as u32 } else { 0xDEAD };
+                assert_eq!(r.vgpr[l][reg + j], want, "lane {l} global x{k}[{j}]");
+                if l < 4 {
+                    assert_eq!(r.mem[base_dw + j], want, "mem global store x{k} lane {l}[{j}]");
+                }
+            }
+        }
+        for k in 0..2usize {
+            let want = if l >= 48 {
+                0xDEAD
+            } else {
+                let off = st.vgpr[l][2] as usize + 4 * k;
+                if off + 4 <= 256 { 0x2000 + (off / 4) as u32 } else { 0 }
+            };
+            assert_eq!(r.vgpr[l][10 + k], want, "lane {l} buffer_load_dwordx2[{k}]");
+        }
+        for k in 0..3usize {
+            let want = if l >= 48 {
+                0xDEAD
+            } else {
+                let off = st.vgpr[l][3] as usize + 4 * k;
+                if st.vgpr[l][3] <= 256 && off + 4 <= 256 { 0x2000 + (off / 4) as u32 } else { 0 }
+            };
+            assert_eq!(r.vgpr[l][12 + k], want, "lane {l} buffer_load_dwordx3[{k}]");
+        }
+        for k in 0..4usize {
+            let want = if l >= 48 {
+                0xDEAD
+            } else {
+                let off = st.vgpr[l][4] as usize + 4 * k;
+                if off + 4 <= 256 { 0x2000 + (off / 4) as u32 } else { 0 }
+            };
+            assert_eq!(r.vgpr[l][15 + k], want, "lane {l} buffer_load_dwordx4[{k}]");
+        }
+    }
+}
+
 /// A real console vertex shader from the retail pack, run on the PC GPU
 /// (needs XCL_SAMPLE_RPF=…\shaders.rpf).
 #[test]
@@ -4897,6 +5058,16 @@ fn memory_windows_above_4_gib(heap: bool) {
     let word = |a: u64| unsafe { &mut *(a as *mut u32) };
     *word(w1 + 0x1000) = 0xC0FFEE;
     *word(w1 + 0x1004) = 0x1234;
+    for k in 2..8u64 {
+        *word(w1 + 0x1000 + 4 * k) = 0x3000 + k as u32;
+    }
+    let partial_at: u64 = if heap { (1 << 20) - 4 } else { 0x8000 - 4 };
+    *word(w1 + partial_at) = 0x55AA_1234;
+    if !heap {
+        *word(w1 + partial_at + 4) = 0xDEAD_0001;
+        *word(w1 + partial_at + 8) = 0xDEAD_0002;
+        *word(w1 + partial_at + 12) = 0xDEAD_0003;
+    }
     for l in 0..64u64 {
         *word(w1 + 0x2000 + 4 * l) = 1000 + l as u32;
         *word(w1 + 0x4000 + 4 * l) = 5000 + l as u32;
@@ -4913,6 +5084,10 @@ fn memory_windows_above_4_gib(heap: bool) {
         glbl("GLOBAL_LOAD_DWORD", &[("VDST", 6), ("ADDR", 4), ("SADDR", 0x7D), ("OFFSET", 0)]), // v[4:5] → window 1
         glbl("GLOBAL_STORE_DWORD", &[("ADDR", 8), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0)]), // v[8:9] → window 1
         glbl("GLOBAL_ATOMIC_ADD", &[("VDST", 10), ("ADDR", 3), ("DATA", 11), ("SADDR", 16), ("OFFSET", 0), ("GLC", 1)]), // s[16:17] + v3 → window 1
+        ("S_LOAD_DWORDX8", "ENC_SMEM", vec![("SDATA", 32), ("SBASE", 1), ("OFFSET", 0)], None), // s[2:3] → window 1 (xcl_load4x2)
+        ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", vec![("SDATA", 40), ("SBASE", 14), ("OFFSET", 0)], None), // s[28:31] partial OOB (window top in heap mode)
+        glbl("GLOBAL_LOAD_DWORDX4", &[("VDST", 12), ("ADDR", 4), ("SADDR", 0x7D), ("OFFSET", 4)]), // v[4:5] + 4: not 16-byte aligned
+        glbl("GLOBAL_STORE_DWORDX3", &[("ADDR", 16), ("DATA", 12), ("SADDR", 0x7D), ("OFFSET", 0)]), // v[16:17] → window 1
     ];
     let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
     let p = prog(&refs);
@@ -4922,6 +5097,7 @@ fn memory_windows_above_4_gib(heap: bool) {
     assert!(t.hlsl.contains("RWByteAddressBuffer mem1 : register(u3)"));
     assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap, "heap windows: no switch over windows");
     assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(4u + xcl_w)]"), heap);
+    assert!(t.hlsl.contains("= xcl_mLoad4(") && t.hlsl.contains(") xcl_mStore3(") && t.hlsl.contains("xcl_load4x2("), "vector multi-window call sites");
     let hlsl_dxil = || super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
     let dxil = direct_or(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() }), hlsl_dxil());
     let hi = |a: u64| (a >> 32) as u32;
@@ -4930,6 +5106,7 @@ fn memory_windows_above_4_gib(heap: bool) {
     st.sgpr[8..12].copy_from_slice(&[(w1 + 0x2000) as u32, hi(w1) & 0xFFFF | 4 << 16, 64, 0]);
     st.sgpr[12..16].copy_from_slice(&[(w0 + 0x3000) as u32, hi(w0) & 0xFFFF | 4 << 16, 64, 0]);
     st.sgpr[16..18].copy_from_slice(&[(w1 + 0x6000) as u32, hi(w1)]);
+    st.sgpr[28..32].copy_from_slice(&[(w1 + partial_at) as u32, hi(w1) & 0xFFFF, 4, 0]);
     for (l, r) in st.vgpr.iter_mut().enumerate() {
         let l = l as u64;
         r[0] = l as u32;
@@ -4940,15 +5117,24 @@ fn memory_windows_above_4_gib(heap: bool) {
         r[8] = (w1 + 0x5000 + 4 * l) as u32;
         r[9] = hi(w1);
         r[11] = 1;
+        r[16] = (w1 + 0x7000 + 16 * l) as u32;
+        r[17] = hi(w1);
     }
     let r = runner::run_in_arena(&dxil, &st, &arena).unwrap();
     assert_eq!((r.sgpr[20], r.sgpr[21]), (0xC0FFEE, 0x1234), "s_load from window 1");
     assert_eq!(r.sgpr[24..28], [1001, 1002, 1003, 1004], "s_buffer_load_dwordx4 from window 1");
+    assert_eq!(r.sgpr[32..40], [0xC0FFEE, 0x1234, 0x3002, 0x3003, 0x3004, 0x3005, 0x3006, 0x3007], "s_load_dwordx8 from window 1 (heap={heap})");
+    assert_eq!(r.sgpr[40..44], [0x55AA_1234, 0, 0, 0], "s_buffer_load_dwordx4 partial OOB in window 1 (heap={heap})");
     for l in 0..64u64 {
         assert_eq!(r.vgpr[l as usize][1], 1000 + l as u32, "lane {l}: buffer_load from window 1");
         assert_eq!(r.vgpr[l as usize][6], 5000 + l as u32, "lane {l}: global_load from window 1");
         assert_eq!(*word(w0 + 0x3000 + 4 * l), 7 * l as u32, "lane {l}: buffer_store into window 0");
         assert_eq!(*word(w1 + 0x5000 + 4 * l), 7 * l as u32, "lane {l}: global_store into window 1");
+        // dwords l+1..l+4 of the 64 written at 0x4000; anything past them is 0
+        let x4: Vec<u32> = (1..5).map(|k| if l + k < 64 { 5000 + (l + k) as u32 } else { 0 }).collect();
+        assert_eq!(r.vgpr[l as usize][12..16], x4, "lane {l}: global_load_dwordx4 from window 1");
+        let x3: Vec<u32> = (0..3).map(|k| *word(w1 + 0x7000 + 16 * l + 4 * k)).collect();
+        assert_eq!(x3, x4[..3], "lane {l}: global_store_dwordx3 into window 1");
     }
     assert_eq!(*word(w1 + 0x6000), 64, "global_atomic_add in window 1");
     assert_eq!(*word(w0 + 0x6000), 0, "nothing in window 0 at the same low address");
@@ -5004,6 +5190,7 @@ fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
     let list = vec![
         // 1. Out-of-UMA s_load from hi = base_hi + 4 (would alias w0 under `& 3`) -> must read 0
         ("S_LOAD_DWORD", "ENC_SMEM", vec![("SDATA", 30), ("SBASE", 1), ("OFFSET", 0)], None), // s[2:3]
+        ("S_LOAD_DWORDX8", "ENC_SMEM", vec![("SDATA", 32), ("SBASE", 1), ("OFFSET", 0)], None), // s[2:3] (xcl_load4x2)
         // 2. 32-bit hi == 0 s_load at offset 0x4000 -> MUST read w0 + 0x4000
         ("S_LOAD_DWORD", "ENC_SMEM", vec![("SDATA", 31), ("SBASE", 2), ("OFFSET", 0)], None), // s[4:5]
         // 3. Out-of-UMA buffer_store with V# hi = base_hi + 5 and stride = 4 -> must NOT touch w1 + 0x1000
@@ -5041,6 +5228,7 @@ fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
     st.sgpr[16..20].copy_from_slice(&[0x3000, ((base_hi + 4) & 0xFFFF) | (4 << 16), 64, 0]); // out-of-UMA atomic V# (aliases w0 under & 3)
     st.sgpr[20..22].copy_from_slice(&[0xFFFF_FFF0, base_hi]); // carry base
     st.sgpr[22..24].copy_from_slice(&[0, base_hi]); // borrow base (0 - 16 borrows into base_hi - 1)
+    st.sgpr[32..40].fill(0x7777_7777);
     for r in st.vgpr.iter_mut() {
         r[0] = 0; // index 0
         r[1] = 0xBAD0_DEAD; // poison value to store
@@ -5062,6 +5250,7 @@ fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
 
     let r = runner::run_in_arena(&dxil, &st, &arena).unwrap();
     assert_eq!(r.sgpr[30], 0, "out-of-UMA s_load must return 0");
+    assert_eq!(r.sgpr[32..40], [0; 8], "out-of-UMA s_load_dwordx8 must return 0 (heap={heap})");
     assert_eq!(r.sgpr[31], 0xABCD_0123, "hi == 0 s_load must still read window 0 (32-bit descriptor tables)");
     assert_eq!(r.vgpr[0][2], 0, "out-of-UMA buffer_load must return 0");
     assert_eq!(r.vgpr[0][3], 0x5566_7788, "valid strided V# buffer_load must mask stride out of d1");

@@ -1981,26 +1981,43 @@ impl Em {
             }
             // Branch-free: a dword past num_records reads offset 0 (always in the window) and
             // comes out 0. HLSL 2021's `?:` is a branch, and with several memory windows every
-            // access is a switch between them (`windowed`): one per dword made DXC several
-            // times slower on big programs. Four dwords share one switch (`xcl_loadx4`).
+            // access is a switch between them (`windowed`): Load2 / Load4 for 2 / 4 dwords, and
+            // xcl_load4x2 / xcl_load4x4 for 8 / 16 dwords so multi-window loads share one switch.
             if count == 1 {
                 self.line(&format!("bool {t}_in = {t}_off < {t}_lim;"));
                 self.line(&format!("uint {t}_0 = select({t}_in, mem.Load(select({t}_in, {t}_a, 0u)), 0u);"));
                 vals.push(format!("{t}_0"));
+            } else if count <= 4 {
+                let offs = (0..count).map(|k| format!("{}u", 4 * k)).collect::<Vec<_>>().join(", ");
+                self.line(&format!("bool{count} {t}_in0 = {t}_off + uint{count}({offs}) < {t}_lim;"));
+                self.line(&format!("uint{count} {t}_g0 = select({t}_in0, mem.Load{count}(select(any({t}_in0), {t}_a, 0u)), 0u);"));
+                vals.extend(["x", "y", "z", "w"][..count].iter().map(|c| format!("{t}_g0.{c}")));
             } else {
-                for g in 0..count.div_ceil(4) {
-                    let n = (count - 4 * g).min(4);
-                    let o = (0..4).map(|k| format!("{}u", 16 * g + 4 * k.min(n - 1))).collect::<Vec<_>>().join(", ");
-                    self.line(&format!("bool4 {t}_in{g} = {t}_off + uint4({o}) < {t}_lim;"));
-                    self.line(&format!("uint4 {t}_g{g} = select({t}_in{g}, xcl_loadx4(select({t}_in{g}, {t}_a + uint4({o}), 0u)), 0u);"));
-                    vals.extend(["x", "y", "z", "w"][..n].iter().map(|c| format!("{t}_g{g}.{c}")));
+                let chunks = count / 4;
+                let mut addrs = Vec::with_capacity(chunks);
+                for g in 0..chunks {
+                    let offs = (0..4).map(|k| format!("{}u", 16 * g + 4 * k)).collect::<Vec<_>>().join(", ");
+                    self.line(&format!("bool4 {t}_in{g} = {t}_off + uint4({offs}) < {t}_lim;"));
+                    addrs.push(if g == 0 {
+                        format!("select(any({t}_in0), {t}_a, 0u)")
+                    } else {
+                        format!("select(any({t}_in{g}), {t}_a + {}u, 0u)", 16 * g)
+                    });
+                }
+                let rargs: Vec<String> = (0..chunks).map(|g| format!("{t}_r{g}")).collect();
+                self.line(&format!("uint4 {};", rargs.join(", ")));
+                let args: Vec<String> = addrs.into_iter().chain(rargs).collect();
+                self.line(&format!("xcl_load4x{chunks}({});", args.join(", ")));
+                for g in 0..chunks {
+                    self.line(&format!("uint4 {t}_g{g} = select({t}_in{g}, {t}_r{g}, 0u);"));
+                    vals.extend(["x", "y", "z", "w"].iter().map(|c| format!("{t}_g{g}.{c}")));
                 }
             }
         } else {
             let imm = ((imm << 11) as i32 >> 11) as u32; // 21-bit signed
             let b = self.sreg(sbase);
             let hi = self.sreg(sbase + 1);
-            // the dwords are contiguous: Load2 / Load4 (one window switch per four dwords)
+            // the dwords are contiguous: Load2 / Load4, or one window switch for 8 / 16 dwords
             if self.opt.mem_windows > 1 {
                 self.line(&format!(
                     "uint64_t {t}_ea = ((((uint64_t){hi}) << 32) | (uint64_t){b}) + (uint64_t)(int64_t)(int){} + (uint64_t){soff};",
@@ -2016,13 +2033,18 @@ impl Em {
                     self.line(&format!("uint {t}_0 = mem.Load({t}_a);"));
                     vals.push(format!("{t}_0"));
                 }
-                2 => {
-                    self.line(&format!("uint2 {t}_g0 = mem.Load2({t}_a);"));
-                    vals.extend([format!("{t}_g0.x"), format!("{t}_g0.y")]);
+                2 | 4 => {
+                    self.line(&format!("uint{count} {t}_g0 = mem.Load{count}({t}_a);"));
+                    vals.extend(["x", "y", "z", "w"][..count].iter().map(|c| format!("{t}_g0.{c}")));
                 }
                 _ => {
-                    for g in 0..count / 4 {
-                        self.line(&format!("uint4 {t}_g{g} = mem.Load4({t}_a + {}u);", 16 * g));
+                    let chunks = count / 4;
+                    let gargs: Vec<String> = (0..chunks).map(|g| format!("{t}_g{g}")).collect();
+                    self.line(&format!("uint4 {};", gargs.join(", ")));
+                    let addrs = (0..chunks).map(|g| if g == 0 { format!("{t}_a") } else { format!("{t}_a + {}u", 16 * g) });
+                    let args: Vec<String> = addrs.chain(gargs).collect();
+                    self.line(&format!("xcl_load4x{chunks}({});", args.join(", ")));
+                    for g in 0..chunks {
                         vals.extend(["x", "y", "z", "w"].iter().map(|c| format!("{t}_g{g}.{c}")));
                     }
                 }
@@ -2229,7 +2251,7 @@ impl Em {
         match kind {
             BufKind::Load => {
                 // branch-free (see `smem`): a lane that is inactive or out of range reads offset
-                // 0 and keeps its register / gets 0; one window switch per four dwords
+                // 0 and keeps its register / gets 0; one vector load (and one switch) for 2..4 dwords
                 self.line(&format!("bool {t}_act = {act};"));
                 if count == 1 {
                     let ok = in_range("4u".into());
@@ -2238,10 +2260,9 @@ impl Em {
                     self.line(&format!("uint {t}_v = mem.Load(select(and({t}_act, {t}_ok), {t}_a & ~3u, 0u));"));
                     self.line(&format!("{v} = select({t}_act, select({t}_ok, {t}_v, 0u), {v});"));
                 } else {
-                    let oks: Vec<String> = (0..4).map(|i| in_range(format!("{}u", 4 * i.min(count - 1) + 4))).collect();
-                    let o = (0..4).map(|i| format!("{}u", 4 * i.min(count - 1))).collect::<Vec<_>>().join(", ");
-                    self.line(&format!("bool4 {t}_ok = bool4({});", oks.join(", ")));
-                    self.line(&format!("uint4 {t}_v = xcl_loadx4(select(and({t}_act, {t}_ok), ({t}_a & ~3u) + uint4({o}), 0u));"));
+                    let oks: Vec<String> = (0..count).map(|i| in_range(format!("{}u", 4 * i + 4))).collect();
+                    self.line(&format!("bool{count} {t}_ok = bool{count}({});", oks.join(", ")));
+                    self.line(&format!("uint{count} {t}_v = mem.Load{count}(select(and({t}_act, any({t}_ok)), {t}_a & ~3u, 0u));"));
                     for i in 0..count {
                         let v = self.vreg(vdata + i);
                         let c = ["x", "y", "z", "w"][i as usize];
@@ -4452,17 +4473,21 @@ impl Em {
         let t = self.t();
         self.emit_flat_addr(global, op.ends_with("_addtid"), saddr, f("ADDR"), off, 0, store, &t);
         let act = self.act();
-        let mut st = Vec::new();
-        for i in 0..count {
+        if count == 1 {
             if store {
-                let v = self.vreg(f("DATA") + i);
-                st.push(format!("mem.Store(({t}_a + {}u) & ~3u, {v});", 4 * i));
+                let v = self.vreg(f("DATA"));
+                self.line(&format!("if ({act}) {{ mem.Store(({t}_a + 0u) & ~3u, {v}); }}"));
             } else {
-                let v = self.vreg(f("VDST") + i);
-                st.push(format!("{v} = mem.Load(({t}_a + {}u) & ~3u);", 4 * i));
+                let v = self.vreg(f("VDST"));
+                self.line(&format!("if ({act}) {{ {v} = mem.Load(({t}_a + 0u) & ~3u); }}"));
             }
+        } else if store {
+            let vs: Vec<String> = (0..count).map(|i| self.vreg(f("DATA") + i)).collect();
+            self.line(&format!("if ({act}) mem.Store{count}({t}_a & ~3u, uint{count}({}));", vs.join(", ")));
+        } else {
+            let assigns: Vec<String> = (0..count).map(|i| format!("{} = {t}_v.{};", self.vreg(f("VDST") + i), ["x", "y", "z", "w"][i as usize])).collect();
+            self.line(&format!("if ({act}) {{ uint{count} {t}_v = mem.Load{count}({t}_a & ~3u); {} }}", assigns.join(" ")));
         }
-        self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
         Ok(())
     }
 
@@ -4880,7 +4905,7 @@ impl Em {
             h.push_str("static uint xcl_w = 0u;\nstatic uint xcl_uma_base = 0u;\n");
             h.push_str(MEM_ACCESSORS_HERE);
         } else {
-            h.push_str(LOADX4_ONE_WINDOW);
+            h.push_str(LOAD_HELPERS_ONE_WINDOW);
         }
         for (i, (_, cmp)) in self.static_used.iter().enumerate() {
             let k = self.opt.static_sampler_base as usize + i;
@@ -5878,9 +5903,11 @@ fn float_minmax_mem(min: bool, x2: bool, a: &str, v: &str, old: &str, t: &str) -
 /// Placeholder where the memory window accessors go (after the `mem` declarations).
 const MEM_ACCESSORS_HERE: &str = "//XCL_MEM_ACCESSORS\n";
 
-/// Four dwords at four addresses (scalar buffer loads with their bounds checks); with several
-/// windows `mem_accessors` defines it, with one switch for all four.
-const LOADX4_ONE_WINDOW: &str = "uint4 xcl_loadx4(uint4 a) { return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); }\n";
+/// Multi-chunk read helpers for the single-window form (multi-window emits `[branch] switch (xcl_w)` or descriptor-heap versions in `mem_accessors`).
+const LOAD_HELPERS_ONE_WINDOW: &str = "\
+void xcl_load4x2(uint a0, uint a1, out uint4 g0, out uint4 g1) { g0 = mem.Load4(a0); g1 = mem.Load4(a1); }\n\
+void xcl_load4x4(uint a0, uint a1, uint a2, uint a3, out uint4 g0, out uint4 g1, out uint4 g2, out uint4 g3) { g0 = mem.Load4(a0); g1 = mem.Load4(a1); g2 = mem.Load4(a2); g3 = mem.Load4(a3); }\n\
+void xcl_load5(uint a, out uint4 w, out uint w4) { w = mem.Load4(a); w4 = mem.Load(a + 16u); }\n";
 
 /// Several memory windows: every `mem.Method(` of the program (and of the preludes) becomes
 /// an accessor `xcl_mMethod(` that switches on `xcl_w` between `mem` and `mem1`.., whose
@@ -5939,11 +5966,31 @@ fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
         }
     }
     let mut s = String::new();
+    let multi_loads: &[(&str, &str, &str)] = &[
+        (
+            "void xcl_load4x2(uint a0, uint a1, out uint4 g0, out uint4 g1)",
+            "g0 = {m}.Load4(a0); g1 = {m}.Load4(a1);",
+            "g0 = uint4(0u, 0u, 0u, 0u); g1 = uint4(0u, 0u, 0u, 0u); break;",
+        ),
+        (
+            "void xcl_load4x4(uint a0, uint a1, uint a2, uint a3, out uint4 g0, out uint4 g1, out uint4 g2, out uint4 g3)",
+            "g0 = {m}.Load4(a0); g1 = {m}.Load4(a1); g2 = {m}.Load4(a2); g3 = {m}.Load4(a3);",
+            "g0 = uint4(0u, 0u, 0u, 0u); g1 = uint4(0u, 0u, 0u, 0u); g2 = uint4(0u, 0u, 0u, 0u); g3 = uint4(0u, 0u, 0u, 0u); break;",
+        ),
+        (
+            "void xcl_load5(uint a, out uint4 w, out uint w4)",
+            "w = {m}.Load4(a); w4 = {m}.Load(a + 16u);",
+            "w = uint4(0u, 0u, 0u, 0u); w4 = 0u; break;",
+        ),
+    ];
     if let Some(coherent) = heap {
         // one access: window k is descriptor MEM_HEAP_BASE + k; an `xcl_w` outside the windows
         // does what the switch's `default` does
         let _ = writeln!(s, "#define XCL_MW {coherent}RWByteAddressBuffer m = ResourceDescriptorHeap[NonUniformResourceIndex({}u + xcl_w)]", super::MEM_HEAP_BASE);
-        let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] if (xcl_w >= {windows}u) {{ return uint4(0u, 0u, 0u, 0u); }} XCL_MW; return uint4(m.Load(a.x), m.Load(a.y), m.Load(a.z), m.Load(a.w)); }}");
+        for &(sig, body, def) in multi_loads {
+            let outside = def.replace("break;", "return;");
+            let _ = writeln!(s, "{sig} {{ [branch] if (xcl_w >= {windows}u) {{ {outside} }} XCL_MW; {} }}", body.replace("{m}", "m"));
+        }
         for (ret, name, params, args, def) in sigs {
             let r = if ret == "void" { "" } else { "return " };
             // (the switch's `break` leaves the accessor)
@@ -5952,12 +5999,14 @@ fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
         }
         return s;
     }
-    let _ = write!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] switch (xcl_w) {{ ");
-    let _ = write!(s, "case 0u: return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); ");
-    for k in 1..windows {
-        let _ = write!(s, "case {k}u: return uint4(mem{k}.Load(a.x), mem{k}.Load(a.y), mem{k}.Load(a.z), mem{k}.Load(a.w)); ");
+    for &(sig, body, def) in multi_loads {
+        let _ = write!(s, "{sig} {{ [branch] switch (xcl_w) {{ ");
+        let _ = write!(s, "case 0u: {} break; ", body.replace("{m}", "mem"));
+        for k in 1..windows {
+            let _ = write!(s, "case {k}u: {} break; ", body.replace("{m}", &format!("mem{k}")));
+        }
+        let _ = writeln!(s, "default: {def} }} }}");
     }
-    let _ = writeln!(s, "default: return uint4(0u, 0u, 0u, 0u); }} }}");
     for (ret, name, params, args, def) in sigs {
         let _ = write!(s, "{ret} xcl_m{name}({params}) {{ [branch] switch (xcl_w) {{ ");
         if ret == "void" {
@@ -6061,9 +6110,9 @@ void scr_st(uint a, uint v, uint n) {
 
 const PRELUDE_MEM: &str = r#"
 uint4 ld_raw(uint a) {
-    // one Load4 + one Load (with several memory windows each is a switch) and no branch
+    // one Load4 + one Load (sharing one window switch with several memory windows) and no branch
     uint b = a & ~3u; uint s = (a & 3u) * 8u;
-    uint4 w = mem.Load4(b); uint w4 = mem.Load(b + 16u);
+    uint4 w; uint w4; xcl_load5(b, w, w4);
     uint4 n = uint4(w.yzw, w4);
     return select((s == 0u).xxxx, w, (w >> s) | (n << ((32u - s) & 31u)));
 }
