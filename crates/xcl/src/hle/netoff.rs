@@ -49,7 +49,7 @@ extern "system" {
 /// name, localhost – a console without a network still answers these (a retail game asks for
 /// its own name and none at start).
 fn local_name(name: &str) -> bool {
-    if name.is_empty() || name.eq_ignore_ascii_case("localhost") || name.starts_with("127.") || name == "::1" {
+    if name.is_empty() || name.eq_ignore_ascii_case("localhost") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
         return true;
     }
     let mut buf = [0u8; 256];
@@ -394,5 +394,21 @@ mod tests {
             let _ = wsa_send_to(usize::MAX, std::ptr::null(), 0, &mut sent, 0, std::ptr::null(), 0, std::ptr::null_mut(), std::ptr::null());
             assert_ne!(WSAGetLastError(), WSAENETUNREACH);
         }
+    }
+
+    #[test]
+    fn local_name_parses_loopback_ips() {
+        assert!(!local_name("127.example.com"));
+        assert!(!local_name("127.0.0.1.example.com"));
+        assert!(!local_name("127.999.0.1"));
+        assert!(!local_name("192.0.2.1"));
+        assert!(!local_name("example.invalid"));
+        assert!(local_name(""));
+        assert!(local_name("localhost"));
+        assert!(local_name("LOCALHOST"));
+        assert!(local_name("127.0.0.1"));
+        assert!(local_name("127.255.255.254"));
+        assert!(local_name("::1"));
+        assert!(local_name("0:0:0:0:0:0:0:1"));
     }
 }
