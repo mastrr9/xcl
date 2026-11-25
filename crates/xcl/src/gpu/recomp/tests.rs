@@ -1138,6 +1138,38 @@ fn f64_roots(wave64: bool) {
     assert!(bad.is_empty(), "wave{lanes}:\n{}", bad.join("\n"));
 }
 
+/// v_rcp_f64 and v_rsq_f64 of a NaN: RDNA2 returns it quiet with its payload (a signalling NaN
+/// gets the quiet bit), on the HLSL path (rcp_d) and the direct one (a divide) alike.
+#[test]
+fn gpu_f64_rcp_rsq_quiet_a_signalling_nan() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = prog(&[
+        ("V_RCP_F64", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)], None),
+        ("V_RSQ_F64", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None),
+    ]);
+    // (input, result): signalling NaNs of either sign get bit 51, quiet ones stay as they are
+    let cases: [(u64, u64); 4] = [
+        (0x7FF0_0000_0000_0001, 0x7FF8_0000_0000_0001),
+        (0xFFF4_0000_1234_5678, 0xFFFC_0000_1234_5678),
+        (0x7FF8_0000_0000_0000, 0x7FF8_0000_0000_0000),
+        (0x7FFC_0000_0000_00AB, 0x7FFC_0000_0000_00AB),
+    ];
+    let mut st = KernelState::default();
+    for (l, v) in st.vgpr.iter_mut().enumerate() {
+        let x = cases[l % cases.len()].0;
+        (v[0], v[1]) = (x as u32, (x >> 32) as u32);
+    }
+    let (r, lanes) = run_wave(&p, &st, false);
+    for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+        let (x, want) = cases[l % cases.len()];
+        let bits = |i: usize| v[i] as u64 | (v[i + 1] as u64) << 32;
+        assert_eq!(bits(2), want, "lane {l}: v_rcp_f64({x:#018x})");
+        assert_eq!(bits(4), want, "lane {l}: v_rsq_f64({x:#018x})");
+    }
+}
+
 /// v_ldexp_f64 = x · 2^n, rounded once, for every i32 n: results that over- or underflow,
 /// denormal results, exponents beyond the f32 range of 2^n.
 #[test]
