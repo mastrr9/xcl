@@ -453,7 +453,7 @@ fn atomic_fcmpswap_x2_uses_ieee_64_bit_cas() {
     assert!(t.hlsl.contains("_cmp = (uint64_t)v26 | ((uint64_t)v27 << 32);"), "{}", t.hlsl);
     // 8-byte alignment of all three cells; the buffer form's bounds check reads records in dwords
     assert_eq!(t.hlsl.matches("& ~7u;").count(), 3, "{}", t.hlsl);
-    assert!(t.hlsl.contains("_off + 8u <= s10"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("_room = s10 - t") && t.hlsl.contains("8u <= t"), "{}", t.hlsl);
     // GLC returns the old u64 as a low / high dword pair – in place in VDATA for the buffer
     // form, into VDST for flat / global
     assert_eq!(t.hlsl.matches("_old >> 32").count(), 3, "{}", t.hlsl);
@@ -504,6 +504,104 @@ fn atomic_fmin_fmax_x2_are_native_64_bit_atomics() {
         super::dxc::compile(&w.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", w.hlsl));
         direct_check(&code, &Options { mem_windows: 2, ..Default::default() });
         direct_check(&code, &Options { mem_windows: 2, heap_windows: true, ..Default::default() });
+    }
+}
+
+/// Raw buffer accesses (stride 0) with one memory window: `voff + OFFSET` is a 32-bit sum, but
+/// RDNA2 adds without wrapping (as the 64-bit sum of several windows does), so a sum past 2^32
+/// is past num_records. Every form checks that the sum did not wrap and compares the bytes it
+/// accesses with what is left to num_records (`off + bytes` cannot wrap either).
+#[test]
+fn raw_buffer_range_checks_do_not_wrap() {
+    let names: &[(&str, &str, &[(&str, u64)])] = &[
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[]),
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", &[]),
+        ("BUFFER_STORE_DWORDX3", "ENC_MUBUF", &[]),
+        ("BUFFER_LOAD_SBYTE", "ENC_MUBUF", &[]),
+        ("BUFFER_STORE_SHORT", "ENC_MUBUF", &[]),
+        ("BUFFER_LOAD_SHORT_D16", "ENC_MUBUF", &[]),
+        ("BUFFER_LOAD_UBYTE_D16_HI", "ENC_MUBUF", &[]),
+        ("BUFFER_STORE_BYTE_D16_HI", "ENC_MUBUF", &[]),
+        ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[]),
+        ("BUFFER_STORE_FORMAT_X", "ENC_MUBUF", &[]),
+        ("BUFFER_LOAD_FORMAT_D16_XY", "ENC_MUBUF", &[]),
+        ("BUFFER_STORE_FORMAT_D16_HI_X", "ENC_MUBUF", &[]),
+        ("TBUFFER_LOAD_FORMAT_X", "ENC_MTBUF", &[("FORMAT", 20)]),
+        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("GLC", 1)]),
+        ("BUFFER_ATOMIC_CMPSWAP_X2", "ENC_MUBUF", &[("GLC", 1)]),
+        ("BUFFER_ATOMIC_UMAX_X2", "ENC_MUBUF", &[]),
+    ];
+    for &(name, enc, extra) in names {
+        let mut fields = vec![("VDATA", 4), ("VADDR", 2), ("SRSRC", 2), ("SOFFSET", 128), ("OFFSET", 0x208), ("OFFEN", 1)];
+        fields.extend_from_slice(extra);
+        let code = prog(&[(name, enc, fields.as_slice(), None)]);
+        let t = translate(&code, &Options::default()).unwrap();
+        assert!(t.complete(), "{name}: {:?}\n{}", t.unsupported_why, t.hlsl);
+        // the sum's carry (voff = v2) and num_records (s10) bound the access, not a 32-bit
+        // `off + bytes <= num_records`
+        assert!(t.hlsl.contains("_off = v2 + 520u;"), "{name}:\n{}", t.hlsl);
+        assert!(t.hlsl.contains("_off >= v2, t") && t.hlsl.contains("_room = s10 - t"), "{name}:\n{}", t.hlsl);
+        assert!(t.hlsl.contains("_in, ") && t.hlsl.contains("<= t") && !t.hlsl.contains("<= s10,"), "{name}:\n{}", t.hlsl);
+        // several windows already sum in 64 bits
+        let w = translate(&code, &Options { mem_windows: 2, ..Default::default() }).unwrap();
+        assert!(w.hlsl.contains("<= (uint64_t)s10") && !w.hlsl.contains("_room"), "{name}:\n{}", w.hlsl);
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{name}: {e}\n{}", t.hlsl));
+        }
+    }
+}
+
+/// The GPU side of `raw_buffer_range_checks_do_not_wrap`: a load, a d16 load, a store and a
+/// returning atomic whose `voff + OFFSET` wraps past 2^32 to an offset inside the buffer read 0,
+/// write nothing and return 0, as does a load whose `off + 4` wraps past num_records 0xFFFF_FFFF;
+/// an in-range lane behaves as usual (the direct DXIL backend too, with `XCL_DIRECT_DXIL=1`).
+#[test]
+fn gpu_raw_buffer_offsets_that_wrap_are_out_of_range() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 3), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("OFFSET", 0x208), ("OFFEN", 1)], None),
+        ("BUFFER_LOAD_SHORT_D16", "ENC_MUBUF", &[("VDATA", 7), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("OFFSET", 0x208), ("OFFEN", 1)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 5), ("VADDR", 2), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("OFFSET", 0x208), ("OFFEN", 1)], None),
+        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 6), ("VADDR", 1), ("SRSRC", 2), ("SOFFSET", 128), ("OFFSET", 0x208), ("OFFEN", 1), ("GLC", 1)], None),
+    ]);
+    let mut mem = vec![0u32; 1024];
+    for (i, m) in mem.iter_mut().enumerate() {
+        *m = 0x1000 + i as u32;
+    }
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&[0x40, 0, 0x400, 0]); // V#: base 0x40, stride 0, 0x400 bytes
+    st.sgpr[12..16].copy_from_slice(&[0x40, 0, 0xFFFF_FFFF, 0]); // V#: base 0x40, stride 0, 0xFFFF_FFFF bytes
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        // lane 0 wraps (voff + 0x208 = 0x200 and 0x1F8 in 32 bits; 0xFFFF_FFFE + 4 = 2),
+        // lane 1 is in range, the others are past the end
+        r[0] = [0xFFFF_FFF8, 4].get(l).copied().unwrap_or(0x1000);
+        r[1] = [0xFFFF_FFF0, 0x10].get(l).copied().unwrap_or(0x1000);
+        r[2] = [0xFFFF_FFFE, 8].get(l).copied().unwrap_or(8);
+        r[3] = 0xDEAD;
+        r[4] = 0xC0DE_0000 | l as u32;
+        r[5] = 0xDEAD;
+        r[6] = 5;
+        r[7] = 0xDEAD_BEEF;
+    }
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    for (l, v) in r.vgpr.iter().enumerate().take(64) {
+        let lane1 = l == 1;
+        assert_eq!(v[3], if lane1 { 0x1000 + (0x40 + 4 + 0x208) / 4 } else { 0 }, "lane {l} load");
+        assert_eq!(v[7], if lane1 { 0xDEAD_0000 | (0x1000 + (0x40 + 4 + 0x208) / 4) } else { 0xDEAD_0000 }, "lane {l} d16 load");
+        assert_eq!(v[5], if l == 0 { 0 } else { 0x1000 + (0x40 + 8) / 4 }, "lane {l} load near num_records 0xFFFF_FFFF");
+        assert_eq!(v[6], if lane1 { 0x1000 + (0x40 + 0x10 + 0x208) / 4 } else { 0 }, "lane {l} atomic returns");
+    }
+    // only lane 1's store and atomic write memory
+    for (i, &m) in r.mem.iter().enumerate().take(mem.len()) {
+        let want = match i * 4 {
+            0x24C => 0xC0DE_0001,
+            0x258 => mem[i] + 5,
+            _ => mem[i],
+        };
+        assert_eq!(m, want, "memory at byte {:#x}", i * 4);
     }
 }
 
