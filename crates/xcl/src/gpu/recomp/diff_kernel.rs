@@ -17,10 +17,17 @@
 //! one backend leaves unstored (0) while the other stores its unchanged input value is not a
 //! difference: an SGPR on its own, a VGPR only when that holds in every lane that ran (one
 //! side 0 in all of them, the other the input in all of them).
+//!
+//! The lane order of one atomic across a wave is unspecified, on the console and on the host:
+//! the destinations of the program's returning atomics (`atomic_returns`) are compared as a
+//! multiset of per-lane values when they differ lane by lane. A test whose values depend on
+//! that order in another way (many lanes' cmpswap or umax on one address) names them with
+//! `relax` and `Unordered`; its own check must then accept the direct run.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::io::Write;
+use std::ops::Range;
 use std::sync::Mutex;
 
 use super::diff_table::{self, Outcome};
@@ -39,6 +46,87 @@ thread_local! {
     /// An HLSL kernel container `pair`ed with the lanes it runs, the program (for the
     /// `diff_table` line) and the direct translation of the same program.
     static PAIRED: RefCell<Option<(Vec<u8>, usize, Vec<u8>, Result<Kernel, String>)>> = const { RefCell::new(None) };
+    /// The running test's `relax`ation of the comparison.
+    static RELAX: RefCell<Relax> = RefCell::new(Relax::default());
+}
+
+/// How a test relaxes the comparison of its runs (`relax`); the default compares every slot
+/// bit for bit.
+#[derive(Default)]
+pub struct Relax {
+    /// Values that depend on the order in which the lanes of an atomic ran.
+    pub unordered: Option<Unordered>,
+}
+
+/// VGPRs (every lane) and flat-memory dwords whose values depend on the order in which the
+/// lanes of an atomic ran, such as many lanes' cmpswap or umax on one address: they are not
+/// compared bit for bit, `check` (the test's own checks of them, which panic as its asserts
+/// do) must accept the direct run instead (the test checks the HLSL result it gets back).
+/// Kernel runs only: the memory `runner::dispatch` leaves is compared strictly.
+pub struct Unordered {
+    pub vgprs: Vec<Range<usize>>,
+    pub mem: Vec<Range<usize>>,
+    pub check: Box<dyn Fn(&KernelResult)>,
+}
+
+/// The comparison of this thread's runs is relaxed by `r` until the returned guard drops.
+pub fn relax(r: Relax) -> Relaxed {
+    RELAX.with(|t| *t.borrow_mut() = r);
+    Relaxed(())
+}
+
+/// Ends a `relax`ation when dropped.
+pub struct Relaxed(());
+
+impl Drop for Relaxed {
+    fn drop(&mut self) {
+        RELAX.with(|t| *t.borrow_mut() = Relax::default());
+    }
+}
+
+/// The VGPR ranges the returning atomics of `code` write (DS `_RTN`, GLC FLAT / GLOBAL /
+/// MUBUF / MIMG atomics) and no other instruction of it writes; empty when `code` does not
+/// decode or writes a VGPR M0 picks.
+pub fn atomic_returns(code: &[u8]) -> Vec<Range<usize>> {
+    use crate::gpu::rdna2;
+    let (mut atomic, mut other) = (Vec::new(), Vec::new());
+    let mut pc = 0;
+    while pc < code.len() {
+        let Ok(d) = rdna2::decode(&code[pc..], pc as u64) else { return Vec::new() };
+        pc += d.len;
+        let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0) as usize;
+        let name = d.inst.name;
+        // v_movreld / v_movrelsd write a VGPR chosen by M0 at run time
+        if name.starts_with("V_MOVRELD") || name.starts_with("V_MOVRELSD") {
+            return Vec::new();
+        }
+        let ds = name.starts_with("DS_") && name.contains("_RTN");
+        if ds || name.contains("_ATOMIC_") {
+            // a FLAT / MUBUF / MIMG atomic without GLC writes no VGPR
+            if !ds && f("GLC") == 0 {
+                continue;
+            }
+            let at = if name.starts_with("BUFFER_") || name.starts_with("IMAGE_") { f("VDATA") } else { f("VDST") };
+            let n = if name.starts_with("IMAGE_") {
+                // DMASK: the data dwords, of which a cmpswap returns the first half
+                let n = f("DMASK").count_ones() as usize;
+                if name.contains("CMPSWAP") { n / 2 } else { n }
+            } else if name.starts_with("BUFFER_") {
+                1 + name.ends_with("_X2") as usize
+            } else {
+                d.ienc.operands.iter().find(|o| o.field == Some("VDST")).map_or(1, |o| (o.size as usize).div_ceil(32))
+            };
+            atomic.push(at..at + n.max(1));
+            continue;
+        }
+        for o in d.ienc.operands.iter().filter(|o| o.output && !o.implicit && o.ty.starts_with("OPR_VGPR")) {
+            if let Some(v) = o.field.and_then(|n| rdna2::field_value(d.enc, &d.words, n)) {
+                other.push(v as usize..v as usize + (o.size as usize).div_ceil(32).max(1));
+            }
+        }
+    }
+    atomic.retain(|a| !other.iter().any(|o| o.start < a.end && a.start < o.end));
+    atomic
 }
 
 /// `XCL_DXIL_DIFF=1`: kernel runs go through both backends and must agree.
@@ -204,7 +292,8 @@ fn run_paired(
         diff_table::record(code, Outcome::Failed);
         format!("XCL_DXIL_DIFF: the direct DXIL kernel failed (the HLSL one ran): {x}")
     })?;
-    let c = compare(state, lanes, &h, &d);
+    let atomic = atomic_returns(code);
+    let c = RELAX.with(|r| compare_relaxed(state, lanes, &h, &d, &atomic, &r.borrow()));
     diff_table::record(code, if c.is_ok() { Outcome::Matched } else { Outcome::Mismatched });
     c?;
     Ok(h)
@@ -258,6 +347,57 @@ fn dword(b: &[u8], i: usize) -> u32 {
         *x = b.get(i * 4 + k).copied().unwrap_or(0);
     }
     u32::from_le_bytes(w)
+}
+
+/// `compare` with the destinations of returning atomics `atomic` (`atomic_returns`) compared
+/// as multisets of per-lane values and the test's `relax`ation `r`: the slots they accept take
+/// the HLSL value in a copy of `direct`, which is compared strictly.
+pub fn compare_relaxed(state: &KernelState, lanes: usize, hlsl: &KernelResult, direct: &KernelResult, atomic: &[Range<usize>], r: &Relax) -> Result<(), String> {
+    let mut d = KernelResult {
+        sgpr: direct.sgpr.clone(),
+        vgpr: direct.vgpr.clone(),
+        scc: direct.scc,
+        raw: direct.raw.clone(),
+        mem: direct.mem.clone(),
+        textures: direct.textures.clone(),
+    };
+    let lanes = lanes.min(hlsl.vgpr.len()).min(d.vgpr.len());
+    let regs = |x: &KernelResult, l: usize, a: &Range<usize>| a.clone().map(|v| x.vgpr[l].get(v).copied().unwrap_or(0)).collect::<Vec<u32>>();
+    let take = |d: &mut KernelResult, a: &Range<usize>| {
+        for l in 0..lanes {
+            let n = d.vgpr[l].len();
+            for v in a.clone().filter(|&v| v < n) {
+                d.vgpr[l][v] = hlsl.vgpr[l].get(v).copied().unwrap_or(0);
+            }
+        }
+    };
+    for a in atomic {
+        let (mut h, mut x): (Vec<_>, Vec<_>) = (0..lanes).map(|l| (regs(hlsl, l, a), regs(&d, l, a))).unzip();
+        h.sort_unstable();
+        x.sort_unstable();
+        if h == x {
+            take(&mut d, a);
+        }
+    }
+    if let Some(u) = &r.unordered {
+        let msg = |p: Box<dyn std::any::Any + Send>| p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (u.check)(direct)))
+            .map_err(|p| format!("XCL_DXIL_DIFF: the direct DXIL run fails the test's check of its unordered values: {}", msg(p)))?;
+        for a in &u.vgprs {
+            take(&mut d, a);
+        }
+        d.mem = relaxed_mem(&hlsl.mem, &d.mem, &u.mem);
+    }
+    compare(state, lanes, hlsl, &d)
+}
+
+/// `direct` flat memory with the dwords of `unordered` taken from `hlsl`.
+fn relaxed_mem(hlsl: &[u32], direct: &[u32], unordered: &[Range<usize>]) -> Vec<u32> {
+    let mut d = direct.to_vec();
+    for i in unordered.iter().flat_map(|a| a.clone()).filter(|&i| i < direct.len()) {
+        d[i] = hlsl.get(i).copied().unwrap_or(0);
+    }
+    d
 }
 
 /// Compares the observable state of an HLSL and a direct DXIL run of `lanes` lanes from
@@ -485,6 +625,154 @@ mod tests {
         assert!(translator_failed("direct DXIL failed validation: bad"));
         assert!(translator_failed("direct DXIL builder error: bad"));
         assert!(translator_failed("the direct DXIL translator panicked: overflow"));
+    }
+
+    /// A program with the returning atomics of the given (name, encoding, fields), then
+    /// `S_ENDPGM`.
+    fn program(list: &[(&str, &str, &[(&str, u64)])]) -> Vec<u8> {
+        let mut code = Vec::new();
+        for (n, e, f) in list {
+            code.extend(encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}")));
+        }
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    #[test]
+    fn atomic_returns_are_the_vgprs_returning_atomics_alone_write() {
+        let code = program(&[
+            ("DS_ADD_RTN_U32", "ENC_DS", &[("VDST", 26), ("ADDR", 27), ("DATA0", 28)]),
+            ("DS_ADD_U32", "ENC_DS", &[("ADDR", 27), ("DATA0", 28)]),
+            ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 15), ("VADDR", 0), ("SRSRC", 5)]),
+            ("BUFFER_ATOMIC_UMAX", "ENC_MUBUF", &[("VDATA", 16), ("VADDR", 0), ("SRSRC", 5), ("GLC", 1)]),
+            ("BUFFER_ATOMIC_CMPSWAP_X2", "ENC_MUBUF", &[("VDATA", 30), ("VADDR", 8), ("SRSRC", 3), ("GLC", 1)]),
+            ("GLOBAL_ATOMIC_FCMPSWAP_X2", "ENC_FLAT_GLBL", &[("VDST", 44), ("ADDR", 9), ("DATA", 46), ("SADDR", 3), ("GLC", 1)]),
+            ("IMAGE_ATOMIC_CMPSWAP", "ENC_MIMG", &[("VDATA", 50), ("VADDR", 4), ("SRSRC", 4), ("DMASK", 3), ("GLC", 1)]),
+            // written by a VALU op too: compared lane by lane
+            ("FLAT_ATOMIC_ADD", "ENC_FLAT", &[("VDST", 60), ("ADDR", 14), ("DATA", 16), ("GLC", 1)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 60), ("SRC0", 128)]),
+        ]);
+        assert_eq!(atomic_returns(&code), vec![26..27, 16..17, 30..32, 44..46, 50..51]);
+        // a program that does not decode is compared strictly, as is one that writes a VGPR
+        // M0 picks
+        assert_eq!(atomic_returns(&[0xFF; 4]), Vec::<Range<usize>>::new());
+        let movrel = program(&[
+            ("DS_ADD_RTN_U32", "ENC_DS", &[("VDST", 26), ("ADDR", 27), ("DATA0", 28)]),
+            ("V_MOVRELD_B32", "ENC_VOP1", &[("VDST", 20), ("SRC0", 256 + 1)]),
+        ]);
+        assert_eq!(atomic_returns(&movrel), Vec::<Range<usize>>::new());
+    }
+
+    /// `ds_add_rtn_u32 v26` (every lane adds 1): the old values are 0..64 in any lane order.
+    fn add_rtn() -> (Vec<u8>, KernelResult, KernelResult) {
+        let code = program(&[("DS_ADD_RTN_U32", "ENC_DS", &[("VDST", 26), ("ADDR", 27), ("DATA0", 28)])]);
+        let (mut h, mut d) = (blank(), blank());
+        for l in 0..KERNEL_LANES {
+            h.vgpr[l][26] = l as u32;
+            d.vgpr[l][26] = (l as u32 * 37) % 64; // a permutation of 0..64
+            h.vgpr[l][3] = l as u32;
+            d.vgpr[l][3] = l as u32;
+        }
+        (code, h, d)
+    }
+
+    #[test]
+    fn permuted_atomic_returns_compare_equal() {
+        let (code, h, d) = add_rtn();
+        let st = KernelState::default();
+        assert!(compare(&st, KERNEL_LANES, &h, &d).is_err(), "strict: the lanes differ");
+        assert_eq!(compare_relaxed(&st, KERNEL_LANES, &h, &d, &atomic_returns(&code), &Relax::default()), Ok(()));
+    }
+
+    #[test]
+    fn a_wrong_atomic_return_is_still_a_difference() {
+        let (code, h, mut d) = add_rtn();
+        let st = KernelState::default();
+        // one lane got a value no lane got on the HLSL side (returned the new value, say)
+        d.vgpr[5][26] = 64;
+        let e = compare_relaxed(&st, KERNEL_LANES, &h, &d, &atomic_returns(&code), &Relax::default()).unwrap_err();
+        assert!(e.contains("vgpr (") && e.contains(" v26: hlsl"), "{e}");
+        // the same values in another lane order, but another register differs as well
+        let (code, h, mut d) = add_rtn();
+        d.vgpr[9][3] = 7;
+        let e = compare_relaxed(&st, KERNEL_LANES, &h, &d, &atomic_returns(&code), &Relax::default()).unwrap_err();
+        assert!(e.contains("vgpr (1 differ):\n    lane 9 v3: hlsl 0x00000009 direct 0x00000007"), "{e}");
+    }
+
+    #[test]
+    fn a_permutation_of_a_non_atomic_register_is_a_difference() {
+        let (_, h, d) = add_rtn();
+        // v26 written by a VALU op, not an atomic
+        let code = program(&[("V_MOV_B32", "ENC_VOP1", &[("VDST", 26), ("SRC0", 128)])]);
+        assert!(atomic_returns(&code).is_empty());
+        let st = KernelState::default();
+        assert!(compare_relaxed(&st, KERNEL_LANES, &h, &d, &atomic_returns(&code), &Relax::default()).is_err());
+        // a non-atomic register of a program with atomics: two lanes swapped
+        let (code, h, mut d) = add_rtn();
+        d.vgpr[1][26] = h.vgpr[1][26];
+        for l in 0..KERNEL_LANES {
+            d.vgpr[l][26] = h.vgpr[l][26];
+        }
+        d.vgpr.swap(1, 2);
+        let e = compare_relaxed(&st, KERNEL_LANES, &h, &d, &atomic_returns(&code), &Relax::default()).unwrap_err();
+        assert!(e.contains("lane 1 v3: hlsl 0x00000001 direct 0x00000002"), "{e}");
+    }
+
+    #[test]
+    fn a_wave32_multiset_holds_the_lanes_that_ran() {
+        let (code, mut h, mut d) = add_rtn();
+        let st = KernelState::default();
+        for l in 0..KERNEL_LANES {
+            h.vgpr[l][26] = if l < 32 { l as u32 } else { 0 };
+            d.vgpr[l][26] = if l < 32 { 31 - l as u32 } else { 0 };
+        }
+        assert_eq!(compare_relaxed(&st, 32, &h, &d, &atomic_returns(&code), &Relax::default()), Ok(()));
+        // a value swapped with a lane that did not run is a difference
+        d.vgpr[40][26] = d.vgpr[2][26];
+        d.vgpr[2][26] = 0;
+        assert!(compare_relaxed(&st, 32, &h, &d, &atomic_returns(&code), &Relax::default()).is_err());
+    }
+
+    #[test]
+    fn unordered_values_are_left_to_the_tests_check() {
+        let st = KernelState::default();
+        let (mut h, mut d) = (blank(), blank());
+        // one shared cmpswap cell (mem[4..6]): lane 3 won on the HLSL side, lane 7 on the direct
+        for l in 0..KERNEL_LANES {
+            h.vgpr[l][40] = if l == 3 { 0x15 } else { 0x100 + 3 };
+            d.vgpr[l][40] = if l == 7 { 0x15 } else { 0x100 + 7 };
+        }
+        h.mem[4] = 0x103;
+        d.mem[4] = 0x107;
+        assert!(compare(&st, KERNEL_LANES, &h, &d).is_err());
+        // the test's check: one winner got the initial value, the others and the cell its value
+        let check = |r: &KernelResult| {
+            let w = (0..KERNEL_LANES).find(|&l| r.vgpr[l][40] == 0x15).expect("a winner");
+            for l in (0..KERNEL_LANES).filter(|&l| l != w) {
+                assert_eq!(r.vgpr[l][40], 0x100 + w as u32, "lane {l}");
+            }
+            assert_eq!(r.mem[4], 0x100 + w as u32, "cell");
+        };
+        let r = Relax { unordered: Some(Unordered { vgprs: vec![40..41], mem: vec![4..6], check: Box::new(check) }) };
+        assert_eq!(compare_relaxed(&st, KERNEL_LANES, &h, &d, &[], &r), Ok(()));
+        // a direct run the check refuses is a difference
+        d.mem[4] = 0x103;
+        let e = compare_relaxed(&st, KERNEL_LANES, &h, &d, &[], &r).unwrap_err();
+        assert!(e.contains("fails the test's check of its unordered values") && e.contains("cell"), "{e}");
+        // and slots outside the named ones are compared strictly
+        d.mem[4] = 0x107;
+        d.mem[6] = 1;
+        assert!(compare_relaxed(&st, KERNEL_LANES, &h, &d, &[], &r).unwrap_err().contains("mem[6] (byte 0x18)"));
+    }
+
+    #[test]
+    fn a_relaxation_ends_with_its_guard() {
+        let r = Relax { unordered: Some(Unordered { vgprs: vec![1..2], mem: Vec::new(), check: Box::new(|_| {}) }) };
+        {
+            let _g = relax(r);
+            assert!(RELAX.with(|t| t.borrow().unordered.is_some()));
+        }
+        assert!(RELAX.with(|t| t.borrow().unordered.is_none()));
     }
 
     /// A small program through both backends via the diff entry point (independent of
