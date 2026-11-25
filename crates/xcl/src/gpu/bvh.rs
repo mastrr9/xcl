@@ -616,6 +616,20 @@ pub(crate) mod tests {
         assert_eq!(got, [c0, INVALID, INVALID, INVALID]);
     }
 
+    /// A triangle whose det is the difference of two equal rounded products: 0 when every step
+    /// rounds on its own (a miss), 2^-46 when the first product is fused into the subtraction
+    /// (a hit). The GPU's bvh_intersect rounds every step as this mirror does
+    /// (recomp `gpu_bvh_triangle_rounds_every_step`).
+    #[test]
+    fn triangle_hit_rounds_every_step() {
+        let (a, c) = (1.0 + f32::EPSILON, 1.0 + 2.0 * f32::EPSILON);
+        // the x of cross(d, e2) below: d.y * e2.z - d.z * e2.y
+        assert_eq!(a * a - c, 0.0);
+        assert_eq!(a.mul_add(a, -c), 2f32.powi(-46));
+        let v = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, a]];
+        assert_eq!(triangle_hit(&v, [0.5, 0.0, 0.0], [0.0, a, c]), None);
+    }
+
     #[test]
     fn triangle_hit_small_and_large_det_avoids_underflow_and_overflow() {
         let d = [0.0, 0.0, 1.0];
