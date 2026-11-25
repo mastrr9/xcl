@@ -147,6 +147,16 @@ impl Lw {
         let special = self.cmpc(Pred::Eq, exp, 0xFF);
         self.selc(special, 0, finite)
     }
+    /// A NaN operand as RDNA2's VALU returns it: quiet (bit 22 set), sign and payload kept;
+    /// any other value unchanged. `ldexp_f` and `frexp_mant` return a NaN x as it is.
+    pub fn quiet_f(&mut self, x: Value) -> Value {
+        let u = self.bits(x);
+        let m = self.andc(u, 0x7FFF_FFFF);
+        let n = self.cmpc(Pred::UGt, m, 0x7F80_0000);
+        let q = self.orc(u, 0x40_0000);
+        let q = self.f(q);
+        self.sel(n, q, x)
+    }
     /// `ldexp_f`: exact x · 2^n on the bits.
     pub fn ldexp_f(&mut self, x: Value, n: Value) -> Value {
         let u = self.bits(x);
