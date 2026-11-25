@@ -2019,6 +2019,15 @@ impl Em {
         }
     }
 
+    /// One memory window: what a raw (stride 0) buffer access's range check needs of the 32-bit
+    /// `{t}_off = voff + OFFSET`, as `raw_in_range` takes it. RDNA2 adds them without wrapping
+    /// (as the 64-bit sum of several windows does), so a sum past 2^32 is past num_records `d2`
+    /// too: `{t}_in` is false when the sum wrapped or is past `d2`, and `{t}_room` is the bytes
+    /// left from `{t}_off` to `d2` (so `{t}_off + bytes` cannot wrap in the check either).
+    fn raw_room(&mut self, t: &str, voff: &str, d2: &str) {
+        self.line(&format!("bool {t}_in = and({t}_off >= {voff}, {t}_off <= {d2}); uint {t}_room = {d2} - {t}_off;"));
+    }
+
     /// Compute the effective address of a FLAT / GLOBAL access into `uint {t}_a` (masked by
     /// `~align_mask` when non-zero) and, when `mem_windows > 1`, select `xcl_w` from the exact
     /// 64-bit address (carrying/borrowing across 4 GiB window boundaries).
@@ -2142,6 +2151,7 @@ impl Em {
         } else {
             self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
             self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
+            self.raw_room(&t, &voff, &d2);
         }
         let act = self.act();
         let multi = self.opt.mem_windows > 1;
@@ -2149,7 +2159,7 @@ impl Em {
             if multi {
                 format!("select({t}_stride == 0u, {t}_off + (uint64_t)({bytes}) <= (uint64_t){d2}, {index} < {d2})")
             } else {
-                format!("select({t}_stride == 0u, {t}_off + {bytes} <= {d2}, {index} < {d2})")
+                format!("select({t}_stride == 0u, {}, {index} < {d2})", raw_in_range(&t, &bytes))
             }
         };
         if let Some((n, signed, store)) = small {
@@ -4219,7 +4229,8 @@ impl Em {
         } else {
             self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
             self.line(&format!("uint {t}_a = ({d0} + {soff} + {t}_off + {t}_stride * {index}) & ~{}u;", bytes - 1));
-            self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + {bytes}u <= {d2}, {index} < {d2});"));
+            self.raw_room(&t, &voff, &d2);
+            self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {}, {index} < {d2});", raw_in_range(&t, &format!("{bytes}u"))));
         }
         let act = self.act();
         if x2 {
@@ -4277,11 +4288,12 @@ impl Em {
         } else {
             self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
             self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
+            self.raw_room(&t, &voff, &d2);
         }
         let ok = if self.opt.mem_windows > 1 {
             format!("select({t}_stride == 0u, {t}_off + (uint64_t){n}u <= (uint64_t){d2}, {index} < {d2})")
         } else {
-            format!("select({t}_stride == 0u, {t}_off + {n}u <= {d2}, {index} < {d2})")
+            format!("select({t}_stride == 0u, {}, {index} < {d2})", raw_in_range(&t, &format!("{n}u")))
         };
         let act = self.act();
         let v = self.vreg(vdata);
@@ -5910,6 +5922,12 @@ fn ds_d16(name: &str) -> Option<(u32, bool, bool, u32)> {
         "ds_write_b16_d16_hi" => (16, false, true, 1),
         _ => return None,
     })
+}
+
+/// One memory window: `{t}_off + bytes <= num_records` for a raw (stride 0) buffer access,
+/// without 32-bit wrap (`raw_room` defines `{t}_in` and `{t}_room`).
+fn raw_in_range(t: &str, bytes: &str) -> String {
+    format!("and({t}_in, {bytes} <= {t}_room)")
 }
 
 /// The data a d16 store takes from VGPR `v` (half 1: the high 16 bits).
