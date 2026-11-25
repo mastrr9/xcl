@@ -318,7 +318,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             trace_mem("VirtualAlloc (graphics reserve, UMA)", 0, size, t as u64, p, q as usize);
             return q as *mut c_void;
         }
-        let q = mem::VirtualAlloc(addr, size, mem::MEM_RESERVE | MEM_WRITE_WATCH, sanitize_protect(p));
+        let q = alloc_below_40b(size, mem::MEM_RESERVE | MEM_WRITE_WATCH, sanitize_protect(p));
         if !q.is_null() {
             GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
             GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
@@ -360,7 +360,11 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             return q;
         }
     }
-    let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p));
+    let q = if addr.is_null() && (t & (MEM_GRAPHICS | 0x2000_0000) != 0 || p & PAGE_GRAPHICS_ANY != 0) {
+        alloc_below_40b(size, sanitize_alloc_type(t), sanitize_protect(p))
+    } else {
+        mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p))
+    };
     trace_mem("VirtualAlloc", addr as usize, size, t as u64, p, q as usize);
     q
 }
@@ -372,11 +376,64 @@ fn gpu_visible_fallback(addr: *const c_void, t: u32, p: u32) -> bool {
     addr.is_null() && t & 0x2000 != 0 && (t & (MEM_GRAPHICS | 0x2000_0000) != 0 || p & PAGE_GRAPHICS_ANY != 0)
 }
 
+/// Highest valid byte address inside the console's 40-bit GPU virtual address space
+/// (`(1 << 40) - 1`, aligned to `64 KiB - 1` as `VirtualAlloc2` requires).
+const CONSOLE_VA_40B_MAX: usize = (1usize << 40) - 1;
+
+#[repr(C)]
+struct MemAddressRequirements {
+    lowest_starting_address: *mut c_void,
+    highest_ending_address: *mut c_void,
+    alignment: usize,
+}
+
+#[repr(C)]
+struct MemExtendedParameter {
+    ty: u64,
+    pointer: *mut c_void,
+}
+
+#[link(name = "kernelbase", kind = "raw-dylib")]
+extern "system" {
+    fn VirtualAlloc2(
+        process: HANDLE,
+        base_address: *const c_void,
+        size: usize,
+        allocation_type: u32,
+        page_protection: u32,
+        extended_parameters: *mut MemExtendedParameter,
+        parameter_count: u32,
+    ) -> *mut c_void;
+}
+
+/// Allocate anonymous memory below the console's 40-bit GPU VA ceiling (`< 0x100_0000_0000`).
+/// Console middleware such as `xboxbvhbuilder.dll` validates `va < (1 << 40)` on GPU addresses
+/// and throws `DestAccelerationStructureData can not have more than 40b of address set` if
+/// Windows' 47-bit ASLR places a fallback GPU-visible allocation above 1 TiB.
+/// Falls back to unconstrained `VirtualAlloc` if no range fits below 1 TiB.
+unsafe fn alloc_below_40b(size: usize, alloc_type: u32, protect: u32) -> *mut c_void {
+    let mut reqs = MemAddressRequirements {
+        lowest_starting_address: std::ptr::null_mut(),
+        highest_ending_address: CONSOLE_VA_40B_MAX as *mut c_void,
+        alignment: 0,
+    };
+    let mut ext = MemExtendedParameter {
+        ty: 1, // MemExtendedParameterAddressRequirements
+        pointer: &mut reqs as *mut MemAddressRequirements as *mut c_void,
+    };
+    let q = VirtualAlloc2(std::ptr::null_mut(), std::ptr::null(), size, alloc_type, protect, &mut ext, 1);
+    if !q.is_null() {
+        return q;
+    }
+    mem::VirtualAlloc(std::ptr::null(), size, alloc_type, protect)
+}
+
 /// Plain memory for GPU-visible title memory, write-watched and recorded with the graphics
-/// reservations (whose ranges `title_textures` watches; `VirtualFree` forgets it). Null if
-/// Windows refuses it.
+/// reservations (whose ranges `title_textures` watches; `VirtualFree` forgets it). Placed
+/// below 40 bits so console ray-tracing/GPU middleware accepts the address. Null if Windows
+/// refuses it.
 unsafe fn reserve_watched(size: usize, t: u32, p: u32) -> *mut c_void {
-    let q = mem::VirtualAlloc(std::ptr::null(), size, sanitize_alloc_type(t) | MEM_WRITE_WATCH, sanitize_protect(p));
+    let q = alloc_below_40b(size, sanitize_alloc_type(t) | MEM_WRITE_WATCH, sanitize_protect(p));
     if !q.is_null() {
         GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
         GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
@@ -3327,6 +3384,31 @@ mod tests {
             let home = alloc_physical_home(&u, 2 * PHYS_PAGE).unwrap();
             assert!(u.is_committed(home), "coherent-only UMA should still back physical homes");
             assert!(u.free(home));
+        }
+    }
+
+    /// Fallback GPU-visible reservations and allocations stay within the console's 40-bit GPU VA
+    /// limit (`< 1 TiB`) so console middleware (e.g. `xboxbvhbuilder.dll`) does not reject them
+    /// for having bits above 39 set, while preserving `MEM_WRITE_WATCH` tracking.
+    #[test]
+    fn gpu_visible_fallback_allocations_stay_below_40_bits() {
+        const LIMIT_40B: usize = 1usize << 40;
+        let size = 2 << 20;
+        unsafe {
+            let r = reserve_watched(size, mem::MEM_RESERVE | MEM_64K_PAGES, mem::PAGE_READWRITE);
+            assert!(!r.is_null(), "reserve_watched below 40 bits failed");
+            let r_addr = r as usize;
+            assert!(r_addr + size <= LIMIT_40B, "reserve_watched landed above 40 bits: {r_addr:#x}");
+            assert_ne!(VirtualFree(r, 0, mem::MEM_RELEASE), 0);
+
+            let c = alloc_below_40b(size, mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH, mem::PAGE_READWRITE);
+            assert!(!c.is_null(), "alloc_below_40b commit failed");
+            let c_addr = c as usize;
+            assert!(c_addr + size <= LIMIT_40B, "alloc_below_40b landed above 40 bits: {c_addr:#x}");
+            // Verify the write-watched memory is writable and releases cleanly.
+            *(c as *mut u32) = 0x1234_5678;
+            assert_eq!(*(c as *const u32), 0x1234_5678);
+            assert_ne!(mem::VirtualFree(c, 0, mem::MEM_RELEASE), 0);
         }
     }
 }
