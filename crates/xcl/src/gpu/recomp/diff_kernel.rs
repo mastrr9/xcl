@@ -23,6 +23,9 @@
 //! multiset of per-lane values when they differ lane by lane. A test whose values depend on
 //! that order in another way (many lanes' cmpswap or umax on one address) names them with
 //! `relax` and `Unordered`; its own check must then accept the direct run.
+//!
+//! A test may also compare the NaNs of some float VGPRs by class (`Nan`) instead of bit for
+//! bit; nothing is relaxed unless a test asks.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -56,6 +59,44 @@ thread_local! {
 pub struct Relax {
     /// Values that depend on the order in which the lanes of an atomic ran.
     pub unordered: Option<Unordered>,
+    /// Float VGPRs whose NaNs compare by class.
+    pub nan: Vec<Nan>,
+}
+
+/// VGPRs (every lane that ran) holding f32 values, or f64 values in register pairs from
+/// `vgprs.start` (low dword first), whose NaNs compare by `eq`: a NaN on both sides with the
+/// same class is equal whatever its sign and payload. Every other value in them stays bit for
+/// bit, so a NaN against a number or an infinity is still a difference.
+pub struct Nan {
+    pub vgprs: Range<usize>,
+    pub f64: bool,
+    pub eq: NanEq,
+}
+
+/// When two NaNs are equal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NanEq {
+    /// Both quiet or both signalling. Quiet: the top mantissa bit (f32 bit 22, f64 bit 51) set.
+    Class,
+    /// Any NaN equals any NaN.
+    Any,
+}
+
+/// The class of the f32 (`f64`: false) or f64 value `bits`: None for a number or an infinity,
+/// Some(quiet) for a NaN.
+fn nan_class(bits: u64, f64: bool) -> Option<bool> {
+    let (exp, mant, quiet) = if f64 { (bits >> 52 & 0x7FF, bits & ((1 << 52) - 1), 1 << 51) } else { (bits >> 23 & 0xFF, bits & 0x7F_FFFF, 1 << 22) };
+    (exp == if f64 { 0x7FF } else { 0xFF } && mant != 0).then_some(mant & quiet != 0)
+}
+
+impl NanEq {
+    /// Two values `eq` accepts although their bits differ: two NaNs of a class it equates.
+    fn equal(self, a: u64, b: u64, f64: bool) -> bool {
+        match (nan_class(a, f64), nan_class(b, f64)) {
+            (Some(x), Some(y)) => self == NanEq::Any || x == y,
+            _ => false,
+        }
+    }
 }
 
 /// VGPRs (every lane) and flat-memory dwords whose values depend on the order in which the
@@ -377,6 +418,19 @@ pub fn compare_relaxed(state: &KernelState, lanes: usize, hlsl: &KernelResult, d
         x.sort_unstable();
         if h == x {
             take(&mut d, a);
+        }
+    }
+    for n in &r.nan {
+        let step = if n.f64 { 2 } else { 1 };
+        for l in 0..lanes {
+            let (h, x) = (&hlsl.vgpr[l], &mut d.vgpr[l]);
+            let end = n.vgprs.end.min(h.len()).min(x.len());
+            for v in n.vgprs.clone().step_by(step).filter(|&v| v + step <= end) {
+                let get = |r: &[u32]| if n.f64 { r[v] as u64 | (r[v + 1] as u64) << 32 } else { r[v] as u64 };
+                if n.eq.equal(get(h), get(x), n.f64) {
+                    x[v..v + step].copy_from_slice(&h[v..v + step]);
+                }
+            }
         }
     }
     if let Some(u) = &r.unordered {
@@ -753,7 +807,7 @@ mod tests {
             }
             assert_eq!(r.mem[4], 0x100 + w as u32, "cell");
         };
-        let r = Relax { unordered: Some(Unordered { vgprs: vec![40..41], mem: vec![4..6], check: Box::new(check) }) };
+        let r = Relax { unordered: Some(Unordered { vgprs: vec![40..41], mem: vec![4..6], check: Box::new(check) }), ..Default::default() };
         assert_eq!(compare_relaxed(&st, KERNEL_LANES, &h, &d, &[], &r), Ok(()));
         // a direct run the check refuses is a difference
         d.mem[4] = 0x103;
@@ -767,12 +821,79 @@ mod tests {
 
     #[test]
     fn a_relaxation_ends_with_its_guard() {
-        let r = Relax { unordered: Some(Unordered { vgprs: vec![1..2], mem: Vec::new(), check: Box::new(|_| {}) }) };
+        let r = Relax { unordered: Some(Unordered { vgprs: vec![1..2], mem: Vec::new(), check: Box::new(|_| {}) }), ..Default::default() };
         {
             let _g = relax(r);
             assert!(RELAX.with(|t| t.borrow().unordered.is_some()));
         }
         assert!(RELAX.with(|t| t.borrow().unordered.is_none()));
+    }
+
+    /// `lanes` results with the f32 or f64 value `h` / `d` in v`at` (and v`at + 1`) of lane 0.
+    fn nan_pair(at: usize, h: u64, d: u64) -> (KernelResult, KernelResult) {
+        let (mut a, mut b) = (blank(), blank());
+        (a.vgpr[0][at], a.vgpr[0][at + 1], b.vgpr[0][at], b.vgpr[0][at + 1]) = (h as u32, (h >> 32) as u32, d as u32, (d >> 32) as u32);
+        (a, b)
+    }
+
+    fn nan_rule(vgprs: Range<usize>, f64: bool, eq: NanEq) -> Relax {
+        Relax { nan: vec![Nan { vgprs, f64, eq }], ..Default::default() }
+    }
+
+    #[test]
+    fn nan_classes() {
+        assert_eq!(nan_class(0x7FC0_0000, false), Some(true));
+        assert_eq!(nan_class(0xFFFF_FFFF, false), Some(true));
+        assert_eq!(nan_class(0x7F80_0001, false), Some(false));
+        assert_eq!(nan_class(0x7F80_0000, false), None, "+inf");
+        assert_eq!(nan_class(0x3F80_0000, false), None);
+        assert_eq!(nan_class(0x7FF8_0000_0000_0000, true), Some(true));
+        assert_eq!(nan_class(0x7FF0_0000_0000_0001, true), Some(false));
+        assert_eq!(nan_class(0xFFF0_0000_0000_0000, true), None, "-inf");
+        // an f32 NaN pattern in the low dword of an f64 is a number
+        assert_eq!(nan_class(0x7FC0_0000, true), None);
+    }
+
+    #[test]
+    fn f32_nans_compare_by_class_where_a_test_asks() {
+        let st = KernelState::default();
+        let rel = |h, d, r: &Relax| {
+            let (a, b) = nan_pair(6, h, d);
+            compare_relaxed(&st, KERNEL_LANES, &a, &b, &[], r)
+        };
+        let (class, any) = (nan_rule(4..8, false, NanEq::Class), nan_rule(4..8, false, NanEq::Any));
+        // two quiet NaNs with other signs and payloads: equal by class, not by default
+        assert!(rel(0x7FC0_0000, 0xFFFF_FFFF, &Relax::default()).is_err());
+        assert_eq!(rel(0x7FC0_0000, 0xFFFF_FFFF, &class), Ok(()));
+        // signalling against quiet: a difference by class, equal for Any
+        assert!(rel(0x7FA0_0000, 0x7FE0_0000, &class).is_err());
+        assert_eq!(rel(0x7FA0_0000, 0x7FE0_0000, &any), Ok(()));
+        // a NaN against an infinity or a number, and two numbers 1 ulp apart, still differ
+        assert!(rel(0x7FC0_0000, 0x7F80_0000, &any).is_err());
+        assert!(rel(0x3F80_0000, 0x3F80_0001, &any).is_err());
+        // registers outside the rule stay bit for bit
+        assert!(rel(0x7FC0_0000, 0xFFFF_FFFF, &nan_rule(0..6, false, NanEq::Any)).is_err());
+    }
+
+    #[test]
+    fn f64_nans_compare_both_dwords_by_class() {
+        let st = KernelState::default();
+        let rel = |h, d, r: &Relax| {
+            let (a, b) = nan_pair(14, h, d);
+            compare_relaxed(&st, KERNEL_LANES, &a, &b, &[], r)
+        };
+        // a signalling NaN quieted on one side: the high dwords differ
+        let (snan, qnan) = (0x7FF0_0000_0000_0001u64, 0x7FF8_0000_0000_0001u64);
+        let e = rel(snan, qnan, &Relax::default()).unwrap_err();
+        assert!(e.contains("lane 0 v15: hlsl 0x7ff00000 direct 0x7ff80000"), "{e}");
+        assert!(rel(snan, qnan, &nan_rule(14..16, true, NanEq::Class)).is_err());
+        assert_eq!(rel(snan, qnan, &nan_rule(14..16, true, NanEq::Any)), Ok(()));
+        // quiet NaNs with other payloads in either dword: equal by class
+        assert_eq!(rel(qnan, 0xFFF8_0000_DEAD_0000, &nan_rule(14..16, true, NanEq::Class)), Ok(()));
+        // +inf (0x7ff00000:00000000) is not a NaN
+        assert!(rel(0x7FF0_0000_0000_0000, qnan, &nan_rule(14..16, true, NanEq::Any)).is_err());
+        // pairs run from the range's start: v13:v14 is not the pair v14:v15
+        assert!(rel(snan, qnan, &nan_rule(13..17, true, NanEq::Any)).is_err());
     }
 
     /// A small program through both backends via the diff entry point (independent of

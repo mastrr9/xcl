@@ -3321,7 +3321,7 @@ fn gpu_format_stores_atomics_global_lds() {
         }
     };
     let unordered = super::diff_kernel::Unordered { vgprs: vec![16..17], mem: Vec::new(), check: Box::new(umax_olds) };
-    let _relaxed = super::diff_kernel::relax(super::diff_kernel::Relax { unordered: Some(unordered) });
+    let _relaxed = super::diff_kernel::relax(super::diff_kernel::Relax { unordered: Some(unordered), ..Default::default() });
     let r = runner::run_code(&code, &st, &vec![0u32; 1024]).unwrap();
     umax_olds(&r);
     let byte = |a: usize| (r.mem[a / 4] >> (8 * (a % 4))) & 0xFF;
@@ -5904,7 +5904,7 @@ fn gpu_atomic_fcmpswap_x2() {
         mem: vec![0xC00 / 4..0xC08 / 4, 0xE00 / 4..0xE08 / 4, 0x1200 / 4..0x1208 / 4],
         check: Box::new(shared),
     };
-    let _relaxed = super::diff_kernel::relax(super::diff_kernel::Relax { unordered: Some(unordered) });
+    let _relaxed = super::diff_kernel::relax(super::diff_kernel::Relax { unordered: Some(unordered), ..Default::default() });
     let r = runner::run_code(&code, &st, &mem).unwrap();
     let cell = |a: usize| r.mem[a / 4] as u64 | (r.mem[a / 4 + 1] as u64) << 32;
     for l in 0..64usize {
