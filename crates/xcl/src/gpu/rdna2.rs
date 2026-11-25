@@ -5,7 +5,6 @@
 //! encoding identification, literal constants, SDWA/DPP extension dwords and MIMG NSA.
 //! It is the first stage of the shader recompiler (console microcode → PC shaders).
 
-use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::OnceLock;
 
@@ -93,11 +92,13 @@ pub struct Decoded {
 }
 
 struct Tables {
-    /// primary encodings ordered by spec priority
-    primary: Vec<usize>,
-    by_op: HashMap<(usize, u16), (&'static Inst, usize)>,
-    /// encodings without an OP field (EXP) → their single instruction
-    no_op: HashMap<usize, (&'static Inst, usize)>,
+    /// primary encodings ordered by spec priority, with their OP field
+    primary: Vec<(usize, Option<&'static Field>)>,
+    /// by encoding, then opcode: the first instruction with that opcode in that encoding
+    /// (indexed tables: `decode` looks up every instruction it reads here)
+    by_op: Vec<Vec<Option<(&'static Inst, usize)>>>,
+    /// by encoding: encodings without an OP field (EXP) → their single instruction
+    no_op: Vec<Option<(&'static Inst, usize)>>,
 }
 
 /// Every instruction the decoder knows: the RDNA2 spec first, then the console
@@ -111,13 +112,18 @@ fn tables() -> &'static Tables {
     T.get_or_init(|| {
         let mut primary: Vec<usize> = (0..ENCODINGS.len()).filter(|&i| ENCODINGS[i].primary).collect();
         primary.sort_by_key(|&i| ENCODINGS[i].order);
-        let mut by_op = HashMap::new();
-        let mut no_op = HashMap::new();
+        let primary = primary.into_iter().map(|i| (i, ENCODINGS[i].field("OP"))).collect();
+        let mut by_op: Vec<Vec<Option<(&'static Inst, usize)>>> = vec![Vec::new(); ENCODINGS.len()];
+        let mut no_op = vec![None; ENCODINGS.len()];
         for inst in all_instructions() {
             for (ei, e) in inst.encs.iter().enumerate() {
-                by_op.entry((e.encoding as usize, e.opcode)).or_insert((inst, ei));
+                let ops = &mut by_op[e.encoding as usize];
+                if ops.len() <= e.opcode as usize {
+                    ops.resize(e.opcode as usize + 1, None);
+                }
+                ops[e.opcode as usize].get_or_insert((inst, ei));
                 if ENCODINGS[e.encoding as usize].field("OP").is_none() {
-                    no_op.entry(e.encoding as usize).or_insert((inst, ei));
+                    no_op[e.encoding as usize].get_or_insert((inst, ei));
                 }
             }
         }
@@ -126,6 +132,14 @@ fn tables() -> &'static Tables {
 }
 
 fn bits(words: &[u32], off: u32, cnt: u32) -> u64 {
+    // every field of the tables is at most 32 bits wide: one shift of the two dwords it spans
+    // (missing dwords read as 0)
+    if cnt <= 32 {
+        let at = (off / 32) as usize;
+        let lo = words.get(at).copied().unwrap_or(0) as u64;
+        let hi = words.get(at + 1).copied().unwrap_or(0) as u64;
+        return ((hi << 32 | lo) >> (off % 32)) & ((1u64 << cnt) - 1);
+    }
     let mut v = 0u64;
     for i in 0..cnt {
         let b = off + i;
@@ -136,14 +150,17 @@ fn bits(words: &[u32], off: u32, cnt: u32) -> u64 {
 }
 
 pub fn field_value(enc: &Encoding, words: &[u32], name: &str) -> Option<u64> {
-    let f = enc.field(name)?;
+    Some(value_of(enc.field(name)?, words))
+}
+
+fn value_of(f: &Field, words: &[u32]) -> u64 {
     let mut v = 0u64;
     let mut shift = 0u32;
     for &(off, cnt) in f.ranges {
         v |= bits(words, off as u32, cnt as u32) << shift;
         shift += cnt as u32;
     }
-    Some(v)
+    v
 }
 
 fn read_words(code: &[u8], n: usize) -> Vec<u32> {
@@ -154,6 +171,12 @@ fn read_words(code: &[u8], n: usize) -> Vec<u32> {
                 .unwrap_or(0)
         })
         .collect()
+}
+
+/// The first two dwords of `code` as `read_words` reads them; with `n` = 1 the second is 0.
+fn head_words(code: &[u8], n: usize) -> [u32; 2] {
+    let w = |i: usize| code.get(i * 4..i * 4 + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    [w(0), if n >= 2 { w(1) } else { 0 }]
 }
 
 /// Operand types that are encoded as a scalar/vector source code and therefore can
@@ -177,20 +200,20 @@ pub fn decode(code: &[u8], pc: u64) -> Result<Decoded, DecodeError> {
     if code.len() < 4 {
         return Err(DecodeError::Truncated);
     }
-    let head = read_words(code, 2);
+    let head = head_words(code, 2);
     let raw64 = head[0] as u64 | (head[1] as u64) << 32;
     let t = tables();
     let mut found = None;
-    for &ei in &t.primary {
+    for &(ei, op) in &t.primary {
         let enc = &ENCODINGS[ei];
         if raw64 & enc.fixed_mask != enc.fixed_value {
             continue;
         }
-        let hit = match field_value(enc, &head, "OP") {
-            Some(op) => t.by_op.get(&(ei, op as u16)),
-            None => t.no_op.get(&ei),
+        let hit = match op {
+            Some(f) => t.by_op[ei].get(value_of(f, &head) as u16 as usize).copied().flatten(),
+            None => t.no_op[ei],
         };
-        if let Some(&(inst, ie)) = hit {
+        if let Some((inst, ie)) = hit {
             found = Some((ei, inst, ie));
             break;
         }
@@ -199,7 +222,8 @@ pub fn decode(code: &[u8], pc: u64) -> Result<Decoded, DecodeError> {
     let enc = &ENCODINGS[ei];
     let ienc = &inst.encs[ie];
     let base = enc.bits as usize / 8;
-    let base_words = read_words(code, base / 4);
+    // primary encodings are 32 or 64 bits
+    let base_words = head_words(code, base / 4);
 
     let mut variant = Variant::Plain;
     let mut extra = 0usize;
@@ -870,6 +894,7 @@ pub fn find_programs(blob: &[u8]) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn dis(bytes: &[u8]) -> String {
         format(&decode(bytes, 0).unwrap())
@@ -1143,6 +1168,259 @@ mod tests {
 
     fn renamed_in_rdna2(llvm: &str, spec: &str) -> bool {
         matches!((llvm, spec), ("v_mac_legacy_f32", "v_fmac_legacy_f32") | ("v_mad_legacy_f32", "v_fma_legacy_f32"))
+    }
+
+    /// The encodings of LLVM's gfx10 disassembler tests (`llvm_gfx10_corpus`), as bytes.
+    fn llvm_encodings() -> Vec<Vec<u8>> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu");
+        let mut paths: Vec<_> = std::fs::read_dir(&dir).expect("tests/data/llvm-amdgpu").map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|x| x == "txt")).collect();
+        paths.sort();
+        let mut out = Vec::new();
+        for p in paths {
+            for line in std::fs::read_to_string(&p).unwrap().lines() {
+                let Some((_, enc)) = line.split_once("; encoding: [") else { continue };
+                let Some(enc) = enc.split(']').next() else { continue };
+                let bytes: Vec<u8> = enc.split(',').filter_map(|b| u8::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()).collect();
+                if bytes.len() >= 4 {
+                    out.push(bytes);
+                }
+            }
+        }
+        out
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 32) as u32
+        }
+    }
+
+    /// `bits` before it read whole dwords: one bit at a time.
+    fn bits_bitwise(words: &[u32], off: u32, cnt: u32) -> u64 {
+        let mut v = 0u64;
+        for i in 0..cnt {
+            let b = off + i;
+            let w = words.get((b / 32) as usize).copied().unwrap_or(0);
+            v |= (((w >> (b % 32)) & 1) as u64) << i;
+        }
+        v
+    }
+
+    #[test]
+    fn bits_match_the_bitwise_reference() {
+        let mut r = Lcg(1);
+        for len in 0..7 {
+            for _ in 0..40 {
+                let words: Vec<u32> = (0..len).map(|k| match k % 3 { 0 => r.next(), 1 => u32::MAX, _ => r.next() & r.next() }).collect();
+                // past the end of the dwords, across dword boundaries, every width the tables use
+                for off in 0..(32 * len as u32 + 70) {
+                    for cnt in 0..=32 {
+                        assert_eq!(bits(&words, off, cnt), bits_bitwise(&words, off, cnt), "{words:x?} off {off} cnt {cnt}");
+                    }
+                }
+            }
+        }
+        // the slow path is the reference itself
+        assert_eq!(bits(&[u32::MAX; 3], 5, 40), bits_bitwise(&[u32::MAX; 3], 5, 40));
+        // every field of every encoding, on random and on truncated dwords
+        for e in ENCODINGS {
+            for f in e.fields {
+                for len in 0..6 {
+                    let words: Vec<u32> = (0..len).map(|_| r.next()).collect();
+                    let mut want = 0u64;
+                    let mut shift = 0;
+                    for &(off, cnt) in f.ranges {
+                        want |= bits_bitwise(&words, off as u32, cnt as u32) << shift;
+                        shift += cnt as u32;
+                    }
+                    assert_eq!(field_value(e, &words, f.name), Some(want), "{} {}", e.name, f.name);
+                }
+            }
+        }
+    }
+
+    /// `decode` before its indexed tables and fixed scratch dwords: hash maps, `Vec`s and a
+    /// bit-by-bit field read.
+    fn decode_reference(code: &[u8], pc: u64) -> Result<Decoded, DecodeError> {
+        type Hit = (&'static Inst, usize);
+        type Old = (Vec<usize>, HashMap<(usize, u16), Hit>, HashMap<usize, Hit>);
+        static T: std::sync::OnceLock<Old> = std::sync::OnceLock::new();
+        let (primary, by_op, no_op) = T.get_or_init(|| {
+            let mut primary: Vec<usize> = (0..ENCODINGS.len()).filter(|&i| ENCODINGS[i].primary).collect();
+            primary.sort_by_key(|&i| ENCODINGS[i].order);
+            let mut by_op = HashMap::new();
+            let mut no_op = HashMap::new();
+            for inst in all_instructions() {
+                for (ei, e) in inst.encs.iter().enumerate() {
+                    by_op.entry((e.encoding as usize, e.opcode)).or_insert((inst, ei));
+                    if ENCODINGS[e.encoding as usize].field("OP").is_none() {
+                        no_op.entry(e.encoding as usize).or_insert((inst, ei));
+                    }
+                }
+            }
+            (primary, by_op, no_op)
+        });
+        let field_value = |enc: &Encoding, words: &[u32], name: &str| -> Option<u64> {
+            let f = enc.field(name)?;
+            let mut v = 0u64;
+            let mut shift = 0u32;
+            for &(off, cnt) in f.ranges {
+                v |= bits_bitwise(words, off as u32, cnt as u32) << shift;
+                shift += cnt as u32;
+            }
+            Some(v)
+        };
+        if code.len() < 4 {
+            return Err(DecodeError::Truncated);
+        }
+        let head = read_words(code, 2);
+        let raw64 = head[0] as u64 | (head[1] as u64) << 32;
+        let mut found = None;
+        for &ei in primary {
+            let enc = &ENCODINGS[ei];
+            if raw64 & enc.fixed_mask != enc.fixed_value {
+                continue;
+            }
+            let hit = match field_value(enc, &head, "OP") {
+                Some(op) => by_op.get(&(ei, op as u16)),
+                None => no_op.get(&ei),
+            };
+            if let Some(&(inst, ie)) = hit {
+                found = Some((ei, inst, ie));
+                break;
+            }
+        }
+        let Some((ei, inst, ie)) = found else { return Err(DecodeError::Unknown(head[0])) };
+        let enc = &ENCODINGS[ei];
+        let ienc = &inst.encs[ie];
+        let base = enc.bits as usize / 8;
+        let base_words = read_words(code, base / 4);
+        let mut variant = Variant::Plain;
+        let mut extra = 0usize;
+        let mut has_literal = inst.always_literal;
+        if is_valu32(enc) {
+            match field_value(enc, &base_words, "SRC0") {
+                Some(0xF9) => variant = Variant::Sdwa,
+                Some(0xFA) => variant = Variant::Dpp16,
+                Some(0xE9) | Some(0xEA) => variant = Variant::Dpp8,
+                _ => {}
+            }
+            if variant != Variant::Plain {
+                extra = 4;
+            }
+        }
+        if variant == Variant::Plain && !has_literal {
+            has_literal = ienc.operands.iter().any(|o| !o.implicit && is_src_type(o.ty) && o.field.and_then(|f| field_value(enc, &base_words, f)) == Some(255));
+            if !has_literal && is_valu(enc) {
+                has_literal = ["SRC0", "SRC1", "SRC2"].iter().any(|f| field_value(enc, &base_words, f) == Some(255));
+            }
+        }
+        if has_literal {
+            extra += 4;
+        }
+        if enc.name == "ENC_MIMG" {
+            extra += 4 * field_value(enc, &base_words, "NSA").unwrap_or(0) as usize;
+        }
+        let len = base + extra;
+        if code.len() < len {
+            return Err(DecodeError::Truncated);
+        }
+        let words = read_words(code, len / 4);
+        let literal = has_literal.then(|| words[base / 4]);
+        Ok(Decoded { pc, inst, ienc, enc, words, len, literal, variant, far_target: None })
+    }
+
+    #[test]
+    fn decode_matches_the_hash_map_reference() {
+        let same = |b: &[u8]| {
+            let (got, want) = (decode(b, 0x40), decode_reference(b, 0x40));
+            match (&got, &want) {
+                (Ok(g), Ok(w)) => {
+                    assert!(std::ptr::eq(g.inst, w.inst) && std::ptr::eq(g.ienc, w.ienc) && std::ptr::eq(g.enc, w.enc), "{b:02x?}: {} / {}", g.inst.name, w.inst.name);
+                    assert_eq!((g.pc, &g.words, g.len, g.literal, g.variant, g.far_target), (w.pc, &w.words, w.len, w.literal, w.variant, w.far_target), "{b:02x?}");
+                }
+                (Err(g), Err(w)) => assert_eq!(g, w, "{b:02x?}"),
+                _ => panic!("{b:02x?}: {:?} / {:?}", got.as_ref().map(|d| d.inst.name), want.as_ref().map(|d| d.inst.name)),
+            }
+            got.is_ok()
+        };
+        let mut r = Lcg(11);
+        let mut ok = 0;
+        // LLVM's corpus, whole and cut short at every length
+        for b in llvm_encodings() {
+            for n in 0..=b.len() {
+                ok += same(&b[..n]) as usize;
+            }
+        }
+        // every encoding of every instruction (opcode and fixed bits set, the rest random),
+        // with a random literal / extension / NSA dwords behind it, also cut short
+        for inst in all_instructions() {
+            for e in inst.encs {
+                let enc = &ENCODINGS[e.encoding as usize];
+                if !enc.primary {
+                    continue;
+                }
+                let Some(op) = enc.field("OP").map(|f| f.ranges) else { continue };
+                let mut op_mask = 0u64;
+                let mut op_bits = 0u64;
+                let mut shift = 0;
+                for &(off, cnt) in op {
+                    let m = ((1u64 << cnt) - 1) << off;
+                    op_mask |= m;
+                    op_bits |= ((e.opcode as u64 >> shift) << off) & m;
+                    shift += cnt;
+                }
+                for k in 0..24 {
+                    let raw = r.next() as u64 | (r.next() as u64) << 32;
+                    let raw = raw & !enc.fixed_mask & !op_mask | enc.fixed_value | op_bits;
+                    let mut b: Vec<u8> = raw.to_le_bytes()[..enc.bits as usize / 8].to_vec();
+                    // source fields on the literal / SDWA / DPP codes now and then
+                    if k % 4 == 0 && enc.bits == 32 {
+                        b[0] = [0xFF, 0xF9, 0xFA, 0xE9][k / 4 % 4];
+                    }
+                    (0..4).for_each(|_| b.extend(r.next().to_le_bytes()));
+                    for n in [b.len(), b.len() - 4, b.len() - 9, 4, 3] {
+                        ok += same(&b[..n]) as usize;
+                    }
+                }
+            }
+        }
+        // random dwords
+        for _ in 0..100_000 {
+            let b: Vec<u8> = (0..4).flat_map(|_| r.next().to_le_bytes()).collect();
+            ok += same(&b) as usize;
+        }
+        assert!(ok > 100_000, "{ok}");
+    }
+
+    /// Median ns per instruction of `f` over the LLVM gfx10 corpus (7 runs of 20 passes).
+    fn per_instruction<T>(items: &[T], mut f: impl FnMut(&T) -> usize) -> f64 {
+        let mut runs = Vec::new();
+        for _ in 0..7 {
+            let t = std::time::Instant::now();
+            let n: usize = (0..20).map(|_| items.iter().map(&mut f).sum::<usize>()).sum();
+            runs.push(t.elapsed().as_secs_f64() * 1e9 / (20 * items.len()) as f64);
+            assert!(n > 0);
+        }
+        runs.sort_by(f64::total_cmp);
+        runs[3]
+    }
+
+    /// The decoder's parts the recompiler runs on every instruction, on the LLVM gfx10 corpus:
+    /// `cargo test --release --lib rdna2::tests::bench_decode -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_decode() {
+        let corpus = llvm_encodings();
+        let decoded: Vec<Decoded> = corpus.iter().filter_map(|b| decode(b, 0).ok()).collect();
+        println!("{} instructions, ns per instruction (median of 7):", corpus.len());
+        println!("decode {:.0}", per_instruction(&corpus, |b| decode(b, 0).map_or(1, |d| d.len)));
+        println!("sgpr_uses {:.0}", per_instruction(&decoded, |d| 1 + sgpr_uses(d).0.len()));
+        println!("vgpr_uses {:.0}", per_instruction(&decoded, |d| 1 + vgpr_uses(d).0.len()));
+        println!("branch_target {:.0}", per_instruction(&decoded, |d| 1 + branch_target(d).is_some() as usize));
+        println!("format {:.0}", per_instruction(&decoded, |d| format(d).len()));
     }
 
     /// Decode every instruction in LLVM's gfx10 disassembler tests and compare the
